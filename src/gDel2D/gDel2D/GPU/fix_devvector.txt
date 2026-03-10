@@ -1,0 +1,50 @@
+// 替换拷贝控制部分（第41-69行）
+
+// Copy constructor (deep copy)
+DevVector(const DevVector& other)
+    : _ptr(), _size(0), _capacity(0), _owned(false)
+{
+    if (other._capacity > 0) {
+        resize(other._size);
+        thrust::copy(other.begin(), other.end(), begin());
+    }
+}
+
+// Copy assignment operator (deep copy)
+DevVector& operator=(const DevVector& other) {
+    if (this != &other) {
+        if (other._size > 0) {
+            resize(other._size);
+            thrust::copy(other.begin(), other.end(), begin());
+        } else {
+            free();
+        }
+    }
+    return *this;
+}
+
+// Move constructor
+DevVector(DevVector&& other) noexcept
+    : _ptr(std::move(other._ptr)),
+      _size(other._size),
+      _capacity(other._capacity),
+      _owned(other._owned) {
+    other._size = 0;
+    other._capacity = 0;
+    other._owned = false;
+}
+
+// Move assignment operator
+DevVector& operator=(DevVector&& other) noexcept {
+    if (this != &other) {
+        free();
+        _ptr = std::move(other._ptr);
+        _size = other._size;
+        _capacity = other._capacity;
+        _owned = other._owned;
+        other._size = 0;
+        other._capacity = 0;
+        other._owned = false;
+    }
+    return *this;
+}

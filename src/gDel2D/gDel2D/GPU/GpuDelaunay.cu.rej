@@ -1,0 +1,12 @@
+--- GpuDelaunay.cu
++++ GpuDelaunay.cu
+@@ -63,6 +63,9 @@ void GpuDel::compute
+     startTiming( ProfNone );
+ 
+     initForFlip();
++    std::cout << "DEBUG: After initForFlip" << std::endl;
+     splitAndFlip();
++    std::cout << "DEBUG: After splitAndFlip" << std::endl;
+ 	outputToHost();
++    std::cout << "DEBUG: After outputToHost" << std::endl;
+ 

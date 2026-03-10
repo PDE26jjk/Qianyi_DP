@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.20)
+project(ProjectName)
+set(CMAKE_CUDA_ARCHITECTURES 75)
+message(STATUS [[============================]])
+message(STATUS $ENV{CUDAARCHS})
+message(STATUS ${CUDA_ARCHITECTURES} )
+option(USE_LLD "Use lld (from llvm) linker" OFF)

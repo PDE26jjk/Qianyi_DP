@@ -1,0 +1,5 @@
+
+[*]
+
+# ReSharper properties
+resharper_use_continuous_line_indent_in_method_pars = false

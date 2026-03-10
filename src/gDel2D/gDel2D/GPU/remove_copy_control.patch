@@ -1,0 +1,22 @@
+--- a/MemoryManager.h
++++ b/MemoryManager.h
+@@ -38,42 +38,6 @@
+     }
+ 
+-    // Copy constructor - use copyFrom for safety
+-    DevVector(const DevVector& other)
+-        : _ptr(), _size(0), _capacity(0), _owned(false)
+-    {
+-        copyFrom(other);
+-    }
+-
+-    // Copy assignment operator
+-    DevVector& operator=(const DevVector& other) {
+-        if (this != &other) {
+-            copyFrom(other);
+-        }
+-        return *this;
+-    }
+-
+     // Move constructor
+     DevVector(DevVector&& other) noexcept
