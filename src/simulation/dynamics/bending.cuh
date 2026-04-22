@@ -183,10 +183,11 @@ static __global__ void precompute_IBM_Q(
 
 // M. Bergou, M. Wardetzky, D. Harmon, D. Zorin, and E. Grinspun, "A quadratic bending model for inextensible surfaces"
 static __global__ void compute_quadratic_Bending_IBM(
-    Mat3* Jx,
-    Mat3* Jx_diag,
-    Mat3* Jx_bend_cross,
-    float3* forces,
+    Mat3* __restrict__ Jx,
+    Mat3* __restrict__ Jx_diag,
+    Mat3* __restrict__ Jx_bend_cross,
+    float3* __restrict__ forces,
+    float* __restrict__ enerys,
     const float4* __restrict__ _q,
     const float3* __restrict__ vertices,
     const int2* __restrict__ edges,
@@ -206,6 +207,9 @@ static __global__ void compute_quadratic_Bending_IBM(
     float3 x0 = vertices[p0_idx], x1 = vertices[p1_idx], x2 = vertices[p2_idx], x3 = vertices[p3_idx];
     float4 q = _q[i];
     float3 qtX = x0 * q.x + x1 * q.y + x2 * q.z + x3 * q.w;
+    if ( enerys ) {
+        atomicAdd(&enerys[p0_idx],0.5f * kb * len_sq(qtX));
+    }
     qtX = qtX * kb;
 
     if ( forces ) {
@@ -227,6 +231,9 @@ static __global__ void compute_quadratic_Bending_IBM(
         auto t2 = triangles[t2_i];
         auto f0d1 = Mat3::identity(q.x * q.y * kb);
         atomicAddMat3(&Jx[i], f0d1);
+
+        auto f2d3 = Mat3::identity(q.z * q.w * kb);
+        atomicAddMat3(&Jx_bend_cross[i], f2d3);
 
         auto f0d2 = Mat3::identity(q.x * q.z * kb);
         auto f1d2 = Mat3::identity(q.y * q.z * kb);
@@ -268,7 +275,6 @@ static __global__ void compute_quadratic_Bending_IBM(
         //
         // assign_jacobian(triangles[t1_i], p2_idx, f0d2, f1d2);
         // assign_jacobian(triangles[t2_i], p3_idx, f0d3, f1d3);
-        auto f2d3 = Mat3::identity(q.z * q.w * kb);
-        atomicAddMat3(&Jx_bend_cross[i], f2d3);
+
     }
 }

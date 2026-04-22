@@ -31,3 +31,14 @@ inline void __cudaCheckError(cudaError_t err, const char* file, const int line) 
     __cudaCheckError((call), __FILE__, __LINE__); \
 } while (0)
  
+#define START_TIMER \
+    auto start_time = std::chrono::high_resolution_clock::now(); \
+    auto end_time = start_time; \
+    std::chrono::duration<double, std::milli> duration = end_time - start_time
+
+#define RECORD_TIME(name) \
+    end_time = std::chrono::high_resolution_clock::now();\
+    duration = end_time - start_time;\
+    std::cout << (name) <<" time: " << duration.count() << std::endl; \
+    start_time = end_time
+

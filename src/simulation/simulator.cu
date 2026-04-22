@@ -2,24 +2,44 @@
 
 #include <thrust/device_vector.h>
 // #include <thrust/host_vector.h>
+#include <map>
 #include <thrust/sort.h>
 
 #include "common/cuda_utils.h"
 
 #include <thrust/execution_policy.h>
 
+#include "solver_base.cuh"
+#include "solver_Chebyshev.cuh"
 #include "solver_PCG.cuh"
+#include "solver_PNCG.cuh"
 
 
-Simulator::Simulator(): m_solver(new SolverPCG()) {}
-Simulator::~Simulator() {
+Simulator::Simulator() {}
+extern bool device_initialized;
+extern int active_device_id;
+void Simulator::reset() {
     try {
-        delete m_solver;
-        cudaDeviceSynchronize();
+        if ( !device_initialized ) return;
+        cudaError_t err = cudaSetDevice(active_device_id);
+        if ( err == cudaSuccess ) {
+            delete m_solver;
+            m_solver = nullptr;
+            cudaDeviceSynchronize();
+        }
+        else {
+            printf("[Qianyi] The CUDA context has been destroyed; skip releasing the solver. \n");
+        }
     }
-    catch ( ... ) {}
+    catch ( ... ) {
+        throw;
+    }
+    device_initialized = false;
 }
-void printLastCudaError(const char* context = nullptr) {
+Simulator::~Simulator() {
+    reset();
+}
+static void printLastCudaError(const char* context = nullptr) {
     cudaError_t err = cudaGetLastError();
     if ( err != cudaSuccess ) {
         if ( context ) {
@@ -60,15 +80,25 @@ void Simulator::init(const std::vector<float>& _vertices,
     const std::vector<float>& _vertices_sim,
     const std::vector<int>& _edges,
     const std::vector<int>& _triangles,
+    const std::vector<float>& _normals,
     const std::vector<int>& _object_types,
-    const std::vector<float>& _mass,
+    const std::vector<ObjectDataInput>& obj_data_input,
     const std::vector<Mat4>& _world_matrices,
     const std::vector<int>& _vertex_index_offsets,
     const std::vector<int>& _triangle_index_offsets,
+    const std::vector<float>& pin_fixed,
+    const std::vector<float>& pin_attached,
     const std::vector<SewingData>& _sewings,
     const std::vector<int2>& _stitches,
-    int nb_all_cloth_v, int nb_all_cloth_e, int nb_all_cloth_f) {
+    int nb_all_cloth_v, int nb_all_cloth_e, int nb_all_cloth_f
+) {
+    if ( m_last_solver_name != m_solver_name || m_solver == nullptr ) {
+        m_last_solver_name = m_solver_name;
+        delete m_solver;
+        create_solver();
+    }
     auto& params = m_solver->params;
+    params.nb_all_objects = (int)obj_data_input.size();
     params.nb_all_vertices = (int)_vertices.size() / 3;
     params.nb_all_edges = (int)_edges.size() / 2;
     params.nb_all_triangles = (int)_triangles.size() / 3;
@@ -79,19 +109,22 @@ void Simulator::init(const std::vector<float>& _vertices,
 
     cudaDeviceSynchronize();
     copy_to_device<float, float3>(_vertices, m_solver->vertices_2D);
+    copy_to_device<float, float3>(_normals, m_solver->normals_input);
     copy_to_device<int, int2>(_edges, m_solver->edges);
     copy_to_device<int, int3>(_triangles, m_solver->triangles);
     copy_to_device(_object_types, m_solver->object_types);
-    copy_to_device(_mass, m_solver->mass);
+    copy_to_device(obj_data_input, m_solver->obj_data);
     copy_to_device(_world_matrices, m_solver->world_matrices);
     copy_to_device(_sewings, m_solver->sewing_lines);
     copy_to_device(_stitches, m_solver->stitches);
     copy_to_device(_vertex_index_offsets, m_solver->vertex_index_offsets);
     copy_to_device(_triangle_index_offsets, m_solver->triangle_index_offsets);
+    copy_to_device(pin_fixed, m_solver->pin_fixed);
+    copy_to_device(pin_attached, m_solver->pin_attached);
 
-    m_solver->init();
     // vertices data for simulation,
     copy_to_device<float, float3>(_vertices_sim, m_solver->vertices_local);
+    m_solver->init();
 
     // thrust::host_vector<int3> triangles = m_gpu->triangles;
     // std::vector triangles_(triangles.begin(), triangles.end());
@@ -104,7 +137,7 @@ void Simulator::init(const std::vector<float>& _vertices,
     //
     // thrust::host_vector<Mat4> world_matrices_inv = m_gpu->world_matrices_inv;
     // std::vector world_matrices_inv_(world_matrices_inv.begin(), world_matrices_inv.end());
-    cudaDeviceSynchronize();
+    CUDA_CHECK(cudaDeviceSynchronize());
     // printLastCudaError("init");
     return;
 }
@@ -113,20 +146,15 @@ void Simulator::update(float h) {
     m_solver->update(h);
 }
 
-void Simulator::reset() {
-    try {
-        delete m_solver;
-    }
-    catch ( ... ) {}
-    m_solver = new SolverBase();
-    cudaDeviceSynchronize();
-}
 const SimulatorParams* Simulator::get_params() const {
     return &m_solver->params;
 }
 
-void Simulator::copy_vertices(float* ptr,bool world_space = false) {
-    return m_solver->copy_vertices(ptr,world_space);
+void Simulator::copy_vertices(float* ptr, bool world_space) {
+    return m_solver->copy_vertices(ptr, world_space);
+}
+void Simulator::copy_debug_colors(float* ptr) {
+    return m_solver->copy_debug_colors(ptr);
 }
 
 int Simulator::add_pick_triangle(int mesh_index, int tri_index, float3 position) {
@@ -153,4 +181,45 @@ void Simulator::remove_picker(int index) {
 }
 void Simulator::clear_picker() {
     m_solver->clear_picker();
+}
+void Simulator::set_parameter(const std::string& key, float value) {
+    m_parameters[key] = value;
+}
+float Simulator::get_parameter(const std::string& key, float default_value) const {
+    auto it = m_parameters.find(key);
+    if ( it != m_parameters.end() ) {
+        return it->second;
+    }
+    return default_value;
+}
+void Simulator::update_world_matrix(int obj_index, const std::vector<float>& matrix) {
+    m_solver->update_world_matrix(obj_index, matrix);
+}
+void Simulator::update_local_vertices(int obj_index, const std::vector<float>& vertices) {
+    m_solver->update_local_vertices(obj_index, vertices);
+}
+
+std::vector<std::string> Simulator::get_all_solver() {
+    return { "Explicit", "PCG", "Chebyshev", "PNCG" };
+}
+
+void Simulator::set_solver(const std::string& string) {
+    m_solver_name = string;
+}
+void Simulator::create_solver() {
+    if ( m_solver_name == "Explicit" ) {
+        m_solver = new SolverBase(this);
+    }
+    else if ( m_solver_name == "PCG" ) {
+        m_solver = new SolverPCG(this);
+    }
+    else if ( m_solver_name == "Chebyshev" ) {
+        m_solver = new SolverChebyshev(this);
+    }
+    else if ( m_solver_name == "PNCG" ) {
+        m_solver = new SolverPNCG(this);
+    }
+    else {
+        throw std::runtime_error("Unknown solver type: " + m_solver_name);
+    }
 }

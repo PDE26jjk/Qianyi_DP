@@ -1,18 +1,29 @@
 cmake_minimum_required(VERSION 3.24)
+project(Qianyi_DP LANGUAGES CXX CUDA)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-set(CMAKE_CUDA_ARCHITECTURES native)
+# set(CMAKE_CUDA_ARCHITECTURES native)
+# set(CUDA_ARCHS 
+#     sm_75  # Turing (GTX 16xx, RTX 20xx)
+#     sm_80  # Ampere (A100)
+#     sm_86  # Ampere (RTX 30xx)
+#     sm_89  # Ada Lovelace (RTX 40xx)
+#     sm_90  # Hopper (H100)
+# )
+# set(CMAKE_CUDA_ARCHITECTURES 75 80 86 89 90)
+set(CMAKE_CUDA_ARCHITECTURES 86)
 set(CMAKE_BUILD_TYPE Debug)
 
 if(MSVC)
     set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} /Zi")
+    # set(CMAKE_CUDA_FLAGS_DEBUG "${CMAKE_CUDA_FLAGS_DEBUG} -G") # it make dll very big
     set(CMAKE_SHARED_LINKER_FLAGS_DEBUG "${CMAKE_SHARED_LINKER_FLAGS_DEBUG} /DEBUG")
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/MP>)
 endif()
 
-project(Qianyi_DP LANGUAGES CXX CUDA)
 
 find_package(CUDAToolkit REQUIRED)
 
@@ -42,19 +53,25 @@ target_include_directories(${PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/extern/pybind11/include
 )
 target_sources(${PROJECT_NAME} PRIVATE
+    src/geometry_interface.h
+    src/geometry_interface.cpp
+    src/pattern_helper_interface.h
+    src/pattern_helper_interface.cpp
     src/simulator_interface.h
     src/simulator_interface.cpp
  )
 
-add_subdirectory(src/sample)
+add_subdirectory(src/geometry)
 add_subdirectory(src/gDel2D)
 add_subdirectory(src/simulation)
+add_subdirectory(src/graphics)
 
 target_include_directories(${PROJECT_NAME} PRIVATE src)
 target_link_libraries(${PROJECT_NAME}
-    PRIVATE sample
+    PRIVATE geometry
     PRIVATE gDel2D
     PRIVATE simulation
+    PRIVATE graphics
 )
 
 if(MSVC)

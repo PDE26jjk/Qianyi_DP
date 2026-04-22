@@ -1,0 +1,9 @@
+{
+    "codeLineCounter.includeDirs": [
+        "r:\\code\\cuda\\qmyidp\\src"
+    ],
+    "codeLineCounter.excludePatterns": [
+        "**/node_modules/**",
+        "**/.git/**"
+    ]
+}

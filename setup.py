@@ -126,8 +126,6 @@ class CMakeBuild(build_ext):
         subprocess.run(
             ["cmake", "--build", ".", *build_args], cwd=build_temp, check=True
         )
-        # print("????",build_temp)
-        # raise Exception(f"error : {sys.executable}")
 
 
 # The information here can also be placed in setup.cfg - better separation of

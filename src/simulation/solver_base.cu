@@ -1,25 +1,29 @@
 ﻿#include "solver_base.cuh"
 
-#include <thrust/device_vector.h>
 #include <thrust/execution_policy.h>
 // #include <thrust/host_vector.h>
 
 
+// #include <filesystem>
 #include <thrust/binary_search.h>
 #include <thrust/sequence.h>
 #include <thrust/sort.h>
+#include <thrust/transform_reduce.h>
 
+#include "constraint.cuh"
 #include "geometric_operator.cuh"
 #include "common/cuda_utils.h"
+#include "contact/collision.cuh"
 #include "dynamics/bending.cuh"
+
 
 void SolverBase::init() {
     sort_and_generate_edge_lookup();
     generate_inverse_matrix();
     generate_vertex_object();
-    init_triangle_index();
+    init_triangle_data();
 
-    vertices_world.resize(vertices_2D.size());
+    vertices_world.resize(params.nb_all_vertices);
     edge_lengths.resize(edges.size());
     thrust::transform(thrust::device, edges.begin(), edges.end(), edge_lengths.begin(), [
             vertices = thrust::raw_pointer_cast(vertices_2D.data())
@@ -30,20 +34,16 @@ void SolverBase::init() {
         edge_lengths.begin() + params.nb_all_cloth_edges, 0.0, thrust::plus<double>()) / params.nb_all_cloth_edges;
 
 
-    vertices_old.resize(params.nb_all_cloth_vertices);
-    velocities.assign(params.nb_all_cloth_vertices, make_float3(0.0f, 0.0f, 0.0f));
-    vertices_mask.assign(params.nb_all_cloth_vertices, static_cast<char>(0));
-    // for test 
-    thrust::transform(thrust::device, thrust::make_counting_iterator(0), thrust::make_counting_iterator(1),
-        vertices_mask.begin(), []
-        __device__ (int i) {
-            if ( i == 0 ) {
-                return char(1);
-            }
-            return char(0);
-        });
-    // thrust::host_vector<char> vertices_mask_ =vertices_mask;
-    // std::vector vertices_mask__(vertices_mask_.begin(), vertices_mask_.end());
+    vertices_old.resize(params.nb_all_vertices);
+    vertices_local_new_frame.resize(params.nb_all_vertices);
+    vertices_new.resize(params.nb_all_vertices);
+    debug_colors.resize(params.nb_all_vertices);
+    velocities.assign(params.nb_all_vertices, make_float3(0.0f, 0.0f, 0.0f));
+    forces.resize(params.nb_all_vertices);
+    vertices_mask.assign(params.nb_all_vertices, static_cast<char>(0));
+    init_pin();
+
+
     IBM_q.assign(params.nb_all_cloth_edges, make_float4(0.0f, 0.0f, 0.0f, 0.f));
     int threadsPerBlock = 256;
     int n = params.nb_all_cloth_edges;
@@ -60,8 +60,15 @@ void SolverBase::init() {
     init_picker();
     init_collision();
     init_sewing();
+    if ( capture_stream != nullptr ) {
+        cudaStreamDestroy(capture_stream);
+        capture_stream = nullptr;
+    }
+    cudaStreamCreate(&capture_stream);
+    pool.resize(1024);
+    pool_used.assign(1024, false);
+    frame = 0;
 }
-
 void SolverBase::sort_and_generate_edge_lookup() {
     int nb_all_v = params.nb_all_vertices;
     size_t num_edges = edges.size();
@@ -206,14 +213,17 @@ static __device__ int get_opposite_point(int2 edge, int3 tri, const int2* edges)
 }
 
 
-void SolverBase::init_triangle_index() {
+void SolverBase::init_triangle_data() {
     e2t.assign(params.nb_all_edges, make_int2(-1, -1));
     edge_opposite_points.assign(params.nb_all_cloth_edges, make_int2(-1, -1));
     Dms.resize(params.nb_all_triangles);
+    // areas.assign(params.nb_all_objects,0.f);
+    masses.assign(params.nb_all_cloth_vertices, 0.f);
     triangle_indices.resize(params.nb_all_triangles);
     thrust::for_each_n(thrust::device, thrust::make_counting_iterator(0), params.nb_all_triangles,
         [
             vertices = thrust::raw_pointer_cast(vertices_2D.data()), // float3
+            normals = thrust::raw_pointer_cast(normals_input.data()), // float3
             triangles = thrust::raw_pointer_cast(triangles.data()), // int3
             edges = thrust::raw_pointer_cast(edges.data()), // int2
             dir_edges = thrust::raw_pointer_cast(dir_edges.data()), // int2
@@ -222,7 +232,11 @@ void SolverBase::init_triangle_index() {
             indices = thrust::raw_pointer_cast(triangle_indices.data()), // int3
             Dms = thrust::raw_pointer_cast(Dms.data()), // Mat2
             nb_all_edges=params.nb_all_edges,
-            nb_all_cloth_triangles=params.nb_all_cloth_triangles
+            nb_all_cloth_triangles=params.nb_all_cloth_triangles,
+            masses = masses.data().get(),
+            vertices_obj = vertices_obj.data().get(),
+            // density = mass_densitys.data().get(),
+            obj_data = obj_data.data().get()
         ] __device__ (const int i) {
             // 1. Load vertices of the triangle
             int3 tri_v = triangles[i];
@@ -239,7 +253,8 @@ void SolverBase::init_triangle_index() {
                 v0 = v1;
                 v1 = tmp;
             }
-            float3 n_in = make_float3(0.0f, 0.0f, 1.0f);
+            // float3 n_in = make_float3(0.0f, 0.0f, 1.0f);
+            float3 n_in = normals[i];
             float3 p0 = vertices[v0], p1 = vertices[v1], p2 = vertices[v2];
             // Check orientation: (p1-p0) cross (p2-p0) dot normal
             if ( dot(cross(p1 - p0, p2 - p0), n_in) < 0.0f ) {
@@ -302,6 +317,12 @@ void SolverBase::init_triangle_index() {
                 Dms[i].r[0].y = dot(e2, u_dir);
                 Dms[i].r[1].x = 0.0f;
                 Dms[i].r[1].y = dot(e2, v_dir);
+                float area = 0.5f * fabsf(Dms[i].det());
+                // atomicAdd(&areas[vertices_obj[edge1.x]], area);
+                float mass_per_v = area * obj_data[vertices_obj[v0]].mass_densitys / 3.f;
+                atomicAdd(&masses[v0], mass_per_v);
+                atomicAdd(&masses[v1], mass_per_v);
+                atomicAdd(&masses[v2], mass_per_v);
             }
         });
 
@@ -329,60 +350,13 @@ void SolverBase::copy_vertices(float* ptr, bool world_space = false) {
     // thrust::host_vector<float3> vertices_ = vertices;
     // std::vector vertices__(vertices_.begin(), vertices_.end());
 }
-__global__ void record_pick_triangle(
-    int i,
-    int mesh_idx, int tri_idx, float3 pos,
-    Mat3* __restrict__ pick_triangle_offsets,
-    thrust::pair<int, float3>* __restrict__ pick_triangles,
-    const float3* __restrict__ vertices,
-    const int3* __restrict__ indices,
-    const int* __restrict__ triangle_index_offsets
-) {
-    int tri_index = tri_idx + triangle_index_offsets[mesh_idx];
-    pick_triangles[i] = thrust::make_pair(tri_index, pos);
-    auto [v0,v1,v2] = indices[tri_index];
-    Mat3 offsets{ vertices[v0] - pos, vertices[v1] - pos, vertices[v2] - pos };
-    pick_triangle_offsets[i] = offsets;
-}
-int SolverBase::add_pick_triangle(int mesh_index, int tri_index, float3 position) {
-    cudaDeviceSynchronize();
-    pick_triangles.push_back({});
-    pick_triangle_offsets.push_back({});
-    int index = (int)pick_triangles.size() - 1;
-    record_pick_triangle<<<1,1>>>(index,
-        mesh_index, tri_index, position,
-        thrust::raw_pointer_cast(pick_triangle_offsets.data()),
-        thrust::raw_pointer_cast(pick_triangles.data()),
-        thrust::raw_pointer_cast(vertices_world.data()),
-        thrust::raw_pointer_cast(triangle_indices.data()),
-        thrust::raw_pointer_cast(triangle_index_offsets.data())
-        );
-    cudaDeviceSynchronize();
-    return index;
-}
-void SolverBase::update_pick_triangle(int index, float3 position) {
-    cudaDeviceSynchronize();
-    pick_triangles[index].second = position;
-    cudaDeviceSynchronize();
-}
-void SolverBase::remove_pick_triangle(int index) {
-    cudaDeviceSynchronize();
-    if ( index >= (int)pick_triangles.size() || index < 0 ) return;
-    pick_triangles[index].first = -1;
-    cudaDeviceSynchronize();
-    for ( const auto& pick_triangle : pick_triangles ) {
-        if ( pick_triangle.first != -1 ) {
-            return;
-        }
-    }
-    clear_pick_triangle();
-}
-void SolverBase::clear_pick_triangle() {
-    cudaDeviceSynchronize();
-    pickers.clear();
-    pick_triangles.clear();
-    pick_triangle_offsets.clear();
-    cudaDeviceSynchronize();
+void SolverBase::copy_debug_colors(float* ptr) {
+    CUDA_CHECK(cudaMemcpy(
+        ptr,
+        thrust::raw_pointer_cast(debug_colors.data()),
+        params.nb_all_cloth_vertices * sizeof(float3),
+        cudaMemcpyDeviceToHost
+    ));
 }
 
 // static __device__ __forceinline__
@@ -394,7 +368,10 @@ void SolverBase::clear_pick_triangle() {
 
 static __global__ void update_begin(
     float3* __restrict__ vertices_world,
-    const float3* __restrict__ vertices,
+    float3* __restrict__ vertices_world_old,
+    float3* __restrict__ vertices,
+    const ObjectDataInput*__restrict__ obj_data,
+    const float3* __restrict__ vertices_new,
     const int* __restrict__ vertices_obj,
     const Mat4* __restrict__ world_matrices,
     const int n
@@ -402,7 +379,44 @@ static __global__ void update_begin(
     for ( int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
           i += blockDim.x * gridDim.x ) {
         int obj = vertices_obj[i];
-        vertices_world[i] = mul_homo(world_matrices[obj], vertices[i]);
+        auto& obj_data_input = obj_data[obj];
+        vertices_world_old[i] = mul_homo(world_matrices[obj], vertices[i]);
+        auto wm = obj_data_input.matrix_updated ? obj_data_input.new_matrix : world_matrices[obj];
+        if ( obj_data_input.vertices_updated ) {
+            vertices[i] = vertices_new[i];
+        }
+        vertices_world[i] = mul_homo(wm, vertices[i]);
+    }
+}
+
+static __global__ void update_begin_obj(
+    ObjectDataInput*__restrict__ obj_data,
+    Mat4* __restrict__ world_matrices,
+    Mat4* __restrict__ world_matrices_inv,
+    int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if ( i >= n ) return;
+    if ( obj_data[i].matrix_updated ) {
+        world_matrices[i] = obj_data[i].new_matrix;
+        world_matrices_inv[i] = world_matrices[i].inverse();
+    }
+    obj_data[i].matrix_updated = false;
+    obj_data[i].vertices_updated = false;
+}
+static __global__ void update_interpolated_position(
+    float3* __restrict__ vertices_interpolated,
+    const float3* __restrict__ vertices_world_new,
+    const float3* __restrict__ vertices_world_old,
+    const float factor,
+    const int num_cloth_vertices,
+    const int n
+) {
+    for ( int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+          i += blockDim.x * gridDim.x ) {
+        if ( i < num_cloth_vertices ) return;
+        vertices_interpolated[i] =
+            vertices_world_old[i] * (1.f - factor) + vertices_world_new[i] * factor;
     }
 }
 
@@ -411,16 +425,22 @@ static __global__ void update_substep_end(
     float3* __restrict__ velocities,
     const float3* __restrict__ forces,
     const char* __restrict__ vertices_mask,
+    const float* __restrict__ masses,
     const float h,
+    const float max_velocity,
     const int n
 ) {
     for ( int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
           i += blockDim.x * gridDim.x ) {
         auto x = vertices_world[i];
         if ( !vertices_mask[i] ) {
-            float mass = 1.f;
+            float mass = masses[i];
             auto v = velocities[i];
-            v = v + forces[i] / mass * h;
+            float3 force = forces[i] + make_float3(0.f, 0.f, -9.8f * mass);
+            v = v + force / mass * h;
+            // float max_velocity = 40.f;
+            if ( norm(v) > max_velocity )
+                v = normalized(v) * max_velocity;
             v = v * expf(-h * 0.5f);
             x = x + v * h;
             velocities[i] = v;
@@ -433,16 +453,18 @@ static __global__ void update_substep_end(
     }
 }
 static __global__ void update_end(
-    const float3* __restrict__ vertices_world,
     float3* __restrict__ vertices,
+    const float3* __restrict__ vertices_world,
+    const int* proxy,
     const int* __restrict__ vertices_obj,
     const Mat4* __restrict__ world_matrices_inv,
     const int n
 ) {
     for ( int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
           i += blockDim.x * gridDim.x ) {
+        int p_id = proxy[i];
         int obj = vertices_obj[i];
-        vertices[i] = mul_homo(world_matrices_inv[obj], vertices_world[i]);
+        vertices[i] = mul_homo(world_matrices_inv[obj], vertices_world[p_id]);
     }
 }
 
@@ -457,94 +479,266 @@ void SolverBase::update(float dt) {
     if ( n <= 0 ) return;
 
     this->dt = dt;
-    int threadsPerBlock = 256;
-    bool has_pick_triangles = (int)pick_triangles.size() > 0;
+    int block = 256;
 
+    int blocksPerGrid = (n + block - 1) / block;
+    update_begin<<<blocksPerGrid, block>>>(
+        vertices_world.data().get(),
+        vertices_old.data().get(),
+        vertices_local.data().get(),
+        obj_data.data().get(),
+        vertices_local_new_frame.data().get(),
+        vertices_obj.data().get(),
+        world_matrices.data().get(),
+        n);
+    update_pin(vertices_world.data().get());
+    cudaMemcpyAsync(vertices_new.data().get(), vertices_world.data().get(),
+        params.nb_all_vertices * sizeof(float3), cudaMemcpyDeviceToDevice);
+    int obj_num = params.nb_all_objects;
+    update_begin_obj<<<(obj_num + block - 1) / block, block>>>(
+        obj_data.data().get(),
+        world_matrices.data().get(),
+        world_matrices_inv.data().get(),
+        obj_num);
 
-    int blocksPerGrid = (n + threadsPerBlock - 1) / threadsPerBlock;
-    update_begin<<<blocksPerGrid, threadsPerBlock>>>(
-        thrust::raw_pointer_cast(vertices_world.data()),
-        thrust::raw_pointer_cast(vertices_local.data()),
-        thrust::raw_pointer_cast(vertices_obj.data()),
-        thrust::raw_pointer_cast(world_matrices.data()),
-        n
-        );
+    int sewing_forced_connect_frame = max(1, (int)get_global_parameter("sewing_forced_connect_frame",80));
+    check_sewing(frame > sewing_forced_connect_frame);
+    fill_inv_mass<<<(n + block - 1) / block, block>>>(
+        mass_inv.data().get(),
+        vertices_obj.data().get(),
+        object_types.data().get(),
+        masses.data().get(),
+        vertices_mask.data().get(), n);
+    float step_h = max(0.000001f, get_global_parameter("step_h",0.0001f));
+    float3* q = vertices_world.data().get();
+    float max_dist = params.cloth_edge_mean_length;
+    int update_pick_substeps = max(1, (int)get_global_parameter("update_pick_substeps",10));
+    float IPC_k = max(0.f, get_global_parameter("IPC_k",1500.f));
+    float sewing_k = max(0.f, get_global_parameter("sewing_k",2e3));
+    float max_vel = max(0.f, get_global_parameter("max_vel",1000));
+    int update_collision_substeps = max(1, (int)get_global_parameter("update_collision_substeps",20));
+    // int LCP_substeps = max(1, (int)get_global_parameter("LCP_substeps",20));
+    bool collision_collect_ee = get_global_parameter("collision_collect_ee", 1.f) > 0;
+    bool collision_collect_tp = get_global_parameter("collision_collect_tp", 1.f) > 0;
+    float dt_rest = dt;
 
-    float step_h = 0.0001f;
-    for ( int substep = 0; dt > 0.f; substep++, dt -= step_h ) {
-        if ( substep > 1000 ) break;
-        float h = step_h > dt ? dt : step_h;
+    for ( int substep = 0; dt_rest > 0.f; substep++ ) {
+        if ( substep > 10000 ) break;
+        float h = step_h > dt_rest ? dt_rest : step_h;
+        if ( substep % update_collision_substeps == 0 ) {
+            float factor = clamp(1.f - (dt_rest / dt) + 0.1f, 0., 1.f);
+            update_interpolated_position<<<blocksPerGrid, block>>>(
+                q, vertices_new.data().get(),
+                vertices_old.data().get(),
+                factor, params.nb_all_cloth_vertices, n);
+            collision_collect_near_pairs(q, max_dist, true, true, collision_collect_tp, collision_collect_ee);
+        }
         // update substep...
-        const auto gravity = make_float3(0.f, 0.f, -9.8f);
-        forces.assign(params.nb_all_cloth_vertices, gravity);
+        // const auto gravity = make_float3(0.f, 0.f, -9.8f);
+        // forces.assign(params.nb_all_cloth_vertices, make_float3(0.f, 0.f, 0.f));
+        cudaMemsetAsync(forces.data().get(), 0, params.nb_all_cloth_vertices * sizeof(float3));
+
+        n = pp_result_size_h;
+        // compute_collision_penalty_force_point_point<<<(n + block - 1) / block, block>>>(
+        //     nullptr, nullptr,
+        //     forces.data().get(),
+        //     velocities.data().get(),
+        //     pp_collision_result.data().get(),
+        //     q, max_dist, h, n);
+
+        int num_constraints = pp_result_size_h + tp_result_size_h + ee_result_size_h;
+        if ( num_constraints > 0 ) {
+            cudaMemsetAsync(weight.data().get(), 0, params.nb_all_cloth_vertices * sizeof(float));
+            compute_normal_constraint_IPC_force<<<(num_constraints + block - 1) / block, block>>>(
+                forces.data().get(), weight.data().get(), normal_constraints.data().get(),
+                q, mass_inv.data().get(), obj_data.data().get(), vertices_obj.data().get(),
+                IPC_k, num_constraints);
+            n = params.nb_all_cloth_edges;
+            apply_weight_force<<<(n + block - 1) / block, block>>>(
+                forces.data().get(), weight.data().get(), n);
+        }
+
         n = params.nb_all_cloth_edges;
-        blocksPerGrid = (n + threadsPerBlock - 1) / threadsPerBlock;
-        compute_spring_forces<<<blocksPerGrid, threadsPerBlock>>>(nullptr, nullptr,
-            thrust::raw_pointer_cast(forces.data()),
-            thrust::raw_pointer_cast(vertices_world.data()),
-            // thrust::raw_pointer_cast(vertices_obj.data()),
-            thrust::raw_pointer_cast(edges.data()),
-            thrust::raw_pointer_cast(edge_lengths.data()),
+        // compute_spring_forces<<<(n + block - 1) / block, block>>>(nullptr, nullptr,
+        //     forces.data().get(), nullptr,
+        //     q,
+        //     thrust::raw_pointer_cast(edges.data()),
+        //     thrust::raw_pointer_cast(edge_lengths.data()),
+        //     n);
+        n = params.nb_all_cloth_triangles;
+        // compute_ARAP_FEM<<<(n + block - 1) / block, block>>>(
+        //     nullptr, nullptr,
+        //     forces.data().get(), nullptr,
+        //     vertices_world.data().get(),
+        //     triangles.data().get(),
+        //     edges.data().get(),
+        //     vertices_obj.data().get(),
+        //     nullptr,
+        //     Dms.data().get(),
+        //     n);
+        compute_BW_FEM<<<(n + block - 1) / block, block>>>(
+            nullptr, nullptr,
+            forces.data().get(), nullptr,
+            vertices_world.data().get(),
+            triangles.data().get(),
+            edges.data().get(),
+            vertices_obj.data().get(),
+            nullptr,
+            Dms.data().get(),
             n);
-        compute_dihedral_bending_Fizt<<<blocksPerGrid, threadsPerBlock>>>(
+        // compute_dihedral_bending_Fizt<<<blocksPerGrid, block>>>(
+        //     nullptr, nullptr, nullptr,
+        //     thrust::raw_pointer_cast(forces.data()),
+        //     thrust::raw_pointer_cast(vertices_world.data()),
+        //     thrust::raw_pointer_cast(edges.data()),
+        //     nullptr,
+        //     nullptr,
+        //     thrust::raw_pointer_cast(edge_opposite_points.data()),
+        //     n, 0.2);
+        n = params.nb_all_cloth_edges;
+        compute_quadratic_Bending_IBM<<< (n + block - 1) / block, block>>>(
             nullptr, nullptr, nullptr,
-            thrust::raw_pointer_cast(forces.data()),
-            thrust::raw_pointer_cast(vertices_world.data()),
-            thrust::raw_pointer_cast(edges.data()),
-            nullptr,
-            nullptr,
-            thrust::raw_pointer_cast(edge_opposite_points.data()),
-            n, 0.5);
+            forces.data().get(), nullptr,
+            IBM_q.data().get(),
+            q,
+            edges.data().get(),
+            e2t.data().get(),
+            triangles.data().get(),
+            edge_opposite_points.data().get(),
+            n, 0.2f);
+        if ( !sewing_done ) {
+            float min_dist = 2e-3f;
+            n = params.nb_all_stitches;
+            compute_stitch_constraint<<<(n + block - 1) / block, block>>>(
+                nullptr, nullptr, forces.data().get(),
+                nullptr,
+                q, vertices_obj.data().get(), obj_data.data().get(),
+                vertices_mask.data().get(), stitches.data().get(), min_dist, sewing_k, n);
+        }
         // update substep end
-        check_update_pick();
+
         n = params.nb_all_cloth_vertices;
-        blocksPerGrid = (n + threadsPerBlock - 1) / threadsPerBlock;
-        update_substep_end<<<blocksPerGrid, threadsPerBlock>>>(
+        if ( substep % update_pick_substeps == 0 ) {
+            check_update_pick();
+        }
+        update_substep_end<<<(n + block - 1) / block, block>>>(
             thrust::raw_pointer_cast(vertices_world.data()),
             thrust::raw_pointer_cast(velocities.data()),
             thrust::raw_pointer_cast(forces.data()),
             thrust::raw_pointer_cast(vertices_mask.data()),
-            h, n);
-
+            thrust::raw_pointer_cast(masses.data()),
+            h, max_vel, n);
+        // if ( substep % LCP_substeps == 0 ) {
+        //     collision_LCP_postprocess_unified(vertices_world.data().get());
+        // }
+        dt_rest -= step_h;
     }
     n = params.nb_all_cloth_vertices;
-    blocksPerGrid = (n + threadsPerBlock - 1) / threadsPerBlock;
-    update_end<<<blocksPerGrid, threadsPerBlock>>>(
-        thrust::raw_pointer_cast(vertices_world.data()),
-        thrust::raw_pointer_cast(vertices_local.data()),
-        thrust::raw_pointer_cast(vertices_obj.data()),
-        thrust::raw_pointer_cast(world_matrices_inv.data()),
-        n
-        );
+    blocksPerGrid = (n + block - 1) / block;
+    update_end<<<blocksPerGrid, block>>>(
+        vertices_local.data().get(),
+        vertices_world.data().get(),
+        vertex_proxy.data().get(),
+        vertices_obj.data().get(),
+        world_matrices_inv.data().get(),
+        n);
+    int smooth_times = max(0, (int)get_global_parameter("smooth_times",5));
+    if ( !sewing_done ) { smooth_times *= 2; }
+    for ( int i = 0; i < smooth_times; ++i ) {
+        laplacian_smoothing<<<n + block - 1, block>>>(
+            temp_vertices_f3.data().get(),
+            velocities.data().get(),
+            vertices_mask.data().get(),
+            edge_lookup.data().get(),
+            dir_edges.data().get(),
+            0.02f, n
+            );
+        thrust::swap(temp_vertices_f3, velocities);
+    }
     reset_pick_mask();
-    cudaDeviceSynchronize();
+    CUDA_CHECK(cudaDeviceSynchronize());
+    frame++;
 }
-int SolverBase::add_picker(float3 position) {
-    cudaDeviceSynchronize();
-    int ptindex = add_pick_triangle(0, -2, position);
-    pickers.push_back(ptindex);
-    return (int)pickers.size() - 1;
+static __global__ void update_world_matrix_kernel(
+    ObjectDataInput* object_data, const Mat4 world_matrix, int index) {
+    object_data[index].new_matrix = world_matrix;
+    object_data[index].matrix_updated = true;
 }
-void SolverBase::update_picker(int index, float3 position) {
-    cudaDeviceSynchronize();
-    if ( pickers[index] != -1 ) {
-        update_pick_triangle(pickers[index], position);
+void SolverBase::update_world_matrix(int obj_index, const std::vector<float>& matrix) {
+    Mat4 world_matrix;
+    memcpy(&world_matrix, matrix.data(), sizeof(float) * 16);
+    update_world_matrix_kernel<<<1,1>>>(
+        obj_data.data().get(), world_matrix, obj_index);
+    CUDA_CHECK(cudaDeviceSynchronize());
+}
+static __global__ void update_local_vertices_kernel(
+    ObjectDataInput* object_data, int index) {
+    object_data[index].vertices_updated = true;
+}
+void SolverBase::update_local_vertices(int obj_index, const std::vector<float>& vertices) {
+    int offset;
+    CUDA_CHECK(cudaMemcpy(&offset, vertex_index_offsets.data().get() + obj_index,
+        sizeof(int), cudaMemcpyDeviceToHost));
+    auto* ptr = vertices_local_new_frame.data().get() + offset;
+    CUDA_CHECK(cudaMemcpy(ptr,vertices.data(),vertices.size() * sizeof(float),
+        cudaMemcpyHostToDevice));
+    update_local_vertices_kernel<<<1,1>>>(
+        obj_data.data().get(), obj_index);
+    CUDA_CHECK(cudaDeviceSynchronize());
+}
+
+
+AutoGPUmem SolverBase::alloc_pool() {
+    for ( size_t i = 0; i < pool_used.size(); ++i )
+        if ( !pool_used[i] ) {
+            pool_used[i] = true;
+            return AutoGPUmem{ this,
+                thrust::raw_pointer_cast(&pool[i]) };
+        }
+    throw std::exception("No pool available");
+    // pool.resize(pool.size() * 2);
+    // pool_used.resize(pool.size(), false);
+    // pool_used[pool.size() / 2] = true;
+    // return AutoGPUmem{ this,
+    //     thrust::raw_pointer_cast(&pool[pool.size() / 2]) };
+}
+void SolverBase::dealloc_pool(void* p) {
+    size_t idx = reinterpret_cast<int*>(p) - thrust::raw_pointer_cast(&pool[0]);
+    if ( idx < pool.size() ) pool_used[idx] = false;
+}
+
+AutoGPUmem::~AutoGPUmem() { pool->dealloc_pool(ptr); }
+struct DotProductFunctor {
+    __device__ __forceinline__
+    float operator()(const thrust::tuple<const float3&, const float3&>& t) const {
+        const float3& va = thrust::get<0>(t);
+        const float3& vb = thrust::get<1>(t);
+        return va.x * vb.x + va.y * vb.y + va.z * vb.z;
     }
-    cudaDeviceSynchronize();
+};
+
+float SolverBase::vector_field_dot(const float3* a, const float3* b) {
+    int n = params.nb_all_cloth_vertices;
+    // int threadsPerBlock = 256;
+    // int blocksPerGrid = (n + threadsPerBlock - 1) / threadsPerBlock;
+    //
+    // vector_field_dot_kernel<<<blocksPerGrid, threadsPerBlock>>>(
+    //     thrust::raw_pointer_cast(temp1.data()),
+    //     a, b, n);
+    // float res = thrust::reduce(temp1.begin(), temp1.begin() + n, 0.f);
+    // return res;
+    auto a_begin = thrust::device_pointer_cast(a);
+    auto a_end = thrust::device_pointer_cast(a + n);
+    auto b_begin = thrust::device_pointer_cast(b);
+
+    return thrust::transform_reduce(
+        thrust::make_zip_iterator(thrust::make_tuple(a_begin, b_begin)),
+        thrust::make_zip_iterator(thrust::make_tuple(a_end, b_begin)),
+        DotProductFunctor{},
+        0.0f,
+        thrust::plus<float>());
 }
-void SolverBase::remove_picker(int index) {
-    cudaDeviceSynchronize();
-    if ( index >= (int)pickers.size() || index < 0 ) return;
-    remove_pick_triangle(pickers[index]);
-    pickers[index] = -1;
-    cudaDeviceSynchronize();
-    for ( int ptindex : pickers ) {
-        if ( ptindex != -1 ) return;
-    }
-    clear_picker();
-}
-void SolverBase::clear_picker() {
-    cudaDeviceSynchronize();
-    pickers.clear();
-    cudaDeviceSynchronize();
+
+float SolverBase::get_global_parameter(const std::string& key, float default_value) const {
+    return simulator->get_parameter(key, default_value);
 }

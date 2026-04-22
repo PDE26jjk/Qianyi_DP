@@ -58,3 +58,31 @@ static __device__ float point_triangle_sq_dist(float3 p, float3 a, float3 b, flo
 	*closest_pt = a + ab * v + ac * w;
 	return len_sq(p - *closest_pt);
 }
+static __device__ __forceinline__ int get_hash(int3 p, int table_size) {
+    long long h = (p.x * 73856093LL) ^ (p.y * 19349663LL) ^ (p.z * 83492791LL);
+    // Use unsigned modulo arithmetic
+    return (int)(abs(h) % table_size);
+}
+
+static void __device__ barycentric(const float3& A, const float3& B, const float3& C,
+    const float3& P, float& u, float& v, float& w) {
+    float3 v0 = B - A;
+    float3 v1 = C - A;
+    float3 v2 = P - A;
+
+    float d00 = dot(v0, v0);
+    float d01 = dot(v0, v1);
+    float d11 = dot(v1, v1);
+    float d20 = dot(v2, v0);
+    float d21 = dot(v2, v1);
+    float denom = d00 * d11 - d01 * d01;
+
+    if ( fabs(denom) < 1e-10 ) {
+        u = v = w = -1.0;
+        return;
+    }
+
+    u = (d11 * d20 - d01 * d21) / denom;
+    v = (d00 * d21 - d01 * d20) / denom;
+    w = 1.0f - u - v;
+}

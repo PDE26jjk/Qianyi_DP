@@ -127,6 +127,7 @@ static __global__ void check_sewing_kernel(
     const char* __restrict__ mask,
     const int2* __restrict__ stitches,
     float min_dist_sq,
+    bool forced_connect,
     int num_stitches
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -134,14 +135,16 @@ static __global__ void check_sewing_kernel(
     auto stitch = stitches[idx];
     if ( stitches_status[idx] == stitch_status_done ) return;// Already done
     auto [v0,v1] = stitch;
-    if ( mask[v0] && mask[v1] ) {
-        stitches_status[idx] = stitch_status_suspend;
+    if ( mask[v0] && mask[v1] ) { // No need to move
+        // stitches_status[idx] = stitch_status_suspend;
+        stitches_status[idx] = stitch_status_done;
+        atomicAdd(stitches_done_count, 1);       
         return;
     }
     v0 = min(vertex_proxy[v0], v0);
     v1 = min(vertex_proxy[v1], v1);
     auto p0 = vertices[v0], p1 = vertices[v1];
-    if ( len_sq(p0 - p1) < min_dist_sq ) {
+    if ( forced_connect || len_sq(p0 - p1) < min_dist_sq ) {
         if ( mask[v0] ) {
             vertex_proxy[v1] = v0;
         }
@@ -156,7 +159,6 @@ static __global__ void check_sewing_kernel(
         atomicAdd(stitches_done_count, 1);
     }
 }
-constexpr char proxy_mask = 0b0100;// 4
 static __global__ void update_proxy_mask(
     int* vertex_proxy,
     char* __restrict__ mask,
@@ -169,7 +171,7 @@ static __global__ void update_proxy_mask(
         proxy_idx = vertex_proxy[proxy_idx];
     if ( proxy_idx != idx ) {
         vertex_proxy[idx] = proxy_idx;
-        mask[idx] |= proxy_mask;
+        mask[idx] |= static_cast<char>(MaskBit::proxy_mask);
     }
 }
 static __global__ void update_proxy_edge(
@@ -243,10 +245,13 @@ static __device__ void reorder_triangle(
     }
     indices[i] = make_int3(v0, v1, v2);
     // 3. Find global edge indices using the lookup table
-    int e1_i = v2e(v0, v1, edge_lookup, dir_edges);
-    int e2_i = v2e(v0, v2, edge_lookup, dir_edges);
-    int e3_i = v2e(v1, v2, edge_lookup, dir_edges);
-
+    int e1_i = v2e_include_stitches(v0, v1, edge_lookup, dir_edges);
+    int e2_i = v2e_include_stitches(v0, v2, edge_lookup, dir_edges);
+    int e3_i = v2e_include_stitches(v1, v2, edge_lookup, dir_edges);
+    if (e1_i == -1 || e2_i == -1 || e3_i == -1 ) {
+        printf("ERROR in reorder_triangle!\n");
+        return;
+    }
     triangles[i] = make_int3(e1_i, e2_i, e3_i);
 
     // 4. Update Edge-to-Triangle (e2t) mapping
@@ -270,7 +275,8 @@ static __device__ void reorder_triangle(
         e2t[e3_i].x = i;
     }
 }
-static __global__ void update_proxy_triangle(
+static __global__ void update_proxy_triangles(
+    float3* __restrict__ debug_colors,
     int3* __restrict__ triangles,
     int3* __restrict__ triangle_indices,
     int2* __restrict__ e2t,
@@ -298,10 +304,14 @@ static __global__ void update_proxy_triangle(
     }
     if ( need_to_reorder ) {
         reorder_triangle(idx, triangles, triangle_indices, e2t, vertices, edge_lookup, dir_edges);
+        t = triangle_indices[idx];
+        debug_colors[t.x] = make_float3(1.0f, 0.0f, 0.0f);
+        debug_colors[t.y] = make_float3(1.0f, 0.0f, 0.0f);
+        debug_colors[t.z] = make_float3(1.0f, 0.0f, 0.0f);
     }
 }
 
-void SolverBase::check_sewing() {
+void SolverBase::check_sewing(bool forced_connect) {
     int block = 256;
 
     int n = params.nb_all_stitches;
@@ -309,7 +319,7 @@ void SolverBase::check_sewing() {
     cudaMemcpy(&stitches_done_count_old, stitches_done_count.data().get(), sizeof(int), cudaMemcpyDeviceToHost);
     sewing_done = true;
     if ( stitches_done_count_old >= n ) return;
-    float min_dist = 5e-3f;
+    float min_dist = 1e-2f;
     check_sewing_kernel<<<(n + block - 1) / block, block>>>(
         vertex_proxy.data().get(),
         stitches_done_count.data().get(),
@@ -317,14 +327,14 @@ void SolverBase::check_sewing() {
         vertices_world.data().get(),
         vertices_mask.data().get(),
         stitches.data().get(),
-        min_dist * min_dist, n);
+        min_dist * min_dist, forced_connect, n);
     int stitches_done_count_new;
     cudaMemcpy(&stitches_done_count_new, stitches_done_count.data().get(), sizeof(int), cudaMemcpyDeviceToHost);
-    
-    std::cout << stitches_done_count_new << std::endl;
+
+    std::cout << "stitches: " << stitches_done_count_new << "/" << n << std::endl;
     if ( stitches_done_count_new > stitches_done_count_old ) {
-        #define CHECK(v,type) thrust::host_vector<type> _##v = v;\
-        std::vector<type> __##v(_##v.begin(), _##v.end())
+        // #define CHECK(v,type) thrust::host_vector<type> _##v = v;\
+        // std::vector<type> __##v(_##v.begin(), _##v.end())
         n = params.nb_all_cloth_vertices;
         // CHECK(stitches_status, char);
         update_proxy_mask<<<(n + block - 1) / block, block>>>(
@@ -347,7 +357,8 @@ void SolverBase::check_sewing() {
             n);
         n = params.nb_all_cloth_triangles;
         // CHECK(vertex_proxy, int);
-        update_proxy_triangle<<<(n + block - 1) / block, block>>>(
+        update_proxy_triangles<<<(n + block - 1) / block, block>>>(
+            debug_colors.data().get(),
             triangles.data().get(),
             triangle_indices.data().get(),
             e2t.data().get(),
@@ -357,7 +368,7 @@ void SolverBase::check_sewing() {
             dir_edges.data().get(),
             n);
         // CHECK(sewing_lines, SewingData);
-        #undef CHECK
+        // #undef CHECK
     }
 
     sewing_done = false;

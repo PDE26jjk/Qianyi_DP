@@ -974,7 +974,7 @@ void GpuDel::splitTri()
 
     stopTiming( ProfDefault, _output->stats.splitTime ); 
 
-    Visualizer::instance()->addFrame( _pointVec, SegmentDVec(), _triVec, _infIdx ); 
+    // Visualizer::instance()->addFrame( _pointVec, SegmentDVec(), _triVec, _infIdx ); 
 
     return;
 }
@@ -1223,7 +1223,7 @@ bool GpuDel::doFlipping( CheckDelaunayMode checkMode )
         _timeFlipVec.push_back( _diagLog->_t[ 5 ] - prevTime ); 
 /////////////////////////////////////////////////////////////////////
 
-    Visualizer::instance()->addFrame( _pointVec, SegmentDVec(), _triVec, _infIdx ); 
+    // Visualizer::instance()->addFrame( _pointVec, SegmentDVec(), _triVec, _infIdx ); 
 
     return true;
 }

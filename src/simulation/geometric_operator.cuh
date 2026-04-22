@@ -33,4 +33,17 @@ static __device__ int v2e(int v0, int v1, const int2* lookup, const int2* dir_ed
     }
     return -1;
 }
+static __device__ int v2e_include_stitches(int v0, int v1, const int2* lookup, const int2* dir_edges) {
+    int2 range = lookup[v1]; // x: offset, y: degree
+    for ( int i = 0; i < range.y; ++i ) {
+        int2 entry = dir_edges[range.x + i]; // x: target_v, y: original_edge_id
+        if ( entry.x == v0 ) return entry.y;
+    }
+    range = lookup[v0]; 
+    for ( int i = 0; i < range.y; ++i ) {
+        int2 entry = dir_edges[range.x + i]; 
+        if ( entry.x == v1 ) return entry.y;
+    }
+    return -1;
+}
 

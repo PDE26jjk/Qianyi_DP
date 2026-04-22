@@ -5,7 +5,18 @@
 #include "common/py_utils.h"
 
 void SimulatorInterface::print() {
-    std::cout << "SimulatorInterface" << std::endl;
+    std::cout << "SimulatorInterface::print" << std::endl;
+}
+py::tuple SimulatorInterface::get_all_solver() {
+    auto solvers = Simulator::instance().get_all_solver();
+    py::tuple tup(solvers.size());
+    for ( int i = 0; i < solvers.size(); ++i ) {
+        tup[i] = solvers[i];
+    }
+    return tup;
+}
+void SimulatorInterface::set_solver(const std::string& solver_name) {
+    Simulator::instance().set_solver(solver_name);
 }
 template<typename T>
 void copy_and_add(std::vector<T>& dst, size_t offset, const py::array_t<T>& src, T to_add = T{}) {
@@ -26,7 +37,11 @@ void copy_and_add(std::vector<T>& dst, size_t offset, const std::vector<T>& src,
         ptr[i] = src_ptr[j] + to_add;
     }
 }
-
+static float3 to_float3(py::array_t<float> src) {
+    float3 v;
+    memcpy(&v, src.data(), sizeof(float3));
+    return v;
+}
 void SimulatorInterface::input_data(py::dict input) {
     int nb_all_v{}, nb_all_e{}, nb_all_f{};
     auto mesh_list = input["mesh_list"].cast<py::list>();
@@ -40,8 +55,12 @@ void SimulatorInterface::input_data(py::dict input) {
     std::vector<float> vertices_simulation(nb_all_v);
     std::vector<int> edges(nb_all_e);
     std::vector<int> triangles(nb_all_f);
+    std::vector<float> normals(nb_all_f);
     std::vector<int> object_types(nb_all_o);
-    std::vector<float> mass(nb_all_o);
+    std::vector<float> pin_fixed(nb_all_v);
+    std::vector<float> pin_attached(nb_all_v);
+    // std::vector<float> mass_densitys(nb_all_o);
+    std::vector<ObjectDataInput> obj_data(nb_all_o);
     std::vector<Mat4> world_matrixs(nb_all_o);
 
     int nb_all_cloth_v{ nb_all_v }, nb_all_cloth_e{ nb_all_e }, nb_all_cloth_f{ nb_all_f };
@@ -66,6 +85,20 @@ void SimulatorInterface::input_data(py::dict input) {
             nb_all_cloth_v = nb_all_v;
             nb_all_cloth_e = nb_all_e;
             nb_all_cloth_f = nb_all_f;
+            // local normal of cloth, should be (0,0,1)
+            for ( size_t j = 2; j < nb_all_cloth_f; j += 3 ) {
+                normals[j] = 1.f;
+            }
+        }
+        if ( object_type != 0 ) {
+            auto _normals = mesh["normals"].cast<py::array_t<float>>();
+            copy_and_add(normals, nb_all_f, _normals);
+        }
+        else {
+            auto _pin_fixed = mesh["fixed_vertices"].cast<py::array_t<float>>();
+            copy_and_add(pin_fixed, nb_all_v / 3, _pin_fixed);
+            auto _pin_attached = mesh["attached_vertices"].cast<py::array_t<float>>();
+            copy_and_add(pin_attached, nb_all_v / 3, _pin_attached);
         }
         auto _edges = mesh["edges"].cast<py::array_t<int>>();
         copy_and_add(edges, nb_all_e, _edges, vertex_index_offsets[i]);
@@ -74,7 +107,20 @@ void SimulatorInterface::input_data(py::dict input) {
         nb_all_v += (int)_vertices.size();
         nb_all_e += (int)_edges.size();
         nb_all_f += (int)_triangles.size();
-        mass[i] = mesh["mass"].cast<float>();
+        if ( object_type == 0 ) {
+            obj_data[i].mass_densitys = mesh["mass"].cast<float>();
+            // mass_densitys[i] = mesh["mass"].cast<float>();
+            obj_data[i].granularity = mesh["granularity"].cast<float>();
+            obj_data[i].friction = mesh["friction"].cast<float>();
+            obj_data[i].thickness = mesh["thickness"].cast<float>();
+            obj_data[i].stretch = to_float3(mesh["stretch"].cast<py::array_t<float>>());
+            obj_data[i].shear = to_float3(mesh["shear"].cast<py::array_t<float>>());
+            obj_data[i].bending = to_float3(mesh["bending"].cast<py::array_t<float>>());
+
+        }
+        else {
+            obj_data[i].mass_densitys = 1.f;
+        }
         auto world_matrix = mesh["world_matrix"].cast<py::array_t<float>>();
         Mat4 mat;
         memcpy(&mat.r, world_matrix.data(), sizeof(float) * 16);
@@ -107,23 +153,41 @@ void SimulatorInterface::input_data(py::dict input) {
         i++;
     }
     auto& simulator = Simulator::instance();
-    simulator.init(vertices_init, vertices_simulation, edges, triangles, object_types, mass, world_matrixs,
+    simulator.init(vertices_init, vertices_simulation,
+        edges, triangles, normals, object_types, obj_data, world_matrixs,
         vertex_index_offsets,
-        triangle_index_offsets,
-        sewings,
-        stitches,
+        triangle_index_offsets, pin_fixed, pin_attached,
+        sewings, stitches,
         nb_all_cloth_v, nb_all_cloth_e, nb_all_cloth_f);
 }
 void SimulatorInterface::update(float dt) {
+    py::gil_scoped_release release;
     Simulator::instance().update(dt);
 }
-py::array_t<float> SimulatorInterface::get_simulation_data(bool world_space=false) {
+void SimulatorInterface::update_world_matrix(int index, py::array_t<float> matrix) {
+    auto matrix_ = to_vector(matrix);
+    Simulator::instance().update_world_matrix(index, matrix_);
+}
+void SimulatorInterface::update_local_vertices(int index, py::array_t<float> vertices) {
+    auto vertices_ = to_vector(vertices);
+    Simulator::instance().update_local_vertices(index, vertices_);
+}
+py::array_t<float> SimulatorInterface::get_simulation_data(bool world_space = false) {
     auto& simulator = Simulator::instance();
     auto result = py::array_t<float>(
         { (py::ssize_t)simulator.get_params()->nb_all_cloth_vertices, (py::ssize_t)3 });
     py::buffer_info buf = result.request();
     float* ptr = static_cast<float*>(buf.ptr);
-    simulator.copy_vertices(ptr,world_space);
+    simulator.copy_vertices(ptr, world_space);
+    return result;
+}
+py::array_t<float> SimulatorInterface::get_debug_colors() {
+    auto& simulator = Simulator::instance();
+    auto result = py::array_t<float>(
+        { (py::ssize_t)simulator.get_params()->nb_all_cloth_vertices, (py::ssize_t)3 });
+    py::buffer_info buf = result.request();
+    float* ptr = static_cast<float*>(buf.ptr);
+    simulator.copy_debug_colors(ptr);
     return result;
 }
 int SimulatorInterface::pick_triangle(int mesh_index, int tri_index, py::array_t<float> position) {
@@ -155,4 +219,15 @@ void SimulatorInterface::picker_update(int index, py::array_t<float> position) {
 }
 void SimulatorInterface::picker_remove(int index) {
     Simulator::instance().remove_picker(index);
+}
+void SimulatorInterface::set_parameter(const std::string& key, float value) {
+    Simulator::instance().set_parameter(key, value);
+}
+void SimulatorInterface::set_parameters(const std::unordered_map<std::string, float>& params) {
+    for ( const auto& [fst, snd] : params ) {
+        Simulator::instance().set_parameter(fst, snd);
+    }
+}
+void SimulatorInterface::on_exit() {
+    Simulator::instance().reset();
 }

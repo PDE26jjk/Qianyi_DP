@@ -287,8 +287,51 @@ int main(int argc, char* argv[]) {
 
 	return 0;
 }
-std::vector<int3> Delaunay2D(std::vector<float2>& pointVecIn,
+std::vector<int3> delaunay_2d_cuda_type_impl(std::vector<float2>& pointVecIn,
 				std::vector<int2>& constraintVecIn) {
+	GpuDel gpuDel;
+	GDel2DInput _input;
+	GDel2DOutput _output;
+	int _seed = 0;
+	auto pointVec = Point2HVec(pointVecIn.size());
+	for (size_t i = 0; i < pointVec.size(); i++) {
+		Point2 p;
+		p._p[0] = static_cast<RealType>(pointVecIn[i].x);
+		p._p[1] = static_cast<RealType>(pointVecIn[i].y);
+		pointVec[i] = p;
+	}
+	_input.pointVec = pointVec;
+	auto constraintVec = SegmentHVec(constraintVecIn.size());
+	static_assert(sizeof(int2) == sizeof(Segment), "Size mismatch");
+	memcpy(constraintVec.data(), constraintVecIn.data(),
+		constraintVecIn.size() * sizeof(int2));
+
+	_input.constraintVec = constraintVec;
+	TriHVec().swap(_output.triVec);
+	TriOppHVec().swap(_output.triOppVec);
+
+	gpuDel.compute(_input, &_output);
+	const Statistics& stats = _output.stats;
+	Statistics statSum;
+	statSum.accumulate(stats);
+
+	std::cout << "TIME: " << stats.totalTime << "("
+	<< stats.initTime << ", "
+	<< stats.splitTime << ", "
+	<< stats.flipTime << ", "
+	<< stats.relocateTime << ", "
+	<< stats.sortTime << ", "
+	<< stats.constraintTime << ", "
+	<< stats.outTime << ")"
+	<< std::endl;
+
+	static_assert(sizeof(Tri) == sizeof(int3), "Size mismatch");
+	std::vector<int3> int3_vec(_output.triVec.size());
+	memcpy(int3_vec.data(), _output.triVec.data(), _output.triVec.size() * sizeof(int3));
+	return int3_vec;
+}
+std::vector<int> delaunay_2d_impl(const std::vector<float>& pointVecIn,
+				const std::vector<int>& constraintVecIn) {
 // TriHVec Delaunay2D(Point2HVec& pointVec,
 //                 SegmentHVec& constraintVec) {
 	// It will destroy all memory in cuda
@@ -307,23 +350,24 @@ std::vector<int3> Delaunay2D(std::vector<float2>& pointVecIn,
 	int _seed = 0;
 	// Point2HVec().swap(_input.pointVec);
 	// SegmentHVec().swap(_input.constraintVec);
-	auto pointVec = Point2HVec(pointVecIn.size());
-	for (int i = 0; i < pointVecIn.size(); i++) {
+	auto pointVec = Point2HVec(pointVecIn.size() / 2);
+	for (size_t i = 0; i < pointVec.size(); i++) {
 		Point2 p;
-		p._p[0] = static_cast<RealType>(pointVecIn[i].x);
-		p._p[1] = static_cast<RealType>(pointVecIn[i].y);
+		p._p[0] = static_cast<RealType>(pointVecIn[i * 2]);
+		p._p[1] = static_cast<RealType>(pointVecIn[i * 2 + 1]);
 		pointVec[i] = p;
 	}
 	_input.pointVec = pointVec;
-	auto constraintVec = SegmentHVec(constraintVecIn.size());
-	static_assert(sizeof(int2) == sizeof(Segment), "Size mismatch");
-	memcpy(constraintVec.data(), constraintVecIn.data(), constraintVecIn.size() * sizeof(int2));
+	auto constraintVec = SegmentHVec(constraintVecIn.size() / 2);
+	static_assert(sizeof(int) * 2 == sizeof(Segment), "Size mismatch");
+	memcpy(constraintVec.data(), constraintVecIn.data(),
+		constraintVecIn.size() * sizeof(int));
 
 	_input.constraintVec = constraintVec;
 	TriHVec().swap(_output.triVec);
 	TriOppHVec().swap(_output.triOppVec);
 
-	std::cout << "Point set: " << _seed << std::endl;
+	// std::cout << "Point set: " << _seed << std::endl;
 
 	// 1. Create points
 	// InputCreator creator;
@@ -365,8 +409,8 @@ std::vector<int3> Delaunay2D(std::vector<float2>& pointVecIn,
 		checker.checkConstraints();
 		checker.checkDelaunay();
 	}
-	static_assert(sizeof(Tri) == sizeof(int3), "Size mismatch");
-	std::vector<int3> int3_vec(_output.triVec.size());
+	static_assert(sizeof(Tri) == sizeof(int) * 3, "Size mismatch");
+	std::vector<int> int3_vec(_output.triVec.size() * 3);
 	memcpy(int3_vec.data(), _output.triVec.data(), _output.triVec.size() * sizeof(int3));
 	return int3_vec;
 }

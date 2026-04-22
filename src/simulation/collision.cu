@@ -1,286 +1,21 @@
-﻿#include "solver_base.cuh"
+﻿#include "contact/collision.cuh"
+
+#include "solver_base.cuh"
 #include "common/cuda_utils.h"
 #include <cuda_runtime.h>
-#include <device_launch_parameters.h>
 #include <thrust/execution_policy.h>
 #include <thrust/sort.h>
 
-#include "constraint.cuh"
 #include "solver_PCG.cuh"
-#include "common/atomic_utils.cuh"
-#include "common/geometric_algorithms.h"
 #include "common/math_utils.h"
-
-
-static __device__ __forceinline__ int get_hash(int3 p, int table_size) {
-    int h = (p.x * 73856093) ^ (p.y * 19349663) ^ (p.z * 83492791);
-    return abs(h) % table_size;
-}
-
-static __global__ void insert_points_to_grid(
-    const float3* __restrict__ points,
-    PointHashCell* table,
-    float cell_size,
-    int hash_table_size,
-    int num_points
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if ( idx >= num_points ) return;
-
-    float cell_size_inv = 1.0f / cell_size;
-    float3 p = points[idx];
-    int3 grid_idx = make_int3(floorf(p.x * cell_size_inv), floorf(p.y * cell_size_inv),
-        floorf(p.z * cell_size_inv));
-
-    int h = get_hash(grid_idx, hash_table_size);
-
-    int old_count = atomicAdd(&table[h].count, 1);
-    if ( old_count < MAX_POINTS_PER_CELL ) {
-        table[h].point_indices[old_count] = idx;
-    }
-}
-template<bool InsertToGrid>
-static __global__ void record_point_hash(
-    int2* __restrict__ results,
-    int* __restrict__ results_sort_key,
-    int* __restrict__ results_size,
-    PointHashCell* hash_table,
-    const float3* __restrict__ points,
-    float cell_size,
-    float max_dist,
-    int max_results_size,
-    int hash_table_size,
-    int num_points
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if ( idx >= num_points ) return;
-
-    float cell_size_inv = 1.0f / cell_size;
-    float3 p = points[idx];
-    int3 grid_idx = make_int3(floorf(p.x * cell_size_inv), floorf(p.y * cell_size_inv),
-        floorf(p.z * cell_size_inv));
-    if constexpr ( InsertToGrid ) {
-        int h = get_hash(grid_idx, hash_table_size);
-        int old_count = atomicAdd(&hash_table[h].count, 1);
-        if ( old_count < MAX_POINTS_PER_CELL ) {
-            hash_table[h].point_indices[old_count] = idx;
-        }
-    }
-
-    int x_min = (int)floorf((p.x - max_dist) * cell_size_inv) != grid_idx.x ? -1 : 0;
-    int x_max = (int)floorf((p.x + max_dist) * cell_size_inv) != grid_idx.x ? 1 : 0;
-    int y_min = (int)floorf((p.y - max_dist) * cell_size_inv) != grid_idx.y ? -1 : 0;
-    int y_max = (int)floorf((p.y + max_dist) * cell_size_inv) != grid_idx.y ? 1 : 0;
-    int z_min = (int)floorf((p.z - max_dist) * cell_size_inv) != grid_idx.z ? -1 : 0;
-    int z_max = (int)floorf((p.z + max_dist) * cell_size_inv) != grid_idx.z ? 1 : 0;
-    for ( int x = x_min; x <= x_max; x++ )
-        for ( int y = y_min; y <= y_max; y++ )
-            for ( int z = z_min; z <= z_max; z++ ) {
-                int h = get_hash(grid_idx + make_int3(x, y, z), hash_table_size);
-                int res_id = atomicAdd(results_size, 1);
-                if ( res_id < max_results_size ) {
-                    results[res_id] = make_int2(h, idx);
-                    results_sort_key[res_id] = h;
-                }
-            }
-}
-
-static __global__ void record_point_hash_table_lookup(
-    int* __restrict__ lookup,
-    const int2* __restrict__ sorted_results,
-    int hash_table_size,
-    int sorted_results_size
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if ( idx >= sorted_results_size ) return;
-    auto pp_hash = sorted_results[idx].x;
-    auto pp_hash_prev = idx > 0 ? sorted_results[idx - 1].x : -1;
-    if ( pp_hash != pp_hash_prev && pp_hash < hash_table_size ) {
-        lookup[pp_hash] = idx;
-    }
-}
-static __device__ bool has_edge(int v0, int v1, const int2* lookup, const int2* dir_edges) {
-    // if (lookup[v0].y > lookup[v1].y) {int temp = v0; v0 = v1; v1 = temp; }
-    auto [offset, degree] = lookup[v0];
-    if ( dir_edges[offset].x <= v1 && v1 <= dir_edges[offset + degree - 1].x ) {
-        for ( int d = 0; d < degree; d++ ) {
-            if ( dir_edges[offset + d].x == v1 ) return true;
-        }
-    }
-    return false;
-}
-static __global__ void collect_pp_sorted(
-    CollisionResult_PP* results,
-    int* results_size,
-    const int2* __restrict__ sorted_results,
-    const float3* __restrict__ points,
-    const int2* __restrict__ edge_lookup,
-    const int2* __restrict__ dir_edges,
-    float cell_size,
-    float max_dist,
-    int hash_table_size,
-    int max_results_size,
-    int sorted_results_size
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if ( idx >= sorted_results_size ) return;
-
-    float cell_size_inv = 1.0f / cell_size;
-    int p_i = sorted_results[idx].y;
-    float3 p = points[p_i];
-    int grid_hash = sorted_results[idx].x;
-    int3 grid_idx = make_int3(floorf(p.x * cell_size_inv), floorf(p.y * cell_size_inv),
-        floorf(p.z * cell_size_inv));
-    int centroid_hash = get_hash(grid_idx, hash_table_size);
-    if ( centroid_hash != grid_hash ) return;// not centroid
-    float dist_sq = max_dist * max_dist;
-    for ( int i = idx + 1; i < sorted_results_size && sorted_results[i].x == grid_hash; ++i ) {
-        int p2_i = sorted_results[i].y;
-        if ( p2_i <= p_i ) continue;
-        float3 p2 = points[p2_i];
-        if ( len_sq(p - p2) < dist_sq ) {
-            if ( has_edge(p_i, p2_i, edge_lookup, dir_edges) ) continue;
-            int res_id = atomicAdd(results_size, 1);
-            if ( res_id < max_results_size )
-                results[res_id] = CollisionResult_PP(p_i, p2_i);
-        }
-    }
-}
-static __global__ void collect_pp(
-    CollisionResult_PP* results,
-    int* results_size,
-    // unsigned long long* sort_key_ptr,
-    // int* sort_value_ptr,
-    // int* sort_results_size,
-    const float3* __restrict__ vertices,
-    const PointHashCell* table,
-    float query_dist_sq,
-    int num_vertices,
-    int max_results_size,
-    // int max_sort_results_size,
-    int hash_table_size,
-    float cell_size
-) {
-    int vert_idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if ( vert_idx >= num_vertices ) return;
-    float3 p = vertices[vert_idx];
-    float cell_size_inv = 1.0f / cell_size;
-    int3 grid_idx = make_int3(floorf(p.x * cell_size_inv), floorf(p.y * cell_size_inv),
-        floorf(p.z * cell_size_inv));
-    for ( int x = -1; x <= 1; x++ )
-        for ( int y = -1; y <= 1; y++ )
-            for ( int z = -1; z <= 1; z++ ) {
-                int h = get_hash(grid_idx + make_int3(x, y, z), hash_table_size);
-                int count = table[h].count;
-                if ( count == 0 ) continue;
-                for ( int k = 0; k < count; k++ ) {
-                    int p_idx = table[h].point_indices[k];
-                    if ( vert_idx >= p_idx ) continue;
-                    float3 p2 = vertices[p_idx];
-                    if ( len_sq(p - p2) <= query_dist_sq ) {
-                        int res_id = atomicAdd(results_size, 1);
-                        if ( res_id < max_results_size ) {
-                            results[res_id] = CollisionResult_PP(vert_idx, p_idx);
-                            // int key_id = atomicAdd(sort_results_size, 1);
-                            // auto sort_key = ((unsigned long long)vert_idx << 32) | (unsigned int)p_idx;
-                            // sort_key_ptr[key_id] = sort_key;
-                            // sort_value_ptr[key_id] = res_id;
-                            // key_id = atomicAdd(sort_results_size, 1);
-                            // sort_key = ((unsigned long long)p_idx << 32) | (unsigned int)vert_idx;
-                            // sort_key_ptr[key_id] = sort_key;
-                            // sort_value_ptr[key_id] = res_id;
-                        }
-                    }
-                }
-            }
-}
-static __global__ void triangles_query_points(
-    CollisionResult_TP* results,
-    int* results_size,
-    const int3* __restrict__ indices,
-    const float3* __restrict__ vertices,
-    const int2* __restrict__ points_hashes,
-    const int* __restrict__ hash_lookup,
-    float cell_size,
-    float query_dist_sq,
-    int hash_table_size,
-    int points_hashes_size,
-    int max_results_size,
-    int num_triangles
-) {
-    int tri_idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if ( tri_idx >= num_triangles ) return;
-
-    int3 idx3 = indices[tri_idx];
-    float3 v0 = vertices[idx3.x];
-    float3 v1 = vertices[idx3.y];
-    float3 v2 = vertices[idx3.z];
-
-    float cell_size_inv = 1.0f / cell_size;
-    float padding = sqrtf(query_dist_sq);
-    float3 min_p = fmin3(v0, fmin3(v1, v2)) - make_float3(padding, padding, padding);
-    float3 max_p = fmax3(v0, fmax3(v1, v2)) + make_float3(padding, padding, padding);
-
-    int3 min_g = make_int3(floorf(min_p.x * cell_size_inv), floorf(min_p.y * cell_size_inv),
-        floorf(min_p.z * cell_size_inv));
-    int3 max_g = make_int3(floorf(max_p.x * cell_size_inv), floorf(max_p.y * cell_size_inv),
-        floorf(max_p.z * cell_size_inv));
-
-    for ( int x = min_g.x; x <= max_g.x; x++ ) {
-        for ( int y = min_g.y; y <= max_g.y; y++ ) {
-            for ( int z = min_g.z; z <= max_g.z; z++ ) {
-
-                int h = get_hash(make_int3(x, y, z), hash_table_size);
-
-                if ( hash_lookup[h] == -1 ) continue;
-
-                for ( int k = hash_lookup[h]; k < points_hashes_size && points_hashes[k].x == h; k++ ) {
-                    int p_idx = points_hashes[k].y;
-                    if ( p_idx == idx3.x || p_idx == idx3.y || p_idx == idx3.z ) continue;
-
-                    float3 pos = vertices[p_idx];
-                    int grid_h = get_hash(make_int3(floorf(pos.x * cell_size_inv), floorf(pos.y * cell_size_inv),
-                        floorf(pos.z * cell_size_inv)), hash_table_size);
-                    if ( grid_h != h ) continue;
-
-                    float3 closest_pt;
-                    float dist_sq = point_triangle_sq_dist(pos, v0, v1, v2, &closest_pt);
-
-                    if ( dist_sq < query_dist_sq ) {
-                        int tp_idx = atomicAdd(results_size, 1);
-                        if ( tp_idx < max_results_size ) {
-                            auto tp = CollisionResult_TP();
-                            tp.vert_idx = p_idx;
-                            tp.tri_idx = tri_idx;
-                            float3 diff = pos - closest_pt;
-                            float d = sqrtf(dist_sq);
-                            tp.normal = (d > 1e-6f) ? diff * (1.0f / d) : make_float3(0, 0, 1);
-                            tp.min_dist_sq = query_dist_sq;
-                            results[tp_idx] = tp;
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-static __global__ void clear_hash_table(PointHashCell* table, int hash_table_size) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if ( idx < hash_table_size ) {
-        table[idx].count = 0;
-    }
-}
-
+#include "contact/hash.cuh"
 
 
 void SolverBase::contact_handle() {
     int block = 256;
     int n = (int)point_hash_table_size;
     clear_hash_table<<<(n + block - 1) / block, block>>>(
-        point_hash_table.data().get(),
-        n
-        );
+        point_hash_table.data().get(), n);
     n = params.nb_all_cloth_vertices;
     // 1. collect pp
     float cell_size = params.cloth_edge_mean_length * 1.414f;
@@ -314,437 +49,603 @@ void SolverBase::contact_handle() {
     //         sort_value_temp.begin());
     // }
 
-    // 3. sort graph
-
-    // 4. GS iter
-}
-
-static __global__ void soft_phase_constraint_edge(
-    float3* __restrict__ grads,
-    int* __restrict__ num_violations,
-    const float3* __restrict__ vertices,
-    const int2* __restrict__ edges,
-    float max_dist,
-    int num_edges
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if ( idx >= num_edges ) return;
-    constexpr float rho = 10.f;
-    auto [p0_i,p1_i] = edges[idx];
-    float3 p0 = vertices[p0_i], p1 = vertices[p1_i];
-
-    float dist = norm((p0 - p1));
-    if ( dist > max_dist ) {
-        float3 dir = (p0 - p1) / (dist + 1e-8f);
-        float violation = dist - max_dist;
-        float3 grad = dir * violation * rho;
-
-        atomicAddFloat3(&grads[p0_i], grad);
-        atomicAddFloat3(&grads[p1_i], -grad);
-
-        atomicAdd(num_violations, 1);
-    }
-}
-static __global__ void soft_phase_constraint_pp(
-    float3* __restrict__ grads,
-    int* __restrict__ num_violations,
-    const CollisionResult_PP* __restrict__ near_point_pairs,
-    const float3* __restrict__ vertices,
-    float min_dist,
-    int num_point_pairs
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if ( idx >= num_point_pairs ) return;
-    constexpr float rho = 2.f;
-
-    int p1_i = near_point_pairs[idx].p1, p2_i = near_point_pairs[idx].p2;
-    float3 p1 = vertices[p1_i], p2 = vertices[p2_i];
-
-    float dist = norm((p1 - p2));
-    if ( dist < min_dist + 1e-5f ) {
-        // L1
-        float3 dir = (p2 - p1) / (dist + 1e-8f);
-        float3 grad = dir * rho;
-        // L2
-        // float violation = max((min_dist - dist) * rho, min_dist * 0.05f);
-        // float3 grad = dir * (violation);
-
-        atomicAddFloat3(&grads[p1_i], grad);
-        atomicAddFloat3(&grads[p2_i], -grad);
-
-        atomicAdd(num_violations, 1);
-        printf("%d,%d, %f, %f\n", p1_i, p2_i, dist, min_dist);
-    }
-}
-
-// Cloth point vs other triangles of objects, only update cloth points
-static __global__ void soft_phase_constraint_tp(
-    CollisionResult_TP* near_point_tri_pairs,
-    float3* __restrict__ grads,
-    const float3* __restrict__ vertices,
-    const int3* __restrict__ triangle_indices,
-    float min_dist,
-    int num_point_tri_pairs
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if ( idx >= num_point_tri_pairs ) return;
-    constexpr float rho = 1.f;
-
-    auto near_point_tri_pair = near_point_tri_pairs[idx];
-    int p_i = near_point_tri_pair.vert_idx, t_i = near_point_tri_pair.tri_idx;
-    float3 p = vertices[p_i];
-    float3 v0 = vertices[triangle_indices[t_i].x];
-    float3& normal = near_point_tri_pair.normal;
-    if ( dot(p - v0, normal) < min_dist ) {
-        float3 grad = normal * rho;
-        atomicAddFloat3(&grads[p_i], -grad);
-    }
-}
-static __global__ void soft_phase_update(
-    float3* __restrict__ points_collision,
-    const float3* __restrict__ points_y,
-    const float3* __restrict__ grads,
-    float step_length,
-    int num_points
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if ( idx >= num_points ) return;
-    float3 v = points_y[idx];
-    float3 coll_v = points_collision[idx];
-    float3 grad = (coll_v - v) * 2.f;
-    grad = grad + grads[idx];
-    points_collision[idx] = coll_v - grad * step_length;
-
-}
-
-__device__ __forceinline__ void calc_barrier_f_and_prime(
-    float x, float eps, float& f_val, float& f_prime) {
-    if ( x >= eps ) {
-        f_val = eps;
-        f_prime = 0.0f;
-    }
-    else if ( x <= 1e-6f ) {
-        x = 1e-6f;
-        f_val = x;
-        f_prime = 1.0f;
-    }
-    else {
-        float a3 = -1.0f / (eps * eps);
-        float a2 = 1.0f / eps;
-        float a1 = 1.0f;
-        float a0 = 1e-6f;
-
-        float xx = x * x;
-        f_val = a3 * xx * x + a2 * xx + +a1 * x + a0;
-        f_prime = 3.0f * a3 * xx + 2.0f * a2 * x + a1;
-    }
-}
-
-// Hard Phase: 计算 Log-Barrier 的梯度
-static __global__ void hard_phase_constraint_pp_grad(
-    float3* __restrict__ barrier_grads,
-    const CollisionResult_PP* __restrict__ near_point_pairs,
-    const float3* __restrict__ vertices,
-    float min_dist,
-    float eps_slack,
-    float mu,
-    int num_point_pairs
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if ( idx >= num_point_pairs ) return;
-
-    int p1_i = near_point_pairs[idx].p1;
-    int p2_i = near_point_pairs[idx].p2;
-    float3 p1 = vertices[p1_i];
-    float3 p2 = vertices[p2_i];
-
-    float dist_sq = len_sq(p1 - p2);
-    float min_dist_sq = min_dist * min_dist;
-
-    // 约束函数 c_ij(x) = ||x_ij||^2 - B^2
-    float x = dist_sq - min_dist_sq;
-
-    if ( x < eps_slack ) {
-        float f_val, f_prime;
-        calc_barrier_f_and_prime(x, eps_slack, f_val, f_prime);
-
-        // 计算障碍函数能量 -mu * log(f(x)) 针对 p1 的梯度
-        // Grad = -mu * (1 / f_val) * f_prime * \nabla c_ij(p1)
-        // \nabla c_ij(p1) = 2 * (p1 - p2)
-        float coeff = -mu * (f_prime / f_val) * 2.0f;
-        float3 grad_p1 = (p1 - p2) * coeff;
-
-        atomicAddFloat3(&barrier_grads[p1_i], grad_p1);
-        atomicAddFloat3(&barrier_grads[p2_i], -grad_p1);
-    }
-}
-
-// Hard Phase: 综合数据保真项和障碍梯度进行位置更新
-static __global__ void hard_phase_update(
-    float3* __restrict__ points_curr, // x^(l)
-    const float3* __restrict__ points_init, // x^{init} (Soft Phase 之前的目标预测位置)
-    const float3* __restrict__ barrier_grads,
-    float step_length,
-    int num_points
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if ( idx >= num_points ) return;
-
-    float3 v_curr = points_curr[idx];
-    float3 v_init = points_init[idx];
-
-    // 目标函数：||x - x^{init}||^2 + Barrier
-    // 对 x 求导：2 * (x - x^{init}) + \nabla Barrier
-    float3 total_grad = (v_curr - v_init) * 2.0f + barrier_grads[idx];
-
-    points_curr[idx] = v_curr - total_grad * step_length;
-}
-
-static __global__ void update_end_collision(
-    float3* __restrict__ points_y,
-    float3* __restrict__ velocities,
-    const float3* __restrict__ points_x,
-    const float3* __restrict__ points_collision,
-    const char* __restrict__ vertices_mask,
-    const float h,
-    const int n
-) {
-    for ( int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
-          i += blockDim.x * gridDim.x ) {
-        auto x = points_collision[i];
-        if ( !vertices_mask[i] ) {
-            float h_inv = 1.f / h;
-            auto old_vel_dir = normalized(points_y[i] - points_x[i]);
-            auto new_vel = (x - points_x[i]) * h_inv;
-            float proj_vel_len = max(0.f, dot(old_vel_dir, new_vel));
-            new_vel = old_vel_dir * proj_vel_len;
-            velocities[i] = new_vel;
-
-            points_y[i] = x;
-        }
-        else {
-            velocities[i] = make_float3(0.f, 0.f, 0.f);
-        }
-    }
 }
 
 
-//L. Wu, B. Wu, Y. Yang, and H. Wang, "A Safe and Fast Repulsion Method for GPU-based Cloth Self Collisions," ACM Trans. Graph., vol. 40, no. 1, pp. 1–18, Feb. 2021, doi: 10.1145/3430025.
-void SolverBase::collision_Wu2021() {
+void SolverBase::collision_LCP_postprocess(float3* points_y) {
+    START_TIMER;
     int block = 256;
     int n = (int)point_hash_table_size;
     clear_hash_table<<<(n + block - 1) / block, block>>>(
-        point_hash_table.data().get(),
-        n
-        );
-    int vertex_size = params.nb_all_cloth_vertices;
-    n = vertex_size;
+        point_hash_table.data().get(), n);
+    int cloth_vertex_size = params.nb_all_cloth_vertices;
+    n = cloth_vertex_size;
     // 1. collect pp
     float max_dist = params.cloth_edge_mean_length;
-    float cell_size = max_dist * 3.f;
-    float max_dist_edge = params.cloth_edge_mean_length * 2.f;
 
     float3* points_x = vertices_old.data().get();
-    float3* points_y = vertices_world.data().get();
-    cudaMemsetAsync(sort_result_size.data().get(), 0, sizeof(int));
-    record_point_hash<true><<<(n + block - 1) / block, block>>>(
-        point_hashes.data().get(),
-        sort_key_temp2.data().get(),
-        sort_result_size.data().get(),
-        point_hash_table.data().get(),
-        points_y,
-        cell_size,
-        max_dist,
-        max_sort_result_size,
-        point_hash_table_size,
-        n);
-    int result_size;
-    cudaMemcpy(&result_size, sort_result_size.data().get(), sizeof(int), cudaMemcpyDeviceToHost);
-    result_size = min(result_size, max_sort_result_size);
-    thrust::sort_by_key(thrust::device, sort_key_temp2.begin(), sort_key_temp2.begin() + result_size, point_hashes.begin());
-    cudaMemsetAsync(pp_result_size.data().get(), 0, sizeof(int));
-    collect_pp_sorted<<<(result_size + block - 1) / block, block>>>(
-        pp_collision_result.data().get(),
-        pp_result_size.data().get(),
-        point_hashes.data().get(),
-        points_y,
-        edge_lookup.data().get(),
-        dir_edges.data().get(),
-        cell_size,
-        max_dist,
-        point_hash_table_size,
-        max_pp_result_size,
-        result_size
-        );
-    cudaMemcpy(&result_size, pp_result_size.data().get(), sizeof(int), cudaMemcpyDeviceToHost);
-    result_size = min(result_size, max_pp_result_size);
-    int edge_size = params.nb_all_cloth_edges;
+    collision_collect_near_pairs(points_x, max_dist, true, false, true, true);
+    // tp_result_size_h = 0;
+    RECORD_TIME("collision_collect_near_pairs");
 
-    // 2. soft phase
-    float3* grads = velocities.data().get();
-    float3* points_collision = temp_vertices_f3.data().get();
-    cudaMemcpyAsync(points_collision, points_y, vertex_size * sizeof(float3), cudaMemcpyDeviceToDevice);
-    n = vertex_size;
-    int* num_violations = sort_result_size.data().get();
-    int num_violations_h;
-    int max_soft_phase_step = 15;
-    int soft_phase_step = 0;
-    for ( ; soft_phase_step < max_soft_phase_step; ++soft_phase_step ) {
-        cudaMemsetAsync(num_violations, 0, sizeof(int));
-        cudaMemsetAsync(grads, 0, vertex_size * sizeof(float3));
-        soft_phase_constraint_edge<<<(edge_size + block - 1) / block, block>>>(
-            grads, num_violations,
-            points_collision,
-            edges.data().get(),
-            max_dist_edge, edge_size);
-        soft_phase_constraint_pp<<<(result_size + block - 1) / block, block>>>(
-            grads, num_violations,
-            pp_collision_result.data().get(),
-            points_collision,
-            max_dist, result_size);
-        soft_phase_update<<<(n + block - 1) / block, block>>>(
-            points_collision,
-            points_y,
-            grads,
-            max_dist * 0.0035f,
-            n);
-        cudaMemcpy(&num_violations_h, num_violations, sizeof(int), cudaMemcpyDeviceToHost);
-        if ( num_violations_h == 0 ) break;
-    }
-    if ( num_violations_h == 0 ) {
-        if ( soft_phase_step == 0 ) {
-            // std::cout << "No need to soft_phase" << std::endl;
-        }
-        else
-            std::cout << "soft_phase succeed, soft_phase_step: " << soft_phase_step << std::endl;
-    }
-    else
-        std::cout << "soft_phase failed, soft_phase_step: " << soft_phase_step <<
-            ", num_violations: " << num_violations_h << std::endl;
-    update_end_collision<<<(n + block - 1) / block, block>>>(
-        points_y,
-        velocities.data().get(),
-        points_x,
-        points_collision,
-        vertices_mask.data().get(),
-        dt, n);
-}
 
-void SolverPCG::contact_handle() {
-    int block = 256;
-    int n = (int)point_hash_table_size;
-    clear_hash_table<<<(n + block - 1) / block, block>>>(
-        point_hash_table.data().get(),
-        n
-        );
-    int vertex_size = params.nb_all_cloth_vertices;
-    n = vertex_size;
-    // 1. collect pp
-    float max_dist = params.cloth_edge_mean_length;
-    float cell_size = max_dist * 3.f;
-    float max_dist_edge = params.cloth_edge_mean_length * 2.f;
-
-    float3* points_x = vertices_old.data().get();
-    float3* points_y = vertices_world.data().get();
-    cudaMemsetAsync(sort_result_size.data().get(), 0, sizeof(int));
-    record_point_hash<false><<<(n + block - 1) / block, block>>>(
-        point_hashes.data().get(),
-        sort_key_temp2.data().get(),
-        sort_result_size.data().get(),
-        point_hash_table.data().get(),
-        points_y,
-        cell_size,
-        max_dist,
-        max_sort_result_size,
-        point_hash_table_size,
-        n);
-    int point_hashes_size_h;
-    cudaMemcpy(&point_hashes_size_h, sort_result_size.data().get(), sizeof(int), cudaMemcpyDeviceToHost);
-    point_hashes_size_h = min(point_hashes_size_h, max_sort_result_size);
-    thrust::sort_by_key(thrust::device, sort_key_temp2.begin(), sort_key_temp2.begin() + point_hashes_size_h,
-        point_hashes.begin());
-
-    // build hash_table lookup
-    cudaMemsetAsync(hash_table_lookup.data().get(), -1, sizeof(int) * point_hash_table_size);
-    record_point_hash_table_lookup<<<(point_hashes_size_h + block - 1) / block, block>>>(
-        hash_table_lookup.data().get(),
-        point_hashes.data().get(),
-        point_hash_table_size, point_hashes_size_h
-        );
-    cudaMemsetAsync(pp_result_size.data().get(), 0, sizeof(int));
-    CollisionResult_PP* point_pairs = pp_collision_result.data().get();
-    collect_pp_sorted<<<(point_hashes_size_h + block - 1) / block, block>>>(
-        point_pairs,
-        pp_result_size.data().get(),
-        point_hashes.data().get(),
-        points_y,
-        edge_lookup.data().get(),
-        dir_edges.data().get(),
-        cell_size,
-        max_dist,
-        point_hash_table_size,
-        max_pp_result_size,
-        point_hashes_size_h
-        );
-    int result_size;
-    cudaMemcpy(&result_size, pp_result_size.data().get(), sizeof(int), cudaMemcpyDeviceToHost);
-    result_size = min(result_size, max_pp_result_size);
-    
-    if ( result_size > 0 ) {
-        compute_collision_constraint_point_point<<<(result_size + block - 1) / block, block>>>(
-            Jx.data().get(),
-            Jx_diag.data().get(),
-            forces.data().get(),
-            velocities.data().get(),
-            point_pairs, points_y, max_dist, dt, result_size);
-    }
-    max_dist = params.cloth_edge_mean_length * 0.5f;
-    n = params.nb_all_triangles;
-    cudaMemsetAsync(tp_result_size.data().get(), 0, sizeof(int));
-    triangles_query_points<<<(n + block - 1) / block, block>>>(
-        tp_collision_result.data().get(),
-        tp_result_size.data().get(),
-        triangle_indices.data().get(),
-        points_y,
-        point_hashes.data().get(),
-        hash_table_lookup.data().get(), cell_size,
-        max_dist * max_dist, point_hash_table_size,
-        point_hashes_size_h, max_tp_result_size, n);
-
-    cudaMemcpy(&result_size, tp_result_size.data().get(), sizeof(int), cudaMemcpyDeviceToHost);
-    result_size = min(result_size, max_tp_result_size);
-    if ( result_size > 0 ) {
+    debug_colors.assign(cloth_vertex_size, make_float3(0.5f, 0.5f, 0.5f));
+    int num_constraints = tp_result_size_h + ee_result_size_h;
+    if ( num_constraints > 0 ) {
+        int all_vertex_size = params.nb_all_vertices;
+        float3* points_collision = temp_vertices_f3.data().get();
+        cudaMemcpyAsync(points_collision, points_y, all_vertex_size * sizeof(float3), cudaMemcpyDeviceToDevice);
         // std::cout <<  result_size << " triangles" << std::endl; 
-        compute_collision_constraint_triangle_point_plane<<<(result_size + block - 1) / block, block>>>(
-            // Jx.data().get(),
-            Jx_diag.data().get(),
-            forces.data().get(),
+        // compute_collision_penalty_force_triangle_point_plane<<<(result_size + block - 1) / block, block>>>(
+        //     // Jx.data().get(),
+        //     Jx_diag.data().get(),
+        //     forces.data().get(),
+        //     tp_collision_result.data().get(),
+        //     points_y, triangle_indices.data().get(),
+        //     params.nb_all_cloth_vertices,
+        //     result_size);
+        if ( tp_result_size_h > 0 )
+            collision_tp_to_constraints<<<(tp_result_size_h + block - 1) / block, block>>>(
+                collision_constraints.data().get(),
+                tp_collision_result.data().get(),
+                triangle_indices.data().get(),
+                tp_result_size_h);
+        if ( ee_result_size_h > 0 )
+            collision_ee_to_constraints<<<(ee_result_size_h + block - 1) / block, block>>>(
+                collision_constraints.data().get(),
+                ee_collision_result.data().get(),
+                edges.data().get(),
+                tp_result_size_h,
+                ee_result_size_h);
+        // coloring
+        // 1. 构建邻接关系并着色 (对应 Vivace 算法)
+        int num_colors = color_constraints(num_constraints);
+        std::cout << "palette_size: " << num_colors << std::endl;
+        RECORD_TIME("color_constraints");
+        n = params.nb_all_vertices;
+        // fill_inv_mass<<<(n + block - 1) / block, block>>>(
+        //     mass_inv.data().get(),
+        //     vertices_obj.data().get(),
+        //     object_types.data().get(),
+        //     masses.data().get(),
+        //     vertices_mask.data().get(), n);
+        // #define CHECK(v,type) thrust::host_vector<type> _##v = v;\
+        // std::vector<type> __##v(_##v.begin(), _##v.end())
+        // CHECK(mass_inv, float);
+        // #undef CHECK
+        // solve LCP using PGS
+        collision_tp_to_normal_constraints<<<(tp_result_size_h + block - 1) / block, block>>>(
+            normal_constraints.data().get(),
+            debug_colors.data().get(),
             tp_collision_result.data().get(),
-            points_y, triangle_indices.data().get(),
-            params.nb_all_cloth_vertices,
-            result_size);
+            constraint_colors.data().get(),
+            triangle_indices.data().get(),
+            mass_inv.data().get(),
+            tp_result_size_h);
+        collision_ee_to_normal_constraints<<<(ee_result_size_h + block - 1) / block, block>>>(
+            normal_constraints.data().get(),
+            debug_colors.data().get(),
+            ee_collision_result.data().get(),
+            constraint_colors.data().get(),
+            edges.data().get(),
+            mass_inv.data().get(),
+            tp_result_size_h,
+            ee_result_size_h);
+        // 2. 将约束按颜色进行排序/分组
+        // 这样在 GPU 上读取时是连续的，利用内存合并访问（Coalesced Memory Access）
+        thrust::sort_by_key(thrust::device, constraint_colors.begin(),
+            constraint_colors.begin() + num_constraints, normal_constraints.begin());
+
+        CUDA_CHECK(cudaDeviceSynchronize());
+        int* lookup = point_hash_table_lookup.data().get();
+        record_color_offsets<<<(num_constraints + block - 1) / block, block>>>(
+            lookup, normal_constraints.data().get(), num_constraints);
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        cudaMemcpy(constraint_color_offsets.data(), lookup, (num_colors + 2) * sizeof(int), cudaMemcpyDeviceToHost);
+
+        int* d_needs_more_iters = sort_result_size.data().get();
+        int h_needs_more_iters;
+        // 3. Multi-Color PGS 求解主循环
+        int num_iterations = 100;
+        RECORD_TIME("sort constraints");
+        if ( current_graph_exec != nullptr ) {
+            cudaGraphExecDestroy(current_graph_exec);
+            cudaGraphDestroy(current_graph);
+        }
+        cudaStreamBeginCapture(capture_stream, cudaStreamCaptureModeGlobal);
+        cudaMemsetAsync(d_needs_more_iters, 0, sizeof(int), capture_stream);
+        // 把单次 PGS 迭代 (包含所有颜色的 Kernel 发射) 录制下来
+        int c = num_colors == MAX_COLORS ? -1 : 0;
+        for ( ; c < num_colors; ++c ) {
+            int start_idx = constraint_color_offsets[c + 1];
+            int end_idx = constraint_color_offsets[c + 2];
+            if ( start_idx < 0 ) continue;
+            if ( end_idx <= start_idx ) end_idx = num_colors;
+            int num_constraints_in_color = end_idx - start_idx;
+            solvePGS_UnifiedColorBatchKernel<<<(num_constraints_in_color + block - 1) / block, block,0,capture_stream>>>(
+                normal_constraints.data().get(), d_needs_more_iters,
+                points_collision, constraint_colors.data().get(), mass_inv.data().get(), start_idx,
+                num_constraints_in_color);
+        }
+
+        cudaStreamEndCapture(capture_stream, &current_graph);
+        cudaGraphInstantiate(&current_graph_exec, current_graph, NULL, NULL, 0);
+        for ( int iter = 0; iter < num_iterations; ++iter ) {
+            // 按颜色逐个批次启动 GPU Kernel
+            // int c = num_colors == MAX_COLORS ? -1 : 0;
+            // for ( ; c < num_colors; ++c ) {
+            //     int start_idx = constraint_color_offsets[c + 1];
+            //     int end_idx = constraint_color_offsets[c + 2];
+            //     if ( start_idx < 0 ) continue;
+            //     if ( end_idx <= start_idx ) end_idx = num_colors;
+            //     int num_constraints_in_color = end_idx - start_idx;
+            //
+            //     // int gridSize = (num_constraints_in_color + blockSize - 1) / blockSize;
+            //
+            //     // 启动 Kernel，仅处理当前颜色的约束
+            //     solvePGS_UnifiedColorBatchKernel
+            //         <<<(num_constraints_in_color + block - 1) / block, block>>>(
+            //             normal_constraints.data().get(), d_needs_more_iters,
+            //             points_collision, constraint_colors.data().get(), mass_inv.data().get(), start_idx,
+            //             num_constraints_in_color);
+            //
+            // }
+            cudaGraphLaunch(current_graph_exec, nullptr);
+            if ( iter % 10 == 0 ) {
+                cudaMemcpy(&h_needs_more_iters, d_needs_more_iters, sizeof(int), cudaMemcpyDeviceToHost);
+                std::cout << "constraints: " << h_needs_more_iters << std::endl;
+                if ( h_needs_more_iters == 0 ) {
+                    break;
+                }
+            }
+        }
+        RECORD_TIME("Multi-Color PGS");
+        update_end_collision<<<(n + block - 1) / block, block>>>(
+            points_y,
+            velocities.data().get(),
+            points_x,
+            points_collision,
+            vertices_mask.data().get(),
+            dt, n);
     }
 }
+void SolverBase::collision_LCP_postprocess_unified(float3* points_y) {
+    START_TIMER;
+    int block = 256;
+    int n = (int)point_hash_table_size;
+    clear_hash_table<<<(n + block - 1) / block, block>>>(
+        point_hash_table.data().get(), n);
+    int cloth_vertex_size = params.nb_all_cloth_vertices;
+    n = cloth_vertex_size;
 
+    // float3* points_x = vertices_old.data().get();
+
+    debug_colors.assign(cloth_vertex_size, make_float3(0.5f, 0.5f, 0.5f));
+    int num_constraints = tp_result_size_h + ee_result_size_h;
+    if ( num_constraints == 0 ) return;
+    int all_vertex_size = params.nb_all_vertices;
+    // float3* points_collision = temp_vertices_f3.data().get();
+    // cudaMemcpyAsync(points_collision, points_y, all_vertex_size * sizeof(float3), cudaMemcpyDeviceToDevice);
+    float3* points_collision = points_y;
+    // coloring
+    // 1. 构建邻接关系并着色 (对应 Vivace 算法)
+    int num_colors = color_constraints(num_constraints);
+    std::cout << "palette_size: " << num_colors << std::endl;
+    RECORD_TIME("color_constraints");
+    n = params.nb_all_vertices;
+    // solve LCP using PGS
+    // 2. 将约束按颜色进行排序/分组
+    // 这样在 GPU 上读取时是连续的，利用内存合并访问（Coalesced Memory Access）
+    thrust::sort_by_key(thrust::device, constraint_colors.begin(),
+        constraint_colors.begin() + num_constraints, normal_constraints.begin());
+
+    CUDA_CHECK(cudaDeviceSynchronize());
+    int* lookup = point_hash_table_lookup.data().get();
+    record_color_offsets<<<(num_constraints + block - 1) / block, block>>>(
+        lookup, normal_constraints.data().get(), num_constraints);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    cudaMemcpy(constraint_color_offsets.data(), lookup, (num_colors + 2) * sizeof(int), cudaMemcpyDeviceToHost);
+
+    int* d_needs_more_iters = sort_result_size.data().get();
+    int h_needs_more_iters;
+    // 3. Multi-Color PGS 求解主循环
+    int num_iterations = 10;
+    RECORD_TIME("sort constraints");
+    if ( current_graph_exec != nullptr ) {
+        cudaGraphExecDestroy(current_graph_exec);
+        cudaGraphDestroy(current_graph);
+    }
+    cudaStreamBeginCapture(capture_stream, cudaStreamCaptureModeGlobal);
+    cudaMemsetAsync(d_needs_more_iters, 0, sizeof(int), capture_stream);
+    int c = num_colors == MAX_COLORS ? -1 : 0;
+    for ( ; c < num_colors; ++c ) {
+        int start_idx = constraint_color_offsets[c + 1];
+        int end_idx = constraint_color_offsets[c + 2];
+        if ( start_idx < 0 ) continue;
+        if ( end_idx <= start_idx ) end_idx = num_colors;
+        int num_constraints_in_color = end_idx - start_idx;
+        solvePGS_UnifiedColorBatchKernel<<<(num_constraints_in_color + block - 1) / block, block,0,capture_stream>>>(
+            normal_constraints.data().get(), d_needs_more_iters,
+            points_collision, constraint_colors.data().get(), mass_inv.data().get(), start_idx,
+            num_constraints_in_color);
+    }
+
+    cudaStreamEndCapture(capture_stream, &current_graph);
+    cudaGraphInstantiate(&current_graph_exec, current_graph, NULL, NULL, 0);
+    for ( int iter = 0; iter < num_iterations; ++iter ) {
+        cudaGraphLaunch(current_graph_exec, nullptr);
+        if ( iter % 10 == 0 ) {
+            cudaMemcpy(&h_needs_more_iters, d_needs_more_iters, sizeof(int), cudaMemcpyDeviceToHost);
+            std::cout << "constraints: " << h_needs_more_iters << std::endl;
+            if ( h_needs_more_iters == 0 ) {
+                break;
+            }
+        }
+    }
+    RECORD_TIME("Multi-Color PGS");
+    // update_end_collision<<<(n + block - 1) / block, block>>>(
+    //     points_y,
+    //     velocities.data().get(),
+    //     points_x,
+    //     points_collision,
+    //     vertices_mask.data().get(),
+    //     dt, n);
+}
+void SolverPCG::contact_handle() {
+    collision_LCP_postprocess(vertices_world.data().get());
+    // CUDA_CHECK(cudaDeviceSynchronize());
+}
+
+int SolverBase::color_constraints(int num_constraints) {
+    int blockSize = 256;
+    int gridSize = (num_constraints + blockSize - 1) / blockSize;
+    int* d_constraint_colors = this->constraint_colors.data().get();
+    // 初始化着色数组为 -1
+    cudaMemsetAsync(d_constraint_colors, -1, num_constraints * sizeof(int));
+
+    int num_vertices = params.nb_all_vertices;
+    // 分配黑板：记录每个顶点每种颜色被谁占用了
+    int* d_vertex_color_claimer = this->vertex_color_claimer.data().get();
+    cudaMemsetAsync(d_vertex_color_claimer, -1, num_vertices * MAX_COLORS * sizeof(int));
+
+    int* d_uncolored_count = this->uncolored_count.data().get();
+    uint64_t* d_vertex_forbidden_masks = this->vertex_forbidden_masks.data().get();
+
+    int h_uncolored_count = num_constraints;
+    // int last_uncolored_count = h_uncolored_count;
+    int iteration = 0;
+    // int h_current_palette_size = 4;
+
+    // CollisionConstraint* d_constraints = this->collision_constraints.data().get();
+    auto* d_constraints = this->normal_constraints.data().get();
+
+    auto d_current_palette_size = alloc_pool();
+    auto d_iteration = alloc_pool();
+    auto d_last_uncolored_count = alloc_pool();
+    cudaMemsetAsync(d_last_uncolored_count.ptr, num_constraints, sizeof(int));
+    cudaMemsetAsync(d_iteration.ptr, 0, sizeof(int));
+    // 一开始给出少量颜色，增加冲突几率但节约颜色
+    int h_current_palette_size = 4;
+    cudaMemcpyAsync(d_current_palette_size.ptr, &h_current_palette_size, sizeof(int), cudaMemcpyHostToDevice);
+
+    // if ( current_graph_exec != nullptr ) {
+    //     cudaGraphExecDestroy(current_graph_exec);
+    //     cudaGraphDestroy(current_graph);
+    // }
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t graph_exec = nullptr;
+    cudaStreamBeginCapture(capture_stream, cudaStreamCaptureModeGlobal);
+
+    for ( int i = 0; i < 20; i++ ) {
+        cudaMemsetAsync(d_vertex_forbidden_masks, 0, num_vertices * sizeof(uint64_t), capture_stream);
+        cudaMemsetAsync(d_vertex_color_claimer, -1, num_vertices * MAX_COLORS * sizeof(int), capture_stream);
+        // cudaMemsetAsync(d_uncolored_count, 0, sizeof(int));
+        // 步骤 1：去抢占颜色
+        k_mark_forbidden_bits<<<gridSize, blockSize,0,capture_stream>>>(
+            d_vertex_forbidden_masks, d_uncolored_count, d_constraints, d_constraint_colors,
+            num_constraints);
+        k_claim_color_bitmask<<<gridSize, blockSize,0,capture_stream>>>(
+            d_vertex_color_claimer, d_constraints, d_constraint_colors, d_vertex_forbidden_masks,
+            d_current_palette_size.ptr, d_iteration.ptr, num_constraints);
+
+        // 步骤 2：验证是否成功
+        k_verify_colors<<<gridSize, blockSize,0,capture_stream>>>(
+            d_constraint_colors, d_uncolored_count, d_constraints,
+            d_vertex_color_claimer, num_constraints);
+        k_update_colors<<<1, 1,0,capture_stream>>>(
+            d_current_palette_size.ptr,
+            d_uncolored_count,
+            d_last_uncolored_count.ptr,
+            d_iteration.ptr);
+    }
+    cudaStreamEndCapture(capture_stream, &graph);
+    cudaGraphInstantiate(&graph_exec, graph, NULL, NULL, 0);
+    // d_current_palette_size.ptr
+    while ( iteration < 10 ) {
+        cudaGraphLaunch(graph_exec, nullptr);
+        /*cudaMemsetAsync(d_vertex_forbidden_masks, 0, num_vertices * sizeof(uint64_t));
+        cudaMemsetAsync(d_vertex_color_claimer, -1, num_vertices * MAX_COLORS * sizeof(int));
+        // cudaMemsetAsync(d_uncolored_count, 0, sizeof(int));
+        // 步骤 1：去抢占颜色
+        k_mark_forbidden_bits<<<gridSize, blockSize>>>(
+            d_vertex_forbidden_masks, d_uncolored_count, d_constraints, d_constraint_colors,
+            num_constraints);
+        k_claim_color_bitmask<<<gridSize, blockSize>>>(
+            d_vertex_color_claimer, d_constraints, d_constraint_colors, d_vertex_forbidden_masks,
+            d_current_palette_size.ptr, d_iteration.ptr, num_constraints);
+
+        // 步骤 2：验证是否成功
+        k_verify_colors<<<gridSize, blockSize>>>(
+            d_constraint_colors, d_uncolored_count, d_constraints,
+            d_vertex_color_claimer, num_constraints);
+        k_update_colors<<<1, 1>>>(
+            d_current_palette_size.ptr,
+            d_uncolored_count,
+            d_last_uncolored_count.ptr,
+            d_iteration.ptr);*/
+        // if ( iteration % 3 == 0 ) {
+        cudaMemcpy(&h_uncolored_count, d_uncolored_count, sizeof(int), cudaMemcpyDeviceToHost);
+        if ( h_uncolored_count == 0 ) break;
+        // }
+        iteration++;
+
+        // 如果还有没涂上的，慢慢增加可选颜色的种类
+        // cudaMemcpy(&h_uncolored_count, d_uncolored_count, sizeof(int), cudaMemcpyDeviceToHost);
+        // if ( last_uncolored_count == h_uncolored_count && h_uncolored_count > 0 ) {
+        //     if ( current_palette_size < MAX_COLORS )
+        //         current_palette_size++;
+        // }
+        // last_uncolored_count = h_uncolored_count;
+        // std::cout << "uncolored_count: " << h_uncolored_count << std::endl;
+    }
+    // k_print_colors<<<gridSize, blockSize>>>(d_constraint_colors, d_constraints, num_constraints);
+    cudaGraphDestroy(graph);
+    cudaGraphExecDestroy(graph_exec);
+    cudaMemcpy(&h_current_palette_size, d_current_palette_size.ptr,
+        sizeof(int), cudaMemcpyDeviceToHost);
+    return h_current_palette_size;
+
+}
+
+void SolverBase::collision_collect_near_pairs(float3* points, float max_dist,
+    bool update_hash, bool collect_pp, bool collect_tp, bool collect_ee) {
+    START_TIMER;
+    int block = 256;
+    // int n = (int)point_hash_table_size;
+    // clear_hash_table<<<(n + block - 1) / block, block>>>(
+    //     point_hash_table.data().get(), n);
+    int vertex_size = params.nb_all_cloth_vertices;
+    int n = vertex_size;
+    float cell_size = max_dist * 2.f;
+    auto constraint_size_p = alloc_pool();
+    if ( collect_tp || collect_ee || collect_pp )
+        cudaMemsetAsync(constraint_size_p.ptr, 0, sizeof(int));
+    // float max_dist_edge = params.cloth_edge_mean_length * 2.f;
+    if ( update_hash ) {
+        auto point_hashes_size_p = alloc_pool();
+        auto edge_hashes_size_p = alloc_pool();
+        cudaMemsetAsync(point_hashes_size_p.ptr, 0, sizeof(int));
+        record_point_hash<false, false><<<(n + block - 1) / block, block>>>(
+            point_hashes.data().get(),
+            sort_key_temp.data().get(),
+            point_hashes_size_p.ptr,
+            nullptr,
+            points,
+            vertex_proxy.data().get(),
+            cell_size,
+            max_dist,
+            max_point_hashes_size,
+            point_hash_table_size,
+            n);
+
+        CUDA_CHECK(cudaMemcpy(&point_hashes_size_h, point_hashes_size_p.ptr, sizeof(int), cudaMemcpyDeviceToHost));
+        point_hashes_size_h = min(point_hashes_size_h, max_point_hashes_size);
+        RECORD_TIME("record_point_hash");
+        thrust::sort_by_key(thrust::device, sort_key_temp.begin(), sort_key_temp.begin() + point_hashes_size_h,
+            point_hashes.begin());
+
+        RECORD_TIME("sort_by_key");
+        // build hash_table lookup
+        cudaMemsetAsync(point_hash_table_lookup.data().get(), -1, sizeof(int) * (point_hash_table_size + 1));
+        record_hash_table_lookup<<<(point_hashes_size_h + block - 1) / block, block>>>(
+            point_hash_table_lookup.data().get(),
+            point_hashes.data().get(),
+            point_hash_table_size, point_hashes_size_h);
+        // edges
+        if ( collect_ee ) {
+            n = params.nb_all_cloth_edges;
+            CUDA_CHECK(cudaMemsetAsync(edge_hashes_size_p.ptr, 0, sizeof(int)));
+            record_edge_hashes<<<(n + block - 1) / block, block>>>(
+                edge_hashes.data().get(),
+                sort_key_temp.data().get(),
+                edge_hashes_size_p.ptr,
+                edges.data().get(),
+                points,
+                cell_size,
+                max_edge_hashes_size,
+                edge_hash_table_size,
+                n);
+            CUDA_CHECK(cudaMemcpy(&edge_hashes_size_h, edge_hashes_size_p.ptr, sizeof(int), cudaMemcpyDeviceToHost));
+            edge_hashes_size_h = min(edge_hashes_size_h, max_edge_hashes_size);
+            RECORD_TIME("record_edge_hash");
+            thrust::sort_by_key(thrust::device,
+                sort_key_temp.begin(), sort_key_temp.begin() + edge_hashes_size_h, edge_hashes.begin());
+            RECORD_TIME("sort_by_key");
+            // build hash_table lookup
+            cudaMemsetAsync(edge_hash_table_lookup.data().get(), -1, sizeof(int) * (edge_hash_table_size + 1));
+            record_hash_table_lookup<<<(edge_hashes_size_h + block - 1) / block, block>>>(
+                edge_hash_table_lookup.data().get(),
+                edge_hashes.data().get(),
+                edge_hash_table_size, edge_hashes_size_h);
+        }
+    }
+    tp_result_size_h = pp_result_size_h = ee_result_size_h = 0;
+    if ( collect_pp ) {
+        cudaMemsetAsync(pp_result_size.data().get(), 0, sizeof(int));
+        n = params.nb_all_cloth_vertices;
+        // debug_colors.assign(vertex_size, make_float3(0.5f, 0.5f, 0.5f));
+        // collect_pp_sorted<<<(n + block - 1) / block, block>>>(
+        //     pp_collision_result.data().get(),
+        //     pp_result_size.data().get(),
+        //     debug_colors.data().get(),
+        //     point_hashes.data().get(),
+        //     points,
+        //     edge_lookup.data().get(),
+        //     dir_edges.data().get(),
+        //     point_hash_table_lookup.data().get(),
+        //     vertex_proxy.data().get(),
+        //     vertices_mask.data().get(),
+        //     cell_size,
+        //     max_dist,
+        //     point_hash_table_size,
+        //     point_hashes_size_h,
+        //     max_pp_result_size,
+        //     n);
+        points_query_points_by_point_hash<<<(n + block - 1) / block, block>>>(
+            normal_constraints.data().get(),
+            pp_result_size.data().get(),
+            nullptr,
+            point_hashes.data().get(),
+            points,
+            edge_lookup.data().get(),
+            dir_edges.data().get(),
+            point_hash_table_lookup.data().get(),
+            vertex_proxy.data().get(),
+            vertices_mask.data().get(),
+            cell_size,
+            max_dist,
+            point_hash_table_size,
+            point_hashes_size_h,
+            max_collision_constraints_size,
+            n);
+        cudaMemcpy(&pp_result_size_h, pp_result_size.data().get(), sizeof(int), cudaMemcpyDeviceToHost);
+        // pp_result_size_h = min(pp_result_size_h, max_pp_result_size);
+        pp_result_size_h = min(pp_result_size_h, max_collision_constraints_size);
+        std::cout << "pp_result_size_h = " << pp_result_size_h << std::endl;
+    }
+    if ( collect_tp ) {
+        n = params.nb_all_triangles;
+        // cudaMemsetAsync(tp_result_size.data().get(), 0, sizeof(int));
+        // triangles_query_points<<<(n + block - 1) / block, block>>>(
+        //     tp_collision_result.data().get(),
+        //     tp_result_size.data().get(),
+        //     triangle_indices.data().get(),
+        //     points,
+        //     vertices_old.data().get(),
+        //     point_hashes.data().get(),
+        //     point_hash_table_lookup.data().get(),
+        //     vertices_mask.data().get(), cell_size,
+        //     max_dist * max_dist, point_hash_table_size,
+        //     point_hashes_size_h, max_tp_result_size,
+        //     params.nb_all_cloth_vertices, n);
+        // cudaMemcpy(&tp_result_size_h, tp_result_size.data().get(), sizeof(int), cudaMemcpyDeviceToHost);
+        // tp_result_size_h = min(tp_result_size_h, max_tp_result_size);
+        debug_colors.assign(params.nb_all_cloth_edges, make_float3(0.5f, 0.5f, 0.5f));
+        triangles_query_points_by_point_hash<<<(n + block - 1) / block, block>>>(
+            normal_constraints.data().get(),
+            nullptr,
+            constraint_size_p.ptr,
+            triangle_indices.data().get(),
+            points,
+            // vertices_old.data().get(),
+            point_hashes.data().get(),
+            point_hash_table_lookup.data().get(),
+            vertices_mask.data().get(), cell_size,
+            max_dist * max_dist, point_hash_table_size,
+            point_hashes_size_h, max_collision_constraints_size,
+            params.nb_all_cloth_vertices, n);
+        cudaMemcpy(&tp_result_size_h, constraint_size_p.ptr, sizeof(int), cudaMemcpyDeviceToHost);
+        tp_result_size_h = min(tp_result_size_h, max_collision_constraints_size);
+        RECORD_TIME("triangles_query_points");
+        std::cout << "tp_result_size_h = " << tp_result_size_h << std::endl;
+    }
+    if ( collect_ee ) {
+        n = params.nb_all_edges;
+        // max_dist *= 0.5f;
+        // cudaMemsetAsync(ee_result_size.data().get(), 0, sizeof(int));
+        // edges_query_edges_via_point_hash<<<(n + block - 1) / block, block>>>(
+        //     ee_collision_result.data().get(),
+        //     ee_result_size.data().get(),
+        //     edges.data().get(),
+        //     points,
+        //     // vertices_old.data().get(),
+        //     point_hashes.data().get(),
+        //     point_hash_table_lookup.data().get(),
+        //     dir_edges.data().get(),
+        //     edge_lookup.data().get(),
+        //     vertices_mask.data().get(), cell_size,
+        //     max_dist * max_dist, max_dist * 0.5, point_hash_table_size,
+        //     point_hashes_size_h, max_ee_result_size,
+        //     params.nb_all_cloth_vertices, n);
+        // cudaMemcpy(&ee_result_size_h, ee_result_size.data().get(), sizeof(int), cudaMemcpyDeviceToHost);
+        // ee_result_size_h = min(ee_result_size_h, max_ee_result_size);
+        // RECORD_TIME("edges_query_edges_via_point_hash");
+        block = 64;
+        detect_edge_edge_constraints<<<(n + block - 1) / block, block>>>(
+            normal_constraints.data().get(),
+            constraint_size_p.ptr,
+            edges.data().get(),
+            points,
+            edge_hashes.data().get(),
+            edge_hash_table_lookup.data().get(),
+            vertices_mask.data().get(),
+            cell_size, max_dist,
+            max_collision_constraints_size,
+            edge_hash_table_size,
+            edge_hashes_size_h,
+            params.nb_all_cloth_vertices,
+            n);
+        cudaMemcpy(&ee_result_size_h, constraint_size_p.ptr, sizeof(int), cudaMemcpyDeviceToHost);
+        RECORD_TIME("detect_edge_edge_constraints");
+        ee_result_size_h = min(ee_result_size_h, max_collision_constraints_size);
+        ee_result_size_h -= tp_result_size_h;
+        std::cout << "ee_result_size_h = " << ee_result_size_h << std::endl;
+    }
+}
 void SolverBase::init_collision() {
-    point_hash_table_size = next_prime((uint32_t)params.nb_all_cloth_vertices);
+    point_hash_table_size = max(67, next_prime((uint32_t)params.nb_all_cloth_vertices));
+    edge_hash_table_size = max(67, next_prime((uint32_t)params.nb_all_cloth_edges));
     point_hash_table.resize(point_hash_table_size);
-    max_pp_result_size = params.nb_all_cloth_vertices;
-    max_tp_result_size = params.nb_all_triangles;
-    max_sort_result_size = max_pp_result_size * 8;
-    point_hashes.resize(max_sort_result_size);
-    sort_key_temp2.resize(max_sort_result_size);
+    max_pp_result_size = params.nb_all_cloth_vertices * 2;
+    max_tp_result_size = params.nb_all_triangles * 2;
+    max_ee_result_size = params.nb_all_edges * 2;
+    max_point_hashes_size = max_pp_result_size * 8;
+    max_edge_hashes_size = params.nb_all_cloth_edges * 8;
+    point_hashes.resize(max_point_hashes_size);
+    edge_hashes.resize(max_edge_hashes_size);
+    max_sort_result_size = max(max_point_hashes_size, max_edge_hashes_size);
+    sort_key_temp.resize(max_sort_result_size);
+
     sort_result_size.resize(1);
     pp_result_size.resize(1);
     tp_result_size.resize(1);
+    ee_result_size.resize(1);
+    uncolored_count.resize(1);
+    vertex_color_claimer.resize(params.nb_all_vertices * MAX_COLORS);
+    vertex_forbidden_masks.resize(params.nb_all_vertices);
 
     pp_collision_result.resize(max_pp_result_size);
     tp_collision_result.resize(max_tp_result_size);
-    temp_vertices_f3.resize(params.nb_all_cloth_vertices);
-    hash_table_lookup.resize(point_hash_table_size);
+    ee_collision_result.resize(max_ee_result_size);
+    max_collision_constraints_size = max_pp_result_size + max_tp_result_size + max_ee_result_size;
+    normal_constraints.resize(max_collision_constraints_size);
+    collision_constraints.resize(max_collision_constraints_size);
+    constraint_colors.resize(max_collision_constraints_size);
+    temp_vertices_f3.resize(params.nb_all_vertices);
+    point_hash_table_lookup.resize(point_hash_table_size + 1);
+    edge_hash_table_lookup.resize(edge_hash_table_size + 1);
+    mass_inv.resize(params.nb_all_vertices);
+    weight.resize(params.nb_all_vertices);
+    constraint_color_offsets.resize(MAX_COLORS + 2);
+    points_safe.reserve(params.nb_all_vertices);
+    temp_vertices2_f3.reserve(params.nb_all_vertices);
+    temp_vertices3_f3.reserve(params.nb_all_vertices);
     // temp_edge_f3.resize(params.nb_all_cloth_edges);
     // vertex_colors.resize(params.nb_all_cloth_vertices);
     // sort_key_temp.resize(max_pp_result_size);
     // sort_value_temp.resize(max_pp_result_size);
     // pp_result_size.resize(1);
+    alpha_hard = 0.005f;
 }

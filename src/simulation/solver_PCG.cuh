@@ -6,9 +6,9 @@
 #include <thrust/universal_vector.h>
 
 struct SolverPCG : SolverBase {
-    ~SolverPCG() = default;
-
-    // Jacobian matrix of forces or second derivative (Hessian matrix) of constraints/energy, stored per edge, excluding diagonal. It should be symmetrical, so only half of matrix is stored.
+    // ~SolverPCG() = default;
+    SolverPCG(Simulator* simulator):SolverBase(simulator){}
+    // Jacobian matrix of forces or negative second derivative (Hessian matrix) of constraints/energy, stored per edge, excluding diagonal. It should be symmetrical, so only half of matrix is stored.
     thrust::device_vector<Mat3> Jx;
     // Diagonal part of Jx, stored by vertices -- some simplified algorithms only use this part.
     thrust::device_vector<Mat3> Jx_diag;
@@ -27,8 +27,7 @@ struct SolverPCG : SolverBase {
     
 protected:
     void compute_constraint(float dt);
-    float vector_field_dot(const float3* a, const float3* b);
-    float vector_field_dot_cub(const float3* a, const float3* b);
+    // float vector_field_dot_cub(const float3* a, const float3* b);
     void A_mult_x(
         float3* __restrict__ dst,
         const float3* __restrict__ src);

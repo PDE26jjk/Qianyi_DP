@@ -2,11 +2,13 @@
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
 #include <math.h>
-#include <stdio.h>
-#include <iostream>
 #include "cuda_utils.h"
 
 #define _FDH_ __forceinline__ __device__ __host__
+
+_FDH_ int3 operator-(const int3& a, const int3& b) {
+    return make_int3(a.x - b.x, a.y - b.y, a.z - b.z);
+}
 
 _FDH_ float3 operator+(const float3& a, const float3& b) {
     return make_float3(a.x + b.x, a.y + b.y, a.z + b.z);
@@ -26,28 +28,57 @@ _FDH_ float3 operator*(float b, const float3& a) {
 _FDH_ float3 operator/(const float3& a, float b) {
     return make_float3(a.x / b, a.y / b, a.z / b);
 }
+_FDH_ float2 operator+(const float2& a, const float2& b) {
+    return make_float2(a.x + b.x, a.y + b.y);
+}
+
+_FDH_ float2 operator-(const float2& a, const float2& b) {
+    return make_float2(a.x - b.x, a.y - b.y);
+}
+
+_FDH_ float2 operator-(const float2& a) {
+    return make_float2(-a.x, -a.y);
+}
+
+_FDH_ float2 operator*(const float2& a, float b) {
+    return make_float2(a.x * b, a.y * b);
+}
+
+_FDH_ float2 operator*(float b, const float2& a) {
+    return make_float2(a.x * b, a.y * b);
+}
+_FDH_ float2 operator/(const float2& a, float b) {
+    return make_float2(a.x / b, a.y / b);
+}
 
 _FDH_ float dot(const float3& a, const float3& b) {
     return a.x * b.x + a.y * b.y + a.z * b.z;
 }
+_FDH_ float dot(const float2& a, const float2& b) {
+    return a.x * b.x + a.y * b.y;
+}
 _FDH_ float3 cross(const float3& a, const float3& b) {
     return make_float3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x);
+}
+_FDH_ float cross(const float2& a, const float2& b) {
+    return a.x * b.y - a.y * b.x;
 }
 _FDH_ float norm(const float3& a) {
     return sqrtf(dot(a, a));
 }
 _FDH_ float3 normalized(const float3& a) {
     float n = norm(a);
-    return n > 1e-6f ? a / n : make_float3(0.0f, 0.0f, 0.0f);
+    return n > 1e-8f ? a / n : make_float3(0.0f, 0.0f, 0.0f);
 }
 
 _FDH_ float len_sq(const float3& a) { return dot(a, a); }
+_FDH_ float len_sq(const float2& a) { return dot(a, a); }
 
 _FDH_ float3 fmin3(float3 a, float3 b) {
-	return make_float3(fminf(a.x, b.x), fminf(a.y, b.y), fminf(a.z, b.z));
+    return make_float3(fminf(a.x, b.x), fminf(a.y, b.y), fminf(a.z, b.z));
 }
 _FDH_ float3 fmax3(float3 a, float3 b) {
-	return make_float3(fmaxf(a.x, b.x), fmaxf(a.y, b.y), fmaxf(a.z, b.z));
+    return make_float3(fmaxf(a.x, b.x), fmaxf(a.y, b.y), fmaxf(a.z, b.z));
 }
 
 _FDH_ int2 operator+(const int2& a, const int2& b) {
@@ -58,7 +89,7 @@ _FDH_ int3 operator+(const int3& a, const int3& b) {
 }
 
 _FDH_ float4 operator*(const float4& a, float b) {
-    return make_float4(a.x * b, a.y * b, a.z * b,a.w * b);
+    return make_float4(a.x * b, a.y * b, a.z * b, a.w * b);
 }
 
 // 2x2 Matrix struct for Inverse Rest Pose
@@ -108,7 +139,7 @@ struct Mat2 {
 struct Mat3 {
     float3 r[3]; // row storage
 
-    static __forceinline__ __device__ __host__ Mat3 zero() {return identity(0);}
+    static __forceinline__ __device__ __host__ Mat3 zero() { return identity(0); }
     __device__ __host__ Mat3() {}
     __device__ __host__ Mat3(float3 r0, float3 r1, float3 r2) {
         r[0] = r0;
@@ -216,10 +247,64 @@ struct Mat3 {
             make_float3(a.z * b.x, a.z * b.y, a.z * b.z)
         };
     }
-    _FDH_  Mat3 operator-() const {
+    _FDH_ Mat3 operator-() const {
         return { -r[0], -r[1], -r[2] };
     }
+
+    _FDH_ Mat3& operator+=(const Mat3& B) {
+        r[0].x += B.r[0].x;
+        r[0].y += B.r[0].y;
+        r[0].z += B.r[0].z;
+        r[1].x += B.r[1].x;
+        r[1].y += B.r[1].y;
+        r[1].z += B.r[1].z;
+        r[2].x += B.r[2].x;
+        r[2].y += B.r[2].y;
+        r[2].z += B.r[2].z;
+        return *this;
+    }
+
+    _FDH_ Mat3& operator-=(const Mat3& B) {
+        r[0].x -= B.r[0].x;
+        r[0].y -= B.r[0].y;
+        r[0].z -= B.r[0].z;
+        r[1].x -= B.r[1].x;
+        r[1].y -= B.r[1].y;
+        r[1].z -= B.r[1].z;
+        r[2].x -= B.r[2].x;
+        r[2].y -= B.r[2].y;
+        r[2].z -= B.r[2].z;
+        return *this;
+    }
+
+    _FDH_ Mat3& operator*=(float s) {
+        r[0].x *= s;
+        r[0].y *= s;
+        r[0].z *= s;
+        r[1].x *= s;
+        r[1].y *= s;
+        r[1].z *= s;
+        r[2].x *= s;
+        r[2].y *= s;
+        r[2].z *= s;
+        return *this;
+    }
+
+    _FDH_ Mat3& operator/=(float s) {
+        float inv_s = 1.0f / s;
+        r[0].x *= inv_s;
+        r[0].y *= inv_s;
+        r[0].z *= inv_s;
+        r[1].x *= inv_s;
+        r[1].y *= inv_s;
+        r[1].z *= inv_s;
+        r[2].x *= inv_s;
+        r[2].y *= inv_s;
+        r[2].z *= inv_s;
+        return *this;
+    }
 };
+
 __device__ __host__ static float3 operator*(float3 v, const Mat3& M) {
     return make_float3(
         v.x * M.r[0].x + v.y * M.r[1].x + v.z * M.r[2].x,
@@ -227,12 +312,44 @@ __device__ __host__ static float3 operator*(float3 v, const Mat3& M) {
         v.x * M.r[0].z + v.y * M.r[1].z + v.z * M.r[2].z
         );
 }
+_FDH_ static
+float3& operator+=(float3& a, const float3& b) {
+    a.x += b.x;
+    a.y += b.y;
+    a.z += b.z;
+    return a;
+}
+
+_FDH_ static
+float3& operator-=(float3& a, const float3& b) {
+    a.x -= b.x;
+    a.y -= b.y;
+    a.z -= b.z;
+    return a;
+}
+
+_FDH_ static
+float3& operator*=(float3& a, float s) {
+    a.x *= s;
+    a.y *= s;
+    a.z *= s;
+    return a;
+}
+
+_FDH_ static
+float3& operator/=(float3& a, float s) {
+    float inv_s = 1.0f / s;
+    a.x *= inv_s;
+    a.y *= inv_s;
+    a.z *= inv_s;
+    return a;
+}
 
 struct Mat4 {
     float4 r[4];
 
     __device__ __host__ Mat4() {}
-    __device__ __host__ Mat4(float4 r0, float4 r1, float4 r2,float4 r3) {
+    __device__ __host__ Mat4(float4 r0, float4 r1, float4 r2, float4 r3) {
         r[0] = r0;
         r[1] = r1;
         r[2] = r2;
@@ -318,7 +435,7 @@ struct Mat4 {
             make_float4(a.x * b.x, a.x * b.y, a.x * b.z, a.x * b.w),
             make_float4(a.y * b.x, a.y * b.y, a.y * b.z, a.y * b.w),
             make_float4(a.z * b.x, a.z * b.y, a.z * b.z, a.z * b.w),
-            make_float4(a.w * b.x, a.w * b.y,a.w * b.z,a.w * b.w)
+            make_float4(a.w * b.x, a.w * b.y, a.w * b.z, a.w * b.w)
         };
     }
 };
