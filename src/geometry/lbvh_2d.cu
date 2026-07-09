@@ -25,26 +25,27 @@
 namespace lbvh2d {
 
 // Internal storage
-namespace storage { 
+namespace storage {
 struct Storage {
     thrust::device_vector<unsigned int> morton_codes;
     thrust::device_vector<unsigned int> sorted_indices;
- 
+
     // Combined storage for centroids (float2)
     thrust::device_vector<float2> centroids;
- 
+
     thrust::device_vector<unsigned int> parent;
     thrust::device_vector<unsigned int> depth;
     thrust::device_vector<unsigned int> node_indices_scratch; // For sorting nodes by depth
- 
+
     // Scene bounds: [min_x, min_y, max_x, max_y]
     // We can also use a float4 or AABB2D here, but let's keep raw array for clarity
     thrust::device_vector<float> scene_bounds;
 
 };
-static Storage* inst = nullptr; // will not delete to avoid cudaFree being called after the CUDA context is destroyed by the host.
+static Storage* inst =
+    nullptr; // will not delete to avoid cudaFree being called after the CUDA context is destroyed by the host.
 inline Storage& instance() {
-    if (inst == nullptr) {
+    if ( inst == nullptr ) {
         inst = new Storage();
     }
     return *inst;
@@ -433,6 +434,24 @@ void initialize(unsigned int max_primitives) {
     s.scene_bounds.resize(4);
 }
 
+thrust::device_vector<float>& get_scene_bounds() {
+    return storage::instance().scene_bounds;
+}
+
+void calc_bounds(const thrust::device_vector<float2>& q, float (&h_bounds)[4]) {
+    float2 init_min = make_float2(FLT_MAX, FLT_MAX);
+    float2 init_max = make_float2(-FLT_MAX, -FLT_MAX);
+    const float2* centroids_ptr = thrust::raw_pointer_cast(q.data());
+    size_t centroids_n = q.size();
+    float2 min_res = thrust::reduce(thrust::device, centroids_ptr,
+        centroids_ptr + centroids_n, init_min, float2_min());
+    float2 max_res = thrust::reduce(thrust::device, centroids_ptr,
+        centroids_ptr + centroids_n, init_max, float2_max());
+    h_bounds[0] = min_res.x;
+    h_bounds[1] = min_res.y;
+    h_bounds[2] = max_res.x;
+    h_bounds[3] = max_res.y;
+}
 // Internal helper to build tree structure and levels
 void build_bvh_internal(BVH2D& bvh, unsigned int n) {
     if ( n == 0 ) return;
@@ -441,15 +460,8 @@ void build_bvh_internal(BVH2D& bvh, unsigned int n) {
     auto& s = storage::instance();
     // 1. Compute Scene Bounds using Thrust Reduce on float2 centroids
     // Init with first element or identity
-    float2 init_min = make_float2(FLT_MAX, FLT_MAX);
-    float2 init_max = make_float2(-FLT_MAX, -FLT_MAX);
-    float2* centroids_ptr = thrust::raw_pointer_cast(s.centroids.data());
-    size_t centroids_n = s.centroids.size();
-    float2 min_res = thrust::reduce(thrust::device, centroids_ptr,
-        centroids_ptr + centroids_n, init_min, float2_min());
-    float2 max_res = thrust::reduce(thrust::device, centroids_ptr,
-        centroids_ptr + centroids_n, init_max, float2_max());
-    float h_bounds[4] = { min_res.x, min_res.y, max_res.x, max_res.y };
+    float h_bounds[4];
+    calc_bounds(s.centroids, h_bounds);
     thrust::copy(h_bounds, h_bounds + 4, s.scene_bounds.begin());
 
     // 2. Compute Morton Codes
@@ -620,84 +632,84 @@ void build_point_bvh(const thrust::device_vector<float2>& vertices, BVH2D& bvh) 
 __device__ float closest_point_on_segment(float2 p, float2 a, float2 b, float& t) {
     float2 ab = b - a;
     float2 ap = p - a;
-    
+
     float len_sq = ab.x * ab.x + ab.y * ab.y;
-    if (len_sq < 1e-12f) { // 退化情况
+    if ( len_sq < 1e-12f ) { // 退化情况
         t = 0.0f;
         return ap.x * ap.x + ap.y * ap.y;
     }
-    
+
     t = (ap.x * ab.x + ap.y * ab.y) / len_sq;
     t = fmaxf(0.0f, fminf(1.0f, t)); // 限制在 [0, 1]
-    
+
     float2 closest = a + t * ab;
     float2 diff = p - closest;
     return diff.x * diff.x + diff.y * diff.y;
 }
- 
+
 // 核心几何逻辑：计算点与三角形的关系
 // 返回距离平方，更新权重 和 is_inside
 __device__ void point_triangle_interaction(
     float2 p, float2 a, float2 b, float2 c,
-    float& out_dist_sq, float3& out_weights, int& out_is_inside) 
-{
+    float& out_dist_sq, float3& out_weights, int& out_is_inside) {
     // 1. 计算重心坐标
     float2 v0 = b - a;
     float2 v1 = c - a;
     float2 v2 = p - a;
- 
+
     float d00 = v0.x * v0.x + v0.y * v0.y;
     float d01 = v0.x * v1.x + v0.y * v1.y;
     float d11 = v1.x * v1.x + v1.y * v1.y;
     float d20 = v2.x * v0.x + v2.y * v0.y;
     float d21 = v2.x * v1.x + v2.y * v1.y;
- 
+
     float denom = d00 * d11 - d01 * d01;
-    
+
     // 处理退化三角形
     float max_term = fmaxf(d00 * d11, d01 * d01);
-    if (fabsf(denom) <= max_term * 1e-6f) {
+    if ( fabsf(denom) <= max_term * 1e-6f ) {
         out_dist_sq = FLT_MAX;
         out_weights = make_float3(0, 0, 0);
         out_is_inside = 0;
         return;
     }
- 
+
     float invDenom = 1.0f / denom;
     float v = (d11 * d20 - d01 * d21) * invDenom;
     float w = (d00 * d21 - d01 * d20) * invDenom;
     float u = 1.0f - v - w;
- 
+
     out_weights = make_float3(u, v, w);
- 
+
     // 2. 判断是否在内部
     // 使用稍微放宽的阈值处理数值误差
-    if (u >= -1e-6f && v >= -1e-6f && w >= -1e-6f) {
+    if ( u >= -1e-6f && v >= -1e-6f && w >= -1e-6f ) {
         // 严格内部 (>=0) 或 边界/顶点 (接近0)
         // 如果三个值都严格大于0，则认为在内部
-        if (u > 1e-6f && v > 1e-6f && w > 1e-6f) {
+        if ( u > 1e-6f && v > 1e-6f && w > 1e-6f ) {
             out_is_inside = 1;
             out_dist_sq = 0.0f;
-        } else {
+        }
+        else {
             // 在边上或顶点上，距离视为0，但 is_inside 标记为 0
             // 这里可以根据需求调整，如果“在边上”也算“在三角形里”，可设为 1
-            out_is_inside = 0; 
+            out_is_inside = 0;
             out_dist_sq = 0.0f;
         }
         return;
     }
- 
+
     // 3. 如果在外部，计算到三条边的最近距离
     out_is_inside = 0;
-    
+
     float t_ab, t_bc, t_ca;
     float d_ab = closest_point_on_segment(p, a, b, t_ab);
     float d_bc = closest_point_on_segment(p, b, c, t_bc);
     float d_ca = closest_point_on_segment(p, c, a, t_ca);
- 
+
     // 找出最近的边
     out_dist_sq = fminf(d_ab, fminf(d_bc, d_ca));
- 
+
     // // 根据最近的边更新权重
     // // 权重定义：P = u*A + v*B + w*C
     // if (out_dist_sq == d_ab) {
@@ -721,102 +733,101 @@ __device__ void point_triangle_interaction(
     //     out_weights.z = 1.0f - t_ca;
     // }
 }
- 
+
 //------------------------------------------------------------------------------
 // Query Kernel
 //------------------------------------------------------------------------------
- 
+
 __global__ void query_location_kernel(
     const float2* query_pts, unsigned int num_queries,
     const int2* nodes, const AABB2D* aabbs, unsigned int root_idx,
     const float2* vertices, const int3* faces,
-    LocationResult* results)
-{
+    LocationResult* results) {
     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= num_queries) return;
- 
+    if ( i >= num_queries ) return;
+
     float2 qp = query_pts[i];
-    
+
     // 初始化结果
     results[i].prim_idx = -1;
     results[i].dist_sq = FLT_MAX;
     results[i].u = results[i].v = results[i].w = 0.0f;
     results[i].is_inside = 0;
- 
+
     unsigned int stack[128];
     int sp = 0;
     stack[sp++] = root_idx;
     // int times = 0;
-    while (sp > 0) {
+    while ( sp > 0 ) {
         unsigned int node_idx = stack[--sp];
-        
+
         // 剪枝：如果 AABB 距离大于当前已找到的最佳距离，跳过
         // 如果我们已经找到了点所在的三角形 (dist_sq == 0)，
         // 则 dist_sq_point_aabb_2d 只有在点位于 AABB 内部时才返回 0。
         // 这意味着一旦找到包含点，我们会跳过所有不包含该点的 AABB。
         float d_aabb = dist_sq_point_aabb_2d(qp, aabbs[node_idx]);
-        if (d_aabb > results[i].dist_sq) continue;
- 
+        if ( d_aabb > results[i].dist_sq ) continue;
+
         int2 node = nodes[node_idx];
-        
+
         // Leaf
-        if (node.y == 0) {
+        if ( node.y == 0 ) {
             // times++;
             unsigned int prim_idx = node.x - 1; // Triangle index
             int3 f = faces[prim_idx];
-            
+
             float2 v0 = vertices[f.x];
             float2 v1 = vertices[f.y];
             float2 v2 = vertices[f.z];
- 
+
             float dist_sq;
             float3 weights;
             int is_inside;
- 
+
             point_triangle_interaction(qp, v0, v1, v2, dist_sq, weights, is_inside);
- 
+
             // 更新结果
             // 优先级：内部 (dist=0) > 距离更近
             // 如果 dist_sq 为 0，说明找到了包含点或点在边上，这是最高优先级
-            if (dist_sq < results[i].dist_sq) {
+            if ( dist_sq < results[i].dist_sq ) {
                 results[i].dist_sq = dist_sq;
                 results[i].prim_idx = prim_idx;
                 results[i].u = weights.x;
                 results[i].v = weights.y;
                 results[i].w = weights.z;
                 results[i].is_inside = is_inside;
-                if (is_inside) break;
+                if ( is_inside ) break;
             }
-        } 
+        }
         else {
             // Internal node: Push children
             // stack[sp++] = node.y - 1;
             // stack[sp++] = node.x - 1;
             // 3. 内部节点处理：优化栈顺序
-            
+
             // 获取子节点索引
             unsigned int left_child = node.x - 1;
             unsigned int right_child = node.y - 1;
- 
+
             // 计算两个子节点的 AABB 距离
             float dist_left = dist_sq_point_aabb_2d(qp, aabbs[left_child]);
             float dist_right = dist_sq_point_aabb_2d(qp, aabbs[right_child]);
- 
+
             // 策略：距离远的先压栈，距离近的后压栈（先处理）
-            
+
             // 如果左边更远，先压左边
-            if (dist_left > dist_right) {
+            if ( dist_left > dist_right ) {
                 // 剪枝优化：只有当距离有可能比当前最佳小时才压栈
-                if (dist_left <= results[i].dist_sq) 
+                if ( dist_left <= results[i].dist_sq )
                     stack[sp++] = left_child;
-                if (dist_right <= results[i].dist_sq) 
+                if ( dist_right <= results[i].dist_sq )
                     stack[sp++] = right_child;
-            } 
+            }
             else {
                 // 右边更远（或相等），先压右边
-                if (dist_right <= results[i].dist_sq) 
+                if ( dist_right <= results[i].dist_sq )
                     stack[sp++] = right_child;
-                if (dist_left <= results[i].dist_sq) 
+                if ( dist_left <= results[i].dist_sq )
                     stack[sp++] = left_child;
             }
         }
@@ -829,75 +840,76 @@ __global__ void query_location_kernel(
 }
 
 // Kernel for finding the nearest edge to a single point
-__global__ void query_nearest_edge_kernel( 
-    float2 query, 
-    const int2* nodes, const AABB2D* aabbs, unsigned int root_idx, 
-    const float2* vertices, const int2* edges, 
-    NearestEdgeResult* result) 
-{
+__global__ void query_nearest_edge_kernel(
+    float2 query,
+    const int2* nodes, const AABB2D* aabbs, unsigned int root_idx,
+    const float2* vertices, const int2* edges,
+    NearestEdgeResult* result) {
     // Standard stack-based traversal for a single thread
-    if (threadIdx.x != 0 || blockIdx.x != 0) return;
- 
+    if ( threadIdx.x != 0 || blockIdx.x != 0 ) return;
+
     float best_dist = FLT_MAX;
     int best_idx = -1;
     float best_t = 0.0f;
- 
+
     unsigned int stack[64];
     int sp = 0;
     stack[sp++] = root_idx;
- 
-    while (sp > 0) {
+
+    while ( sp > 0 ) {
         unsigned int node_idx = stack[--sp];
-        
+
         // Pruning
         float d_aabb = dist_sq_point_aabb_2d(query, aabbs[node_idx]);
-        if (d_aabb > best_dist) continue;
- 
+        if ( d_aabb > best_dist ) continue;
+
         int2 node = nodes[node_idx];
-        if (node.y == 0) { // Leaf
+        if ( node.y == 0 ) { // Leaf
             unsigned int prim_idx = node.x - 1;
             int2 edge = edges[prim_idx];
             float2 a = vertices[edge.x];
             float2 b = vertices[edge.y];
-            
+
             float2 ab = b - a;
             float2 ap = query - a;
             float len_sq = dot(ab, ab);
             float t = 0.0f;
             float dist_sq;
- 
-            if (len_sq > 1e-12f) {
+
+            if ( len_sq > 1e-12f ) {
                 t = dot(ap, ab) / len_sq;
                 t = fmaxf(0.0f, fminf(1.0f, t));
                 float2 closest = a + t * ab;
                 float2 diff = query - closest;
                 dist_sq = dot(diff, diff);
-            } else {
+            }
+            else {
                 dist_sq = dot(ap, ap);
             }
- 
-            if (dist_sq < best_dist) {
+
+            if ( dist_sq < best_dist ) {
                 best_dist = dist_sq;
                 best_idx = prim_idx;
                 best_t = t;
             }
-        } else {
+        }
+        else {
             unsigned int left_child = node.x - 1;
             unsigned int right_child = node.y - 1;
- 
+
             float dist_left = dist_sq_point_aabb_2d(query, aabbs[left_child]);
             float dist_right = dist_sq_point_aabb_2d(query, aabbs[right_child]);
- 
-            if (dist_left > dist_right) {
-                if (dist_left <= best_dist) 
+
+            if ( dist_left > dist_right ) {
+                if ( dist_left <= best_dist )
                     stack[sp++] = left_child;
-                if (dist_right <= best_dist) 
+                if ( dist_right <= best_dist )
                     stack[sp++] = right_child;
-            } 
+            }
             else {
-                if (dist_right <= best_dist) 
+                if ( dist_right <= best_dist )
                     stack[sp++] = right_child;
-                if (dist_left <= best_dist) 
+                if ( dist_left <= best_dist )
                     stack[sp++] = left_child;
             }
         }
@@ -907,21 +919,196 @@ __global__ void query_nearest_edge_kernel(
     result->t = best_t;
 }
 // Kernel for self-intersection check within a loop
-__global__ void self_intersect_kernel( 
+__global__ void self_intersect_kernel(
     const int2* nodes, const AABB2D* aabbs, unsigned int root_idx, unsigned int num_edges,
     const float2* vertices, const int2* edges,
-    IntersectionResult* result) 
-{
+    IntersectionResult* result) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= num_edges) return;
-    
+    if ( i >= num_edges ) return;
+
     // Early exit if already found
-    if (result->found) return;
- 
+    if ( result->found ) return;
+
     // AABB for edge i
     int2 edge_i = edges[i];
     float2 p1 = vertices[edge_i.x];
     float2 p2 = vertices[edge_i.y];
+    AABB2D box_i;
+    box_i.min = make_float2(fminf(p1.x, p2.x), fminf(p1.y, p2.y));
+    box_i.max = make_float2(fmaxf(p1.x, p2.x), fmaxf(p1.y, p2.y));
+
+    unsigned int stack[64];
+    int sp = 0;
+    stack[sp++] = root_idx;
+
+    while ( sp > 0 ) {
+        unsigned int node_idx = stack[--sp];
+
+        if ( result->found ) return;
+        if ( !aabb_overlap_2d(box_i, aabbs[node_idx]) ) continue;
+
+        int2 node = nodes[node_idx];
+        if ( node.y == 0 ) { // Leaf
+            unsigned int prim_idx = node.x - 1;
+
+            // Filter neighbors (adjacent edges in loop)
+            int diff = abs((int)i - (int)prim_idx);
+            if ( diff <= 1 || diff == (int)num_edges - 1 ) continue;
+
+            int2 edge_j = edges[prim_idx];
+            float2 p3 = vertices[edge_j.x];
+            float2 p4 = vertices[edge_j.y];
+
+            // Segment-Segment Intersection
+            float2 d1 = p2 - p1;
+            float2 d2 = p4 - p3;
+            float2 diff_st = p1 - p3;
+
+            float cross_d = cross(d1, d2);
+            float cross_diff_d2 = cross(diff_st, d2);
+            float cross_diff_d1 = cross(diff_st, d1);
+
+            // Check parallel
+            if ( fabsf(cross_d) < 1e-8f ) continue;
+
+            // float t = cross_diff_d2 / cross_d;
+            // float u = cross_diff_d1 / cross_d;
+            float t = -cross_diff_d2 / cross_d;
+            float u = -cross_diff_d1 / cross_d;
+
+            if ( t >= 0.0f && t <= 1.0f && u >= 0.0f && u <= 1.0f ) {
+                // Found intersection
+                int old = atomicCAS(&result->found, 0, 1);
+                if ( old == 0 ) {
+                    result->idx = i;
+                    result->t = t;
+                }
+                return;
+            }
+        }
+        else {
+            stack[sp++] = node.y - 1;
+            stack[sp++] = node.x - 1;
+        }
+    }
+}
+
+__device__ inline float cross_2d(float2 a, float2 b) {
+    return a.x * b.y - a.y * b.x;
+}
+__device__ inline float dot_2d(float2 a, float2 b) {
+    return a.x * b.x + a.y * b.y;
+}
+
+// __global__ void all_intersections_kernel(
+//     const int2* nodes, const AABB2D* aabbs, unsigned int root_idx, unsigned int num_edges,
+//     const float2* vertices, const int2* edges,
+//     const int* edge_to_curve, const int* edge_local_idx,
+//     const float* edge_lengths, const float* edge_prefix_sums,
+//     const float* curve_total_lengths, const int* curve_num_edges, const int8_t* is_loops,
+//     FullIntersectionResult* results, unsigned int max_results, unsigned int* out_count
+// ) {
+//     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+//     if ( i >= num_edges ) return;
+//     // 获取边 i 的数据
+//     int2 edge_i = edges[i];
+//     float2 p1 = vertices[edge_i.x];
+//     float2 p2 = vertices[edge_i.y];
+//     // 手动构建当前边的 AABB 用于快速过滤
+//     AABB2D box_i;
+//     box_i.min = make_float2(fminf(p1.x, p2.x), fminf(p1.y, p2.y));
+//     box_i.max = make_float2(fmaxf(p1.x, p2.x), fmaxf(p1.y, p2.y));
+//     unsigned int stack[64];
+//     int sp = 0;
+//     stack[sp++] = root_idx;
+//     while ( sp > 0 ) {
+//         unsigned int node_idx = stack[--sp];
+//         // AABB 剪枝
+//         if ( !aabb_overlap_2d(box_i, aabbs[node_idx]) ) continue;
+//         int2 node = nodes[node_idx];
+//         if ( node.y == 0 ) { // 叶子节点
+//             unsigned int j = node.x - 1;
+//             // 1. 避免 i 和 j 重复双向检测，只保留 i < j 的情况
+//             if ( i >= j ) continue;
+//             int curve_i = edge_to_curve[i];
+//             int curve_j = edge_to_curve[j];
+//             // 2. 相邻边过滤：如果是同一条曲线，且相邻，则跳过（共享顶点不算相交）
+//             if ( curve_i == curve_j ) {
+//                 int local_i = edge_local_idx[i];
+//                 int local_j = edge_local_idx[j];
+//                 int diff = abs(local_i - local_j);
+//                 if ( diff <= 1 ) continue; // 直接相邻
+//                 if ( is_loops[curve_i] ) {
+//                     // 如果是闭环，首尾边也相邻
+//                     if ( diff == curve_num_edges[curve_i] - 1 ) continue;
+//                 }
+//             }
+//             // 3. 精确 2D 线段求交
+//             int2 edge_j = edges[j];
+//             float2 p3 = vertices[edge_j.x];
+//             float2 p4 = vertices[edge_j.y];
+//             float2 d1 = p2 - p1;
+//             float2 d2 = p4 - p3;
+//             float2 diff_st = p1 - p3;
+//             float cross_d = cross_2d(d1, d2);
+//             float cross_diff_d2 = cross_2d(diff_st, d2);
+//             float cross_diff_d1 = cross_2d(diff_st, d1);
+//             // 平行或共线视作无交点（共线重叠在缝纫/图案中通常需要特殊处理，此处忽略以保持拓扑清晰）
+//             if ( fabsf(cross_d) < 1e-8f ) continue;
+//             float t = -cross_diff_d2 / cross_d;
+//             float u = -cross_diff_d1 / cross_d;
+//             // 判断是否在线段内部
+//             if ( t >= 0.0f && t <= 1.0f && u >= 0.0f && u <= 1.0f ) {
+//                 // 找到交点，分配结果槽位
+//                 unsigned int idx = atomicAdd(out_count, 1);
+//                 if ( idx < max_results ) {
+//                     float len_i = edge_lengths[i];
+//                     float len_j = edge_lengths[j];
+//                     // 4. 计算长度百分比
+//                     // 百分比 = (此边之前的累加长度 + 交点在此边上的比例 * 此边长度) / 曲线总长度
+//                     float perc_i = (len_i > 1e-8f) ? (edge_prefix_sums[i] + t * len_i) / curve_total_lengths[curve_i] : 0.0f;
+//                     float perc_j = (len_j > 1e-8f) ? (edge_prefix_sums[j] + u * len_j) / curve_total_lengths[curve_j] : 0.0f;
+//                     // ---------------- 计算里外状态 ----------------
+//                     int state = 0;
+//                     // 只有两个曲线中一个是曲线0时才计算
+//                     if (curve_i == 0 && curve_j > 0) {
+//                         // 曲线0逆时针，内法线指向左侧: N = (-d1.y, d1.x)
+//                         float2 normal_0 = make_float2(-d1.y, d1.x);
+//                         // 另一曲线在交点前的来路方向（朝向v0/p3）: D = p3 - p4
+//                         float2 dir_before = p3 - p4;
+//                         
+//                         float dot = dot_2d(dir_before, normal_0);
+//                         if (dot > 0.0f) state = 1;      // 来路在曲线0内部
+//                         else if (dot < 0.0f) state = 2; // 来路在曲线0外部
+//                     } 
+//                     results[idx] = { curve_i, perc_i, curve_j, perc_j, state };
+//                 }
+//             }
+//         }
+//         else {
+//             // 内部节点：压栈（无优先遍历，因为求交不需要像最近邻那样排序）
+//             stack[sp++] = node.y - 1;
+//             stack[sp++] = node.x - 1;
+//         }
+//     }
+// }
+__global__ void all_intersections_kernel(
+    const int2* nodes, const AABB2D* aabbs, unsigned int root_idx, unsigned int num_edges,
+    const float2* vertices, const int2* edges,
+    const int* edge_to_curve, const int* edge_local_idx,
+    const float* edge_lengths, const float* edge_prefix_sums,
+    const float* curve_total_lengths, const int* curve_num_edges, const int8_t* is_loops,
+    const int* edge_to_section, const float* section_prefix_sums, 
+    const float* section_total_lengths, const int* curve_to_section_offset,
+    FullIntersectionResult* results, unsigned int max_results, unsigned int* out_count) {
+ 
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= num_edges) return;
+ 
+    int2 edge_i = edges[i];
+    float2 p1 = vertices[edge_i.x];
+    float2 p2 = vertices[edge_i.y];
+    
     AABB2D box_i;
     box_i.min = make_float2(fminf(p1.x, p2.x), fminf(p1.y, p2.y));
     box_i.max = make_float2(fmaxf(p1.x, p2.x), fmaxf(p1.y, p2.y));
@@ -932,47 +1119,82 @@ __global__ void self_intersect_kernel(
  
     while (sp > 0) {
         unsigned int node_idx = stack[--sp];
-        
-        if (result->found) return;
+ 
         if (!aabb_overlap_2d(box_i, aabbs[node_idx])) continue;
  
         int2 node = nodes[node_idx];
         if (node.y == 0) { // Leaf
-            unsigned int prim_idx = node.x - 1;
-            
-            // Filter neighbors (adjacent edges in loop)
-            int diff = abs((int)i - (int)prim_idx);
-            if (diff <= 1 || diff == (int)num_edges - 1) continue;
+            unsigned int j = node.x - 1;
  
-            int2 edge_j = edges[prim_idx];
+            if (i >= j) continue;
+ 
+            int curve_i = edge_to_curve[i];
+            int curve_j = edge_to_curve[j];
+ 
+            if (curve_i == curve_j) {
+                int local_i = edge_local_idx[i];
+                int local_j = edge_local_idx[j];
+                int diff = abs(local_i - local_j);
+                if (diff <= 1) continue;
+                if (is_loops[curve_i]) {
+                    if (diff == curve_num_edges[curve_i] - 1) continue;
+                }
+            }
+ 
+            int2 edge_j = edges[j];
             float2 p3 = vertices[edge_j.x];
             float2 p4 = vertices[edge_j.y];
  
-            // Segment-Segment Intersection
             float2 d1 = p2 - p1;
             float2 d2 = p4 - p3;
             float2 diff_st = p1 - p3;
-            
-            float cross_d = cross(d1, d2);
-            float cross_diff_d2 = cross(diff_st, d2);
-            float cross_diff_d1 = cross(diff_st, d1);
  
-            // Check parallel
+            float cross_d = cross_2d(d1, d2);
+            float cross_diff_d2 = cross_2d(diff_st, d2);
+            float cross_diff_d1 = cross_2d(diff_st, d1);
+ 
             if (fabsf(cross_d) < 1e-8f) continue;
  
-            // float t = cross_diff_d2 / cross_d;
-            // float u = cross_diff_d1 / cross_d;
             float t = -cross_diff_d2 / cross_d;
             float u = -cross_diff_d1 / cross_d;
  
             if (t >= 0.0f && t <= 1.0f && u >= 0.0f && u <= 1.0f) {
-                // Found intersection
-                int old = atomicCAS(&result->found, 0, 1);
-                if (old == 0) {
-                    result->idx = i;
-                    result->t = t;
+                unsigned int idx = atomicAdd(out_count, 1);
+                if (idx < max_results) {
+                    float len_i = edge_lengths[i];
+                    float len_j = edge_lengths[j];
+ 
+                    // 曲线内的绝对长度
+                    float abs_len_i = edge_prefix_sums[i] + t * len_i;
+                    float abs_len_j = edge_prefix_sums[j] + u * len_j;
+ 
+                    // --- 计算 Section A 的局部索引和百分比 ---
+                    int global_sec_i = edge_to_section[i];
+                    int local_sec_i = global_sec_i - curve_to_section_offset[curve_i];
+                    float sec_abs_len_i = abs_len_i - section_prefix_sums[global_sec_i];
+                    float local_t_i = (section_total_lengths[global_sec_i] > 1e-8f) ? 
+                                      sec_abs_len_i / section_total_lengths[global_sec_i] : 0.0f;
+ 
+                    // --- 计算 Section B 的局部索引和百分比 ---
+                    int global_sec_j = edge_to_section[j];
+                    int local_sec_j = global_sec_j - curve_to_section_offset[curve_j];
+                    float sec_abs_len_j = abs_len_j - section_prefix_sums[global_sec_j];
+                    float local_t_j = (section_total_lengths[global_sec_j] > 1e-8f) ? 
+                                      sec_abs_len_j / section_total_lengths[global_sec_j] : 0.0f;
+ 
+                    // --- 计算里外状态 ---
+                    int state = 0;
+                    if (curve_i == 0 && curve_j > 0) {
+                        float2 normal_0 = make_float2(-d1.y, d1.x);
+                        float2 dir_before = p3 - p4;
+                        float dot = dot_2d(dir_before, normal_0);
+                        if (dot > 0.0f) state = 1;
+                        else if (dot < 0.0f) state = 2;
+                    }
+ 
+                    results[idx] = { curve_i, local_sec_i, local_t_i, 
+                                     curve_j, local_sec_j, local_t_j, state };
                 }
-                return;
             }
         } else {
             stack[sp++] = node.y - 1;
@@ -980,4 +1202,51 @@ __global__ void self_intersect_kernel(
         }
     }
 }
+// =========================================================================
+// 点去重 Kernels
+// =========================================================================
+ 
+// 1. 查找重叠并建立初步指向关系 (大索引指向小索引)
+__global__ void merge_overlaps_kernel(
+    const float2* points, const int2* nodes, const AABB2D* aabbs, unsigned int root_idx,
+    float threshold_sq, unsigned int* map, unsigned int n) {
+    
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+ 
+    float2 p = points[i];
+    unsigned int stack[64];
+    int sp = 0;
+    stack[sp++] = root_idx;
+ 
+    while (sp > 0) {
+        unsigned int node_idx = stack[--sp];
+ 
+        // 剪枝：如果点到 AABB 的最短距离平方大于阈值平方，跳过
+        if (dist_sq_point_aabb_2d(p, aabbs[node_idx]) > threshold_sq) continue;
+ 
+        int2 node = nodes[node_idx];
+        if (node.y == 0) { // 叶子节点
+            unsigned int j = node.x - 1;
+            if (i == j) continue;
+ 
+            float2 q = points[j];
+            float2 diff = p - q;
+            float dist_sq = diff.x * diff.x + diff.y * diff.y;
+ 
+            if (dist_sq <= threshold_sq) {
+                // 找到重叠对，让大索引指向小索引
+                if (j > i) {
+                    atomicMin(&map[j], i);
+                }
+            }
+        } else {
+            // 内部节点压栈
+            stack[sp++] = node.y - 1;
+            stack[sp++] = node.x - 1;
+        }
+    }
+}
+ 
+
 } // namespace lbvh2d

@@ -2,8 +2,7 @@
 #include "common/vec_math.h"
 #include "common/atomic_utils.cuh"
 #include "solver_base.cuh"
-
-
+#include "contact/collision_type.cuh"
 
 static __global__ void compute_stitch_constraint(
     Mat3* __restrict__ Jx,

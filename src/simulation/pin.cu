@@ -1,30 +1,16 @@
-#include "solver_base.cuh"
-
 #include <thrust/execution_policy.h>
 #include <thrust/gather.h>
 #include <thrust/sequence.h>
 #include <thrust/sort.h>
 
-#include "constraint.cuh"
-#include "geometric_operator.cuh"
-#include "contact/collision.cuh"
+// #include "constraint.cuh"
+// #include "geometric_operator.cuh"
+#include "geometry.cuh"
+// #include "contact/collision.cuh"
+
+// #include "contact/lbvh.cuh"
 
 
-#include "contact/lbvh.cuh"
-
-static __global__ void transform_to_world(
-    float3* __restrict__ vertices_world,
-    const float3* __restrict__ vertices_local,
-    const int* __restrict__ vertices_obj,
-    const Mat4* __restrict__ world_matrices,
-    const int n
-) {
-    for ( int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
-          i += blockDim.x * gridDim.x ) {
-        int obj = vertices_obj[i];
-        vertices_world[i] = mul_homo(world_matrices[obj], vertices_local[i]);
-    }
-}
 static __global__ void compute_attach_info_kernel(
     AttachInfo* __restrict__ attach_data,
     const int* __restrict__ attached_indices,
@@ -78,16 +64,7 @@ static __global__ void compute_attach_info_kernel(
     printf("vert_idx:%d,tri_id:%d,u:%f,v:%f,d:%f\n",vert_idx, face_idx,info.u,info.v,info.d);
     attach_data[vert_idx] = info;
 }
-void SolverBase::init_pin() {
-    int threadsPerBlock = 256;
-    int blocksPerGrid = (params.nb_all_vertices + threadsPerBlock - 1) / threadsPerBlock;
-    transform_to_world<<<blocksPerGrid, threadsPerBlock>>>(
-        thrust::raw_pointer_cast(vertices_world.data()),
-        thrust::raw_pointer_cast(vertices_local.data()),
-        thrust::raw_pointer_cast(vertices_obj.data()),
-        thrust::raw_pointer_cast(world_matrices.data()),
-        params.nb_all_vertices
-        );
+void Geometry::init_pin() {
     thrust::transform(thrust::device, thrust::make_counting_iterator(0),
         thrust::make_counting_iterator(params.nb_all_cloth_vertices),
         vertices_mask.begin(), [
@@ -122,9 +99,9 @@ void SolverBase::init_pin() {
             triangle_indices.begin() + params.nb_all_triangles);
         int num_obstacle_triangles = obstacle_faces.size();
         lbvh3d::initialize(num_obstacle_triangles);
-        lbvh3d::build_face_bvh(vertices_world, obstacle_faces, obstacle_bvh);
+        lbvh3d::build_face_bvh(pos_world, obstacle_faces, obstacle_bvh);
         thrust::device_vector<float3> attached_verts_world(num_attached);
-        thrust::gather(thrust::device, attached_indices.begin(), attached_indices.end(), vertices_world.begin(),
+        thrust::gather(thrust::device, attached_indices.begin(), attached_indices.end(), pos_world.begin(),
             attached_verts_world.begin());
 
         thrust::device_vector<int> nearest_obstacle_faces(num_attached);
@@ -137,7 +114,7 @@ void SolverBase::init_pin() {
             thrust::raw_pointer_cast(obstacle_bvh.nodes.data()),
             thrust::raw_pointer_cast(obstacle_bvh.aabbs.data()),
             obstacle_bvh.root_idx,
-            thrust::raw_pointer_cast(vertices_world.data()),
+            thrust::raw_pointer_cast(pos_world.data()),
             thrust::raw_pointer_cast(obstacle_faces.data()),
             thrust::raw_pointer_cast(nearest_obstacle_faces.data())
             );
@@ -150,10 +127,13 @@ void SolverBase::init_pin() {
             thrust::raw_pointer_cast(attach_data.data()),
             thrust::raw_pointer_cast(attached_indices.data()),
             thrust::raw_pointer_cast(nearest_obstacle_faces.data()),
-            thrust::raw_pointer_cast(vertices_world.data()),
+            thrust::raw_pointer_cast(pos_world.data()),
             thrust::raw_pointer_cast(triangle_indices.data()),
             num_attached
             );
+        has_pin_attached = true;
+    }else {
+        has_pin_attached = false;
     }
     thrust::device_vector<float>().swap(pin_fixed);// clear
     thrust::device_vector<float>().swap(pin_attached);
@@ -198,11 +178,12 @@ static __global__ void update_attached_vertices_kernel(
         }
     }
 }
-void SolverBase::update_pin(float3* q) {
+void Geometry::update_pin(float3* q) {
+    if (!has_pin_attached) return; 
     int block = 256;
     int n = params.nb_all_cloth_vertices;
     update_attached_vertices_kernel<<<(n + block - 1) / block,block>>>(
         q, attach_data.data().get(), vertices_mask.data().get(),
-        triangle_indices.data().get(), vertices_world.data().get(),
+        triangle_indices.data().get(), pos_world.data().get(),
         n);
 }

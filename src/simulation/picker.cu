@@ -1,10 +1,10 @@
-﻿#include "solver_base.cuh"
-#include "common/cuda_utils.h"
+﻿#include "common/cuda_utils.h"
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
 #include <math.h>
 #include <thrust/execution_policy.h>
 
+#include "geometry.cuh"
 #include "common/atomic_utils.cuh"
 #include "common/geometric_algorithms.h"
 
@@ -122,13 +122,14 @@ static __global__ void clear_hash_table(PickerHashCell* table) {
     }
 }
 
-void SolverBase::init_picker() {
+void Geometry::init_picker() {
     picker_hash_table.resize(HASH_TABLE_SIZE);
     picker_collision_result.resize(HASH_TABLE_SIZE);
     clear_pick_triangle();
 }
 
-void SolverBase::check_picker() {
+void Geometry::check_picker() {
+    auto& params = *simulator->get_geo_params();
     if ( picker_collision_result.size() < pick_triangles.size() ) {
         picker_collision_result.resize(pick_triangles.size());
     }
@@ -146,7 +147,7 @@ void SolverBase::check_picker() {
     constexpr float query_dist = 0.5f * 0.01f;
     // 每个三角形去查它 AABB 内有没有点
     triangles_query_points<<<(num_triangles + block - 1) / block, block>>>(
-        thrust::raw_pointer_cast(vertices_world.data()),
+        thrust::raw_pointer_cast(pos_world.data()),
         thrust::raw_pointer_cast(triangle_indices.data()),
         thrust::raw_pointer_cast(pick_triangles.data()),
         thrust::raw_pointer_cast(pick_triangle_offsets.data()),
@@ -174,6 +175,7 @@ __global__ void update_pick_triangles(
         vertices[v0] = o0 + pos;
         vertices[v1] = o1 + pos;
         vertices[v2] = o2 + pos;
+        // printf("v: %f, %f, %f\n", vertices[v0].x,vertices[v0].y,vertices[v0].z);
         constexpr char mask = static_cast<char>(MaskBit::pick_mesh_mask);
         vertices_mask[v0] |= mask;
         vertices_mask[v1] |= mask;
@@ -205,7 +207,7 @@ __global__ void reset_pick_mask_kernel(
         vertices_mask[i] &= mask;
     }
 }
-void SolverBase::check_update_pick() {
+void Geometry::check_update_pick() {
     std::lock_guard<std::mutex> lock(picker_mutex);
     std::lock_guard<std::mutex> lock2(pick_mutex);
     int threadsPerBlock = 256;
@@ -218,16 +220,20 @@ void SolverBase::check_update_pick() {
     if ( has_pick_triangles ) {
         update_pick_triangles<<<(n + threadsPerBlock - 1) / threadsPerBlock, threadsPerBlock>>>(
             thrust::raw_pointer_cast(vertices_mask.data()),
-            thrust::raw_pointer_cast(vertices_world.data()),
+            thrust::raw_pointer_cast(pos_interpolation_new.data()),
             thrust::raw_pointer_cast(triangle_indices.data()),
             thrust::raw_pointer_cast(pick_triangles.data()),
             thrust::raw_pointer_cast(pick_triangle_offsets.data()),
             n
             );
+        has_pick_triangles_this_frame = true;
+        need_update_interpolation_vertices_this_frame = true;
+        need_update_inv_mass = true;
     }
 }
 
-void SolverBase::reset_pick_mask() {
+void Geometry::reset_pick_mask() {
+    auto& params = *simulator->get_geo_params();
     // std::lock_guard<std::mutex> lock(pick_mutex);
     int threadsPerBlock = 256;
     // int n = pick_size;
@@ -239,9 +245,13 @@ void SolverBase::reset_pick_mask() {
     //     thrust::raw_pointer_cast(pick_triangles.data()),
     //     n);
     // }
-    int n = params.nb_all_cloth_vertices;
-    reset_pick_mask_kernel<<<(n + threadsPerBlock - 1) / threadsPerBlock, threadsPerBlock>>>(
-        vertices_mask.data().get(), n);
+    if ( has_pick_triangles_this_frame ) {
+        int n = params.nb_all_cloth_vertices;
+        reset_pick_mask_kernel<<<(n + threadsPerBlock - 1) / threadsPerBlock, threadsPerBlock>>>(
+            vertices_mask.data().get(), n);
+        need_update_inv_mass = true;
+        has_pick_triangles_this_frame = false;
+    }
 }
 
 
@@ -260,7 +270,7 @@ __global__ void record_pick_triangle(
     Mat3 offsets{ vertices[v0] - pos, vertices[v1] - pos, vertices[v2] - pos };
     pick_triangle_offsets[i] = offsets;
 }
-int SolverBase::add_pick_triangle(int mesh_index, int tri_index, float3 position) {
+int Geometry::add_pick_triangle(int mesh_index, int tri_index, float3 position) {
     // cudaDeviceSynchronize();
     std::lock_guard<std::mutex> lock(pick_mutex);
     if ( pick_size + 1 > max_pick_size ) return -1;
@@ -270,7 +280,7 @@ int SolverBase::add_pick_triangle(int mesh_index, int tri_index, float3 position
         mesh_index, tri_index, position,
         thrust::raw_pointer_cast(pick_triangle_offsets.data()),
         thrust::raw_pointer_cast(pick_triangles.data()),
-        thrust::raw_pointer_cast(vertices_world.data()),
+        thrust::raw_pointer_cast(pos_world.data()),
         thrust::raw_pointer_cast(triangle_indices.data()),
         thrust::raw_pointer_cast(triangle_index_offsets.data())
         );
@@ -281,7 +291,7 @@ static __global__ void update_pick_position_kernel(thrust::pair<int, float3>* pi
     int index, float3 pos) {
     pick_triangles[index].second = pos;
 }
-void SolverBase::update_pick_triangle(int index, float3 position) {
+void Geometry::update_pick_triangle(int index, float3 position) {
     std::lock_guard<std::mutex> lock(pick_mutex);
     // cudaDeviceSynchronize();
     // pick_triangles[index].second = position;
@@ -293,7 +303,7 @@ static __global__ void invalidate_pick_triangle_kernel(thrust::pair<int, float3>
     int index) {
     pick_triangles[index].first = -1;
 }
-void SolverBase::remove_pick_triangle(int index) {
+void Geometry::remove_pick_triangle(int index) {
     std::unique_lock<std::mutex> lock(pick_mutex);
     // cudaDeviceSynchronize();
     if ( index >= max_pick_size || index < 0 ) return;
@@ -314,7 +324,7 @@ void SolverBase::remove_pick_triangle(int index) {
     if ( iter == end_iter ) { clear_pick_triangle(); }
     // clear_pick_triangle();
 }
-void SolverBase::clear_pick_triangle() {
+void Geometry::clear_pick_triangle() {
     std::lock_guard<std::mutex> lock(pick_mutex);
     cudaDeviceSynchronize();
     picker_size = pick_size = 0;
@@ -324,7 +334,7 @@ void SolverBase::clear_pick_triangle() {
     cudaDeviceSynchronize();
 }
 
-int SolverBase::add_picker(float3 position) {
+int Geometry::add_picker(float3 position) {
     std::lock_guard<std::mutex> lock(picker_mutex);
     int ptindex = add_pick_triangle(0, -2, position);
     if ( picker_size <= max_pick_size ) {
@@ -334,13 +344,13 @@ int SolverBase::add_picker(float3 position) {
     }
     return -1;
 }
-void SolverBase::update_picker(int index, float3 position) {
+void Geometry::update_picker(int index, float3 position) {
     std::lock_guard<std::mutex> lock(picker_mutex);
     if ( pickers[index] != -1 ) {
         update_pick_triangle(pickers[index], position);
     }
 }
-void SolverBase::remove_picker(int index) {
+void Geometry::remove_picker(int index) {
     std::unique_lock<std::mutex> lock(picker_mutex);
     cudaDeviceSynchronize();
     if ( index >= max_pick_size || index < 0 ) return;
@@ -359,7 +369,7 @@ void SolverBase::remove_picker(int index) {
         clear_picker();
     }
 }
-void SolverBase::clear_picker() {
+void Geometry::clear_picker() {
     std::lock_guard<std::mutex> lock(picker_mutex);
     cudaDeviceSynchronize();
     // pickers.clear();

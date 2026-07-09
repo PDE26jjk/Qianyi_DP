@@ -139,7 +139,7 @@ inline int cutGetMaxGflopsDeviceId()
         int compute_perf  = deviceProp.multiProcessorCount * sm_per_multiproc * deviceProp.clockRate;
         if( compute_perf  > max_compute_perf ) {
             // If we find GPU with SM major > 2, search only these
-            if ( best_SM_arch > 2 ) {
+            if ( best_SM_arch > 2 ) { 
                 // If our device==best_SM_arch, choose this, or else pass
                 if (deviceProp.major == best_SM_arch) { 
                     max_compute_perf  = compute_perf;

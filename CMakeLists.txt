@@ -59,12 +59,14 @@ target_sources(${PROJECT_NAME} PRIVATE
     src/pattern_helper_interface.cpp
     src/simulator_interface.h
     src/simulator_interface.cpp
+    src/perf_timing.cpp
  )
 
 add_subdirectory(src/geometry)
 add_subdirectory(src/gDel2D)
 add_subdirectory(src/simulation)
 add_subdirectory(src/graphics)
+add_subdirectory(src/test)
 
 target_include_directories(${PROJECT_NAME} PRIVATE src)
 target_link_libraries(${PROJECT_NAME}
@@ -72,6 +74,7 @@ target_link_libraries(${PROJECT_NAME}
     PRIVATE gDel2D
     PRIVATE simulation
     PRIVATE graphics
+    PRIVATE test
 )
 
 if(MSVC)

@@ -1,13 +1,14 @@
 #pragma once
 #include <unordered_map>
 #include <vector>
-#include <thrust/device_vector.h>
+// #include <thrust/device_vector.h>
 
 #include "common/device.h"
 #include "common/vec_math.h"
 
 struct SimulatorParams;
 struct SolverBase;
+struct Geometry;
 
 enum class MaskBit: char {
     fix_mask = 1 << 0,  // 1
@@ -17,17 +18,20 @@ enum class MaskBit: char {
 };
 
 struct ObjectDataInput {
-    float granularity; // mm
-    float thickness;
+    float granularity; // m
+    float thickness; // m
     float friction;
+    int collision_layer;
     float3 stretch;
-    float3 shear;
+    // float3 shear;
     float3 bending;
     float mass_densitys; // mass density per object, kg/m^2
+    bool kinetic; // The solver does not update its position
     bool vertices_updated;
     bool matrix_updated;
     Mat4 new_matrix;
 };
+
 
 struct SewingData {
     int start_idx; // Start index of stitches
@@ -36,8 +40,29 @@ struct SewingData {
     float compress; // Compress lenght of sewing line
 };
 
+struct GeoDataInput {
+    std::vector<float> vertices;
+    std::vector<float> vertices_sim;
+    std::vector<int> edges;
+    std::vector<int> triangles;
+    std::vector<float> normals;
+    std::vector<int> object_types;
+    std::vector<ObjectDataInput> obj_data_input;
+    std::vector<Mat4> world_matrices;
+    std::vector<int> vertex_index_offsets;
+    std::vector<int> edge_index_offsets;
+    std::vector<int> triangle_index_offsets;
+    std::vector<float> pin_fixed;
+    std::vector<float> pin_attached;
+    std::vector<SewingData> sewings;
+    std::vector<int2> stitches;
+    int nb_all_cloth_v; int nb_all_cloth_e; int nb_all_cloth_f;
+    int nb_all_cloth_o;
+};
+
 struct SimulatorParams {
     int nb_all_objects;
+    int nb_all_cloth_objects;
     int nb_all_vertices;
     int nb_all_edges;
     int nb_all_triangles;
@@ -46,6 +71,16 @@ struct SimulatorParams {
     int nb_all_cloth_edges;
     int nb_all_cloth_triangles;
     float cloth_edge_mean_length;
+};
+
+struct CheckPointData {
+    float mass;
+    float3 force;
+    std::vector<int> nearby_faces;
+};
+struct CheckEdgeData {
+    std::vector<int> nearby_edges;
+    std::vector<int> nearby_faces;
 };
 class Simulator {
 private:
@@ -60,25 +95,12 @@ public:
         init_device();
         return s;
     }
-    void init(const std::vector<float>& vertices, const std::vector<float>& vertices_sim,
-        const std::vector<int>& edges,
-        const std::vector<int>& triangles,
-        const std::vector<float>& normals,
-        const std::vector<int>& object_types,
-        // const std::vector<float>& mass_densitys,
-        const std::vector<ObjectDataInput>& object_data_inputs,
-        const std::vector<Mat4>& world_matrixs,
-        const std::vector<int>& _vertices_size,
-        const std::vector<int>& triangle_index_offsets,
-        const std::vector<float>& pin_fixed,
-        const std::vector<float>& pin_attached,
-        const std::vector<SewingData>& sewings,
-        const std::vector<int2>& stitches,
-        int nb_all_cloth_v, int nb_all_cloth_e, int nb_all_cloth_f);
+    void init(const GeoDataInput& geo);
     void update(float h);
     void copy_vertices(float*, bool world_space = false);
     void copy_debug_colors(float*);
-    const SimulatorParams* get_params() const;
+    const SimulatorParams* get_geo_params() const;
+    Geometry* get_geo() const;
     void reset();
 
     int add_pick_triangle(int mesh_index, int tri_index, float3 position);
@@ -100,11 +122,17 @@ public:
     void update_local_vertices(int obj_index, const std::vector<float>& vertices);
     void set_solver(const std::string& string);
 
+    CheckPointData get_check_point_data(int index) const;
+    CheckEdgeData get_check_edge_data(int p0, int p1) const;
+
+    float dt;
+    int frame;
 private:
     SolverBase* m_solver;
+    Geometry* m_geo;
     std::unordered_map<std::string, float> m_parameters;
     std::string m_last_solver_name;
-    std::string m_solver_name = "Explicit";
+    std::string m_solver_name = "PDNewton";
     void create_solver();
-
+    
 };

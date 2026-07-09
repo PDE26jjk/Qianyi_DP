@@ -61,6 +61,7 @@ static __global__ void record_edge_hashes(
         }
     }
 }
+
 __device__ __forceinline__ float segment_segment_sq_dist(
     const float3 p1, const float3 q1,
     const float3 p2, const float3 q2,

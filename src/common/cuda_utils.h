@@ -30,7 +30,9 @@ inline void __cudaCheckError(cudaError_t err, const char* file, const int line) 
 #define CUDA_CHECK(call) do { \
     __cudaCheckError((call), __FILE__, __LINE__); \
 } while (0)
- 
+
+#define check_cuda(call) CUDA_CHECK(call) // ...
+
 #define START_TIMER \
     auto start_time = std::chrono::high_resolution_clock::now(); \
     auto end_time = start_time; \

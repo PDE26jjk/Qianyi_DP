@@ -9,10 +9,22 @@
 _FDH_ int3 operator-(const int3& a, const int3& b) {
     return make_int3(a.x - b.x, a.y - b.y, a.z - b.z);
 }
-
+_FDH_ int3 operator-(const int3& a, int b) {
+    return make_int3(a.x - b, a.y - b, a.z - b);
+}
+_FDH_ int3 operator+(const int3& a, int b) {
+    return make_int3(a.x + b, a.y + b, a.z + b);
+}
+_FDH_ float3 operator*(const float3& a, const float3& b) {
+    return make_float3(a.x * b.x, a.y * b.y, a.z * b.z);
+}
+_FDH_ float3 operator/(const float3& a, const float3& b) {
+    return make_float3(a.x / b.x, a.y / b.y, a.z / b.z);
+}
 _FDH_ float3 operator+(const float3& a, const float3& b) {
     return make_float3(a.x + b.x, a.y + b.y, a.z + b.z);
 }
+
 _FDH_ float3 operator-(const float3& a, const float3& b) {
     return make_float3(a.x - b.x, a.y - b.y, a.z - b.z);
 }
@@ -25,6 +37,13 @@ _FDH_ float3 operator*(const float3& a, float b) {
 _FDH_ float3 operator*(float b, const float3& a) {
     return make_float3(a.x * b, a.y * b, a.z * b);
 }
+_FDH_ float3 operator+(const float3& a, float b) {
+    return make_float3(a.x + b, a.y + b, a.z + b);
+}
+_FDH_ float3 operator-(const float3& a, float b) {
+    return make_float3(a.x - b, a.y - b, a.z - b);
+}
+
 _FDH_ float3 operator/(const float3& a, float b) {
     return make_float3(a.x / b, a.y / b, a.z / b);
 }
@@ -50,6 +69,9 @@ _FDH_ float2 operator*(float b, const float2& a) {
 _FDH_ float2 operator/(const float2& a, float b) {
     return make_float2(a.x / b, a.y / b);
 }
+_FDH_ float2 operator/(const float2& a, const float2& b) {
+    return make_float2(a.x / b.x, a.y / b.y);
+}
 
 _FDH_ float dot(const float3& a, const float3& b) {
     return a.x * b.x + a.y * b.y + a.z * b.z;
@@ -74,10 +96,10 @@ _FDH_ float3 normalized(const float3& a) {
 _FDH_ float len_sq(const float3& a) { return dot(a, a); }
 _FDH_ float len_sq(const float2& a) { return dot(a, a); }
 
-_FDH_ float3 fmin3(float3 a, float3 b) {
+_FDH_ float3 fmin3(const float3& a, const float3& b) {
     return make_float3(fminf(a.x, b.x), fminf(a.y, b.y), fminf(a.z, b.z));
 }
-_FDH_ float3 fmax3(float3 a, float3 b) {
+_FDH_ float3 fmax3(const float3& a, const float3& b) {
     return make_float3(fmaxf(a.x, b.x), fmaxf(a.y, b.y), fmaxf(a.z, b.z));
 }
 
@@ -87,7 +109,6 @@ _FDH_ int2 operator+(const int2& a, const int2& b) {
 _FDH_ int3 operator+(const int3& a, const int3& b) {
     return make_int3(a.x + b.x, a.y + b.y, a.z + b.z);
 }
-
 _FDH_ float4 operator*(const float4& a, float b) {
     return make_float4(a.x * b, a.y * b, a.z * b, a.w * b);
 }
@@ -146,7 +167,11 @@ struct Mat3 {
         r[1] = r1;
         r[2] = r2;
     }
-
+    __device__ __host__ __forceinline__ void add_diag(const float b) {
+        r[0].x += b;
+        r[1].y += b;
+        r[2].z += b;
+    }
     __device__ __host__ Mat3 operator+(const Mat3& B) const {
         return {
             make_float3(r[0].x + B.r[0].x, r[0].y + B.r[0].y, r[0].z + B.r[0].z),
@@ -222,7 +247,7 @@ struct Mat3 {
 
     __device__ __host__ Mat3 inverse() const {
         float d = det();
-        if ( fabs(d) < 1e-6f ) return Mat3::zero();
+        if ( fabs(d) < 1e-14f ) return Mat3::zero();
         float invD = 1.0f / d;
 
         Mat3 res;
@@ -240,7 +265,7 @@ struct Mat3 {
 
         return res;
     }
-    __device__ __host__ static Mat3 outer_product(float3 a, float3 b) {
+    __device__ __host__ static Mat3 outer_product(const float3& a, const float3& b) {
         return {
             make_float3(a.x * b.x, a.x * b.y, a.x * b.z),
             make_float3(a.y * b.x, a.y * b.y, a.y * b.z),
@@ -443,6 +468,18 @@ static _FDH_
 float3 mul_homo(const Mat4 m, const float3 v) {
     const float4 v_ = m * make_float4(v.x, v.y, v.z, 1.f);
     return make_float3(v_.x, v_.y, v_.z);
+}
+
+_FDH_ float clamp(float x, float a, float b) {
+    // return fminf(fmaxf(x, a), b);
+    return (x < a) ? a : ((x > b) ? b : x);
+}
+
+_FDH_ float* as_float_ptr(float3& v) {
+    return reinterpret_cast<float*>(&v);
+}
+_FDH_ const float* as_float_ptr(const float3& v) {
+    return reinterpret_cast<const float*>(&v);
 }
 
 #undef _FDH_

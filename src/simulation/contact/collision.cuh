@@ -1,4 +1,5 @@
 ﻿#pragma once
+// Deprecated, just a backup
 
 #include "common/cuda_utils.h"
 #include <device_launch_parameters.h>
@@ -7,7 +8,7 @@
 #include "common/atomic_utils.cuh"
 #include "common/geometric_algorithms.h"
 #include "collision_type.cuh"
-
+#include "lbvh.cuh"
 static __global__ void insert_points_to_grid(
     const float3* __restrict__ points,
     PointHashCell* table,
@@ -373,45 +374,6 @@ static __global__ void triangles_query_points(
     }
 }
 
-__device__ __host__ __forceinline__ float clamp(float x, float a, float b) {
-    // return fminf(fmaxf(x, a), b);
-    return (x < a) ? a : ((x > b) ? b : x);
-}
-
-static __device__ float edge_edge_dist_sq(float3 p1, float3 p2, float3 p3, float3 p4, float3& closest_a, float3& closest_b,
-    float& s,
-    float& t) {
-    float3 d1 = p2 - p1; // Edge A direction
-    float3 d2 = p4 - p3; // Edge B direction
-    float3 r = p1 - p3;
-
-    float a = dot(d1, d1);
-    float e = dot(d2, d2);
-    float f = dot(d2, r);
-
-    float eps = 1e-8f;
-
-    if ( a > eps && e > eps ) {
-        float b = dot(d1, d2);
-        float denom = a * e - b * b;
-
-        // 如果近似平行，denom 接近 0，这里简单处理为不相交
-        // 如果需要处理平行边，此处需额外逻辑，但为了速度通常跳过或简化
-        if ( fabsf(denom) < eps ) return false;
-
-        float c = dot(d1, r);
-        s = (b * f - c * e) / denom;
-        t = (b * s + f) / e;
-    }
-    else {
-        s = -1.f;
-    }
-
-    closest_a = p1 + s * d1;
-    closest_b = p3 + t * d2;
-    return dot(closest_a - closest_b, closest_a - closest_b);
-}
-
 
 static __global__ void edges_query_edges_via_point_hash(
     CollisionResult_EE* results,
@@ -460,7 +422,7 @@ static __global__ void edges_query_edges_via_point_hash(
             for ( int z = min_g.z; z <= max_g.z; z++ ) {
                 float3 center = make_float3(x + 0.5f, y + 0.5f, z + 0.5f) * cell_size;
                 float dist = norm(center - v0 - dir * dot(center - v0, dir));
-                if ( dist > center2corner + padding *0.5f ) continue;
+                if ( dist > center2corner + padding * 0.5f ) continue;
 
                 int h = get_hash(make_int3(x, y, z), hash_table_size);
                 if ( hash_lookup[h] == -1 ) continue;
@@ -509,7 +471,7 @@ static __global__ void edges_query_edges_via_point_hash(
                         // 4. 计算 边-边 最短距离
                         float s, t; // 线段参数
                         float3 closest_A, closest_B;
-                        
+
                         float dist_sq = edge_edge_dist_sq(v0, v1, v2, v3, closest_A, closest_B, s, t);
                         if ( s < 0.0f || s > 1.0f || t < 0.0f || t > 1.0f ) {
                             continue;
@@ -720,7 +682,7 @@ static __global__ void k_mark_forbidden_bits(
     if ( c != -1 ) {
         const auto& cons = constraints[cid];
         uint64_t bit = (1ull << c);
-        for (int v : cons.v) {
+        for ( int v : cons.v ) {
             atomicOr(&vertex_forbidden_masks[v], bit);
         }
         // atomicOr(&vertex_forbidden_masks[cons.p0], bit);
@@ -769,8 +731,8 @@ static __global__ void k_claim_color_bitmask(
         }
         int chosen_color = __ffsll(temp_mask) - 1;  // 取第 r 个颜色
         cons.color = chosen_color;
-        for (int v : cons.v) {
-        atomicMax(&vertex_color_claimer[v * MAX_COLORS + chosen_color], cid);
+        for ( int v : cons.v ) {
+            atomicMax(&vertex_color_claimer[v * MAX_COLORS + chosen_color], cid);
         }
         // atomicMax(&vertex_color_claimer[cons.p0 * MAX_COLORS + chosen_color], cid);
         // atomicMax(&vertex_color_claimer[cons.p1 * MAX_COLORS + chosen_color], cid);
@@ -800,7 +762,7 @@ static __global__ void k_verify_colors(
         bool success = true;
         // 如果我的槽位里不是我的 ID（可能是比我大的 ID）
         // 那我就认输
-        for (int v : cons.v) {
+        for ( int v : cons.v ) {
             success &= (vertex_color_claimer[v * MAX_COLORS + c] == cid);
         }
         // if ( vertex_color_claimer[cons.p0 * MAX_COLORS + c] != cid ) success = false;
@@ -845,27 +807,7 @@ static __global__ void k_update_colors(
 //         cons.p2, cons.p3, constraint_colors[cid]);
 //
 // }
-static __global__ void fill_inv_mass(
-    float* __restrict__ invMass,
-    const int* __restrict__ vertex_obj,
-    const int* __restrict__ object_types,
-    float* masses,
-    char* mask,
-    int num_vertices
-) {
-    int vid = blockIdx.x * blockDim.x + threadIdx.x;
-    if ( vid >= num_vertices ) return;
-    if ( mask[vid] ) {
-        invMass[vid] = 0.f;
-        return;
-    }
-    int obj = vertex_obj[vid];
-    if ( object_types[obj] > 0 ) {
-        invMass[vid] = 0.f;
-        return;
-    }
-    invMass[vid] = 1.0f / masses[vid];
-}
+
 static __global__ void solvePGS_UnifiedColorBatchKernel(
     UnifiedNormalConstraint* __restrict__ constraints,
     int* __restrict__ needs_more_iters,
@@ -898,9 +840,9 @@ static __global__ void solvePGS_UnifiedColorBatchKernel(
     // 约束函数 C(x) = C_vec · normal - delta >= 0
     float delta = 0.015f; // 
     float C_val = dot(C_vec, c.normal) - delta;
-    if (c.A_ii == 0.f) {
+    if ( c.A_ii == 0.f ) {
         c.A_ii = invMass[c.v[0]] + c.w[1] * c.w[1] * invMass[c.v[1]]
-    + c.w[2] * c.w[2] * invMass[c.v[2]] + c.w[3] * c.w[3] * invMass[c.v[3]] + 1e-8f;
+            + c.w[2] * c.w[2] * invMass[c.v[2]] + c.w[3] * c.w[3] * invMass[c.v[3]] + 1e-8f;
     }
 
     // 3. 计算 LCP 乘子增量
@@ -947,4 +889,183 @@ static __global__ void record_color_offsets(
     if ( c != c_prev ) {
         lookup[c + 1] = idx;// start from -1
     }
+}
+
+// static __global__ void query_vf_pairs_kernel(
+//     const float3* query_pts,
+//     const unsigned int* __restrict__ sorted_indices,
+//     unsigned int num_queries,
+//     const int2* __restrict__ nodes,
+//     const AABB* __restrict__ aabbs,
+//     unsigned int root_idx,
+//     const float3* vertices,
+//     const int3* __restrict__ faces,
+//     const float radius,
+//     const float max_dist,
+//     int* __restrict__ query_results,
+//     int result_size
+// ) {
+//     int i = blockIdx.x * blockDim.x + threadIdx.x;
+//     if ( i >= num_queries ) return;
+//     if ( sorted_indices ) i = sorted_indices[i];
+//     float3 qp = query_pts[i];
+//     AABB q_aabb = {
+//         .min = qp - radius,
+//         .max = qp + radius,
+//     };
+//     float max_dist_sq = max_dist * max_dist;
+//     BVH_QUERY_LOOP(q_aabb, 64,
+//         int3 f = faces[prim_idx];
+//         if ( f.x == i || f.y == i || f.z == i ) continue; // itself
+//         float3 v0 = vertices[f.x];
+//         float3 v1 = vertices[f.y];
+//         float3 v2 = vertices[f.z];
+//
+//         float dist_sq = dist_sq_point_triangle_3d(qp, v0, v1, v2);
+//
+//         if ( dist_sq < max_dist_sq ) {
+//         query_result[++query_count] = prim_idx;
+//         }
+//         );
+//     // unsigned int stack[64];
+//     // int sp = 0;
+//     // stack[sp++] = root_idx;
+//     // int* query_result = &query_results[i * result_size];
+//     // int query_count = 0;
+//     // float max_dist_sq = max_dist * max_dist;
+//     // while ( sp > 0 && query_count < result_size - 1 ) {
+//     //     unsigned int node_idx = stack[--sp];
+//     //     if ( !aabb_overlap_3d(q_aabb, aabbs[node_idx]) ) continue;
+//     //     int2 node = nodes[node_idx];
+//     //     if ( node.y == 0 ) {
+//     //         int prim_idx = node.x - 1;
+//     //         int3 f = faces[prim_idx];
+//     //         if ( f.x == i || f.y == i || f.z == i ) continue; // itself
+//     //         float3 v0 = vertices[f.x];
+//     //         float3 v1 = vertices[f.y];
+//     //         float3 v2 = vertices[f.z];
+//     //
+//     //         float dist_sq = dist_sq_point_triangle_3d(qp, v0, v1, v2);
+//     //
+//     //         if ( dist_sq < max_dist_sq ) {
+//     //             query_result[++query_count] = prim_idx;
+//     //         }
+//     //     }
+//     //     else if ( sp < 64 - 2 ) {
+//     //         stack[sp++] = node.x - 1;
+//     //         stack[sp++] = node.y - 1;
+//     //     }
+//     // }
+//     // query_result[0] = query_count;
+// }
+//
+
+static __global__ void query_ee_pairs_kernel(
+    const float3*__restrict__ query_pts,
+    const unsigned int* __restrict__ sorted_indices,
+    unsigned int num_queries,
+    const int2*__restrict__ nodes, const AABB*__restrict__ aabbs, unsigned int root_idx,
+    const float3* vertices, const int2*__restrict__ edges, const float radius,
+    const float max_dist,
+    int*__restrict__ query_results, int result_size
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if ( i >= num_queries ) return;
+    if ( sorted_indices ) i = sorted_indices[i];
+    int2 edge = edges[i];
+    float3 p0 = query_pts[edge.x];
+    float3 p1 = query_pts[edge.y];
+
+    AABB q_aabb = {
+        .min = fmin3(p0, p1) - radius,
+        .max = fmax3(p0, p1) + radius
+    };
+    float max_dist_sq = max_dist * max_dist;
+    BVH_QUERY_LOOP(q_aabb, 64,
+        if ( prim_idx <= i ) continue; // itself
+        int2 e = edges[prim_idx];
+        if (edge.x == e.x || edge.x == e.y || edge.y == e.x || edge.y == e.y) continue;
+        float3 v0 = vertices[e.x];
+        float3 v1 = vertices[e.y];
+
+        float dist_sq = segment_segment_dist_sq_robust(p0, p1, v0, v1);
+
+        if ( dist_sq < max_dist_sq ) {
+        query_result[++query_count] = prim_idx;
+        }
+        );
+    // unsigned int stack[64];
+    // int sp = 0;
+    // stack[sp++] = root_idx;
+    // int* query_result = &query_results[i * result_size];
+    // int query_count = 0;
+    // float max_dist_sq = max_dist * max_dist;
+    // while ( sp > 0 && query_count < result_size - 1 ) {
+    //     unsigned int node_idx = stack[--sp];
+    //     if ( !aabb_overlap_3d(q_aabb, aabbs[node_idx]) ) continue;
+    //     int2 node = nodes[node_idx];
+    //     if ( node.y == 0 ) {
+    //         int prim_idx = node.x - 1;
+    //         if ( prim_idx == i ) continue; // itself
+    //         int2 e = edges[prim_idx];
+    //         float3 v0 = vertices[e.x];
+    //         float3 v1 = vertices[e.y];
+    //
+    //         float dist_sq = dist_sq_segment_segment_3d(p0, p1, v0, v1);
+    //
+    //         if ( dist_sq < max_dist_sq ) {
+    //             query_result[++query_count] = prim_idx;
+    //         }
+    //     }
+    //     else if ( sp < 64 - 2 ) {
+    //         stack[sp++] = node.x - 1;
+    //         stack[sp++] = node.y - 1;
+    //     }
+    // }
+    // query_result[0] = query_count;
+}
+
+static __global__ void query_aabb_pairs_kernel(
+    const AABB*__restrict__ query_aabbs,
+    const unsigned int* __restrict__ sorted_indices,
+    unsigned int num_queries,
+    const int2*__restrict__ nodes,
+    const AABB*__restrict__ aabbs,
+    unsigned int root_idx,
+    float radius,
+    int*__restrict__ query_results,
+    int result_size
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if ( i >= num_queries ) return;
+    if ( sorted_indices ) i = sorted_indices[i];
+    AABB q_aabb = query_aabbs[i];
+    q_aabb.min = q_aabb.min - radius;
+    q_aabb.max = q_aabb.max + radius;
+
+    BVH_QUERY_LOOP(q_aabb, 64,
+        query_result[++query_count] = prim_idx;
+        );
+
+    // int* query_result = &query_results[i * result_size];
+    // int query_count = 0;
+    //
+    // unsigned int stack[64];
+    // int sp = 0;
+    // stack[sp++] = root_idx;
+    //
+    // while ( sp > 0 && query_count < result_size - 1 ) {
+    //     unsigned int node_idx = stack[--sp];
+    //     if ( !aabb_overlap_3d(q_aabb, aabbs[node_idx]) ) continue;
+    //     int2 node = nodes[node_idx];
+    //     if ( node.y == 0 ) {
+    //         int prim_idx = node.x - 1;
+    //         query_result[++query_count] = prim_idx;
+    //     }
+    //     else if ( sp < 64 - 2 ) {
+    //         stack[sp++] = node.x - 1;
+    //         stack[sp++] = node.y - 1;
+    //     }
+    // }
+    // query_result[0] = query_count;
 }

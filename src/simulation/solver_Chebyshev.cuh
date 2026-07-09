@@ -20,7 +20,7 @@ struct SolverChebyshev : SolverBase {
     
     void init() override;
     void update(float dt) override;
-    void contact_handle() override;
+    // void contact_handle() override;
 
     float stepping; // alpha
     std::vector<int> profile_iter;

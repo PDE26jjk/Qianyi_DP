@@ -44,10 +44,9 @@ static __global__ void k_init_rng(curandState* states, long seed, int n) {
     }
 }
 
-static __global__ void k_fill_boundary(
+static __global__ void k_place_input_points(
     const float2* points,
-    const int* next_point,
-    int num_input_points,
+    int num_points,
     float2* final_pts,
     unsigned char* grid_status,
     int* grid_point,
@@ -55,7 +54,7 @@ static __global__ void k_fill_boundary(
     Params p
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if ( i >= num_input_points ) return;
+    if ( i >= num_points ) return;
 
     float2 point = points[i];
     int2 index = grid_index(point, p.one_grid_length);
@@ -71,8 +70,25 @@ static __global__ void k_fill_boundary(
             grid_point[idx_flat] = i;
         }
     }
-    float2 next_p = points[next_point[i]];
-    float2 mid_point = (point + next_p) * 0.5f;
+}
+
+static __global__ void k_place_edge_midpoints(
+    const float2* points,
+    const int2* edge_indices,
+    int num_edges,
+    float2* final_pts,
+    unsigned char* grid_status,
+    int* grid_point,
+    int* d_nb_points,
+    Params p
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if ( i >= num_edges ) return;
+
+    int2 edge = edge_indices[i];
+    float2 p0 = points[edge.x];
+    float2 p1 = points[edge.y];
+    float2 mid_point = (p0 + p1) * 0.5f;
     int2 mid_index = grid_index(mid_point, p.one_grid_length);
 
     if ( mid_index.x >= 0 && mid_index.x < p.max_size && mid_index.y >= 0 && mid_index.y < p.max_size ) {
@@ -81,11 +97,10 @@ static __global__ void k_fill_boundary(
             if ( try_test(mid_index, grid_status, p.max_size) ) {
                 int k = atomicAdd(d_nb_points, 1);
                 final_pts[k] = mid_point;
-                grid_point[mid_idx_flat] = i;
+                grid_point[mid_idx_flat] = edge.x;
             }
         }
     }
-
 }
 
 static __global__ void k_scan_line_fill(
@@ -277,7 +292,6 @@ static __global__ void k_compute_repulsion(
 
                 if ( l2 < (r2 * 0.5f) + 1e-6f ) {
                     if ( l2 > 1e-10f ) {
-                        // Taichi: d += l.normalized() / l2
                         d = d + (l * (1.0f / (sqrtf(l2) * l2)));
                     }
                 }
@@ -342,31 +356,24 @@ static __global__ void k_validate_triangles(
     const float2* pts,
     const int* next_point,
     float r,
-    int nb_boundary_points,
+    int nb_input_points,
     int nb_tris,
     Params p
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if ( i >= nb_tris ) return;
     int vs[3] = { triangles[i].x, triangles[i].y, triangles[i].z };
-    // check area
     auto p0 = pts[vs[0]], p1 = pts[vs[1]], p2 = pts[vs[2]];
     float cross_value = cross(p1 - p0, p2 - p0);
     if ( abs(cross_value) < 1e-8f ) {
         valid_status[i] = 0;
         return;
     }
-    if ( vs[0] >= nb_boundary_points || vs[1] >= nb_boundary_points
-        || vs[2] >= nb_boundary_points ) {
+    if ( vs[0] >= nb_input_points || vs[1] >= nb_input_points
+        || vs[2] >= nb_input_points ) {
         valid_status[i] = 1;
         return;
     }
-    // printf("%f\n",cross_value);
-    // printf("%d\n",v0 >= nb_boundary_points || v1 >= nb_boundary_points
-    // || v2 >= nb_boundary_points);
-    // printf("v0: %d, v1: %d, v2: %d\n", v0, v1, v2);
-    // printf("check center\n");
-    // check center
     auto center = (p0 + p1 + p2) / 3.0f;
     int2 index = grid_index(center, p.one_grid_length);
     int idx_flat = index.y * p.max_size + index.x;
@@ -379,6 +386,7 @@ static __global__ void k_validate_triangles(
         valid_status[i] = 0;
         return;
     }
+
     float2 e1 = p1 - p0, e2 = p2 - p0, e3 = p2 - p1;
     const float max_l_sq = r * r * 9;
     if ( len_sq(e1) > max_l_sq || len_sq(e2) > max_l_sq || len_sq(e3) > max_l_sq ) {
@@ -386,10 +394,9 @@ static __global__ void k_validate_triangles(
         return;
     }
     int np[3];
-    #pragma unroll
+	#pragma unroll
     for ( int k = 0; k < 3; ++k )
         np[k] = next_point[vs[k]];
-
     int start = -1, end = -1;
     for ( int j = 0; j < 3; ++j )
         for ( int k = 0; k < 3; ++k ) {
@@ -407,10 +414,8 @@ static __global__ void k_validate_triangles(
             return;
         }
     }
-
     valid_status[i] = 1;
 }
-
 
 // ==========================================
 // Host Controller Class
@@ -418,13 +423,24 @@ static __global__ void k_validate_triangles(
 
 
 
-Sampler::Sampler() {
+Sampler::Sampler()
+: d_nb_points(nullptr)
+, d_grid_status(nullptr)
+, d_grid_point(nullptr)
+, d_final(nullptr)
+, d_grid_multi_point(nullptr)
+, d_grid_multi_point_size(nullptr)
+, d_force(nullptr)
+, d_valid_status(nullptr)
+, d_rng_states(nullptr)
+, d_input_points(nullptr)
+, d_edge_indices(nullptr) {
     cudaMalloc(&d_nb_points, sizeof(int));
 }
 
 
 Sampler::~Sampler() {
-    if ( cudaFree(nullptr) == cudaErrorCudartUnloading ) return; // TODO check it.
+    if ( cudaFree(nullptr) == cudaErrorCudartUnloading ) return;
     cudaFree(d_grid_status);
     cudaFree(d_grid_point);
     cudaFree(d_final);
@@ -435,7 +451,7 @@ Sampler::~Sampler() {
     cudaFree(d_nb_points);
     cudaFree(d_rng_states);
     if ( d_input_points ) cudaFree(d_input_points);
-    if ( d_input_next ) cudaFree(d_input_next);
+    if ( d_edge_indices ) cudaFree(d_edge_indices);
 }
 
 void Sampler::set_radius(float _radius) {
@@ -443,9 +459,8 @@ void Sampler::set_radius(float _radius) {
     params.one_grid_length = _radius / sqrtf(2.0f);
     params.grid_size = (int)ceil(1.0f / params.one_grid_length);
     params.max_size = ((params.grid_size + 63) / 64) * 64;
-    params.n = params.max_size * params.max_size; // Note: Taichi n = max_size^2, usually plenty buffer
+    params.n = params.max_size * params.max_size;
 
-    // Re-allocate if size changed (simplified: always re-allocate for this example)
     if ( d_grid_status ) cudaFree(d_grid_status);
     if ( d_grid_point ) cudaFree(d_grid_point);
     if ( d_final ) cudaFree(d_final);
@@ -463,7 +478,6 @@ void Sampler::set_radius(float _radius) {
     cudaMalloc(&d_force, params.n * sizeof(float2));
     cudaMalloc(&d_valid_status, params.n * sizeof(unsigned char));
 
-    // Init RNG
     cudaMalloc(&d_rng_states, params.n * sizeof(curandState));
     int blockSize = 256;
     int numBlocks = (params.n + blockSize - 1) / blockSize;
@@ -474,17 +488,25 @@ void Sampler::set_radius(float _radius) {
 void Sampler::sample(
     std::vector<float2>& output_points,
     std::vector<int3>& output_tris,
-    const std::vector<float2>& boundary_points,
-    const std::vector<int>& next_point,
+    const std::vector<float2>& all_points,
+    const std::vector<int2>& edge_indices,
+    const std::vector<int>& curve_sizes,
+    const std::vector<bool>& is_holes,
     float raw_radius,
     float f1, int t1, float f2, int t2
 ) {
-    if ( boundary_points.empty() ) return;
+    if ( all_points.empty() || edge_indices.empty() ) return;
 
+    int num_input_points = all_points.size();
+    int num_edges = edge_indices.size();
+
+    // ---------------------------------------------------------
+    // 1. Compute bounding box & normalize
+    // ---------------------------------------------------------
     float x_min = FLT_MAX, y_min = FLT_MAX;
     float x_max = -FLT_MAX, y_max = -FLT_MAX;
 
-    for ( const auto& p : boundary_points ) {
+    for ( const auto& p : all_points ) {
         if ( p.x < x_min ) x_min = p.x;
         if ( p.y < y_min ) y_min = p.y;
         if ( p.x > x_max ) x_max = p.x;
@@ -494,124 +516,139 @@ void Sampler::sample(
     float width = x_max - x_min;
     float height = y_max - y_min;
 
-    // Python: scale = 1.0 / (max(width, height) + radius)
     float scale = 1.0f / (fmaxf(width, height) + raw_radius);
     float2 offset = make_float2(x_min, y_min);
-
-    // Python: radius_scaled = radius * scale
     float radius_scaled = raw_radius * scale;
-
 
     set_radius(radius_scaled);
 
-    // Python: points_normalized = (boundary_points - offset + radius * 0.5) * scale
-    std::vector<float2> points_normalized(boundary_points.size());
-    for ( size_t i = 0; i < boundary_points.size(); ++i ) {
-        float2 p = boundary_points[i];
+    // Normalize all input points
+    std::vector<float2> points_normalized(num_input_points);
+    for ( int i = 0; i < num_input_points; ++i ) {
+        float2 p = all_points[i];
         points_normalized[i].x = (p.x - offset.x + raw_radius * 0.5f) * scale;
         points_normalized[i].y = (p.y - offset.y + raw_radius * 0.5f) * scale;
     }
-    std::vector<graphics::Edge> edges(points_normalized.size());
-    float factor = params.grid_size;
-    for ( int i = 0; i < edges.size(); ++i ) {
-        int j = next_point[i];
-        edges[i] = { { points_normalized[i].x * factor, points_normalized[i].y * factor },
-            { points_normalized[j].x * factor, points_normalized[j].y * factor } };
+
+    // ---------------------------------------------------------
+    // 2. Prepare rasterizer edges (boundary + holes only)
+    // ---------------------------------------------------------
+    std::vector<graphics::Edge> rasterizer_edges;
+    std::vector<int> next_point(num_input_points, -1); 
+    float factor = params.grid_size; 
+    int edge_offset = 0;
+
+    for ( int c = 0; c < (int)curve_sizes.size(); ++c ) {
+        bool is_loop = (c == 0) || is_holes[c];
+        if ( is_loop ) {
+            for ( int e = 0; e < curve_sizes[c]; ++e ) {
+                int2 edge = edge_indices[edge_offset + e];
+                rasterizer_edges.push_back(
+                    { { points_normalized[edge.x].x * factor, points_normalized[edge.x].y * factor },
+                        { points_normalized[edge.y].x * factor, points_normalized[edge.y].y * factor } }
+                    );
+                next_point[edge.x] = edge.y;
+            }
+        }
+        edge_offset += curve_sizes[c];
     }
 
     auto& rasterizer = graphics::VulkanCudaRasterizer::Instance();
-    float* d_rasterization_result = rasterizer.render(edges, params.max_size, params.max_size, 0);
+    float* d_rasterization_result = rasterizer.render(rasterizer_edges, params.max_size, params.max_size, 0);
 
     // ---------------------------------------------------------
-    // 2. GPU Processing
+    // 3. Upload data to GPU
     // ---------------------------------------------------------
-
-    int num_pts = points_normalized.size();
-    // 1. Setup Input
     if ( d_input_points ) cudaFree(d_input_points);
-    if ( d_input_next ) cudaFree(d_input_next);
-    cudaMalloc(&d_input_points, num_pts * sizeof(float2));
-    cudaMalloc(&d_input_next, num_pts * sizeof(int));
+    if ( d_edge_indices ) cudaFree(d_edge_indices);
+    cudaMalloc(&d_input_points, num_input_points * sizeof(float2));
+    cudaMalloc(&d_edge_indices, num_edges * sizeof(int2));
 
-    cudaMemcpy(d_input_points, points_normalized.data(), num_pts * sizeof(float2), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_input_next, next_point.data(), num_pts * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_input_points, points_normalized.data(), num_input_points * sizeof(float2), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_edge_indices, edge_indices.data(), num_edges * sizeof(int2), cudaMemcpyHostToDevice);
 
-    // 2. Clear Grid Status & Counters
+    // ---------------------------------------------------------
+    // 4. Clear Grid Status & Counters
+    // ---------------------------------------------------------
     cudaMemset(d_grid_status, 0, params.max_size * params.max_size * sizeof(unsigned char));
     cudaMemset(d_nb_points, 0, sizeof(int));
 
-    // 3. Fill Boundary (Kernel 1)
+    // ---------------------------------------------------------
+    // 5. Place all input points on grid (as obstacle points)
+    // ---------------------------------------------------------
     int blockSize = 256;
-    int numBlocks = (num_pts + blockSize - 1) / blockSize;
-    k_fill_boundary<<<numBlocks, blockSize>>>(
-        d_input_points, d_input_next, num_pts,
+    int numBlocks = (num_input_points + blockSize - 1) / blockSize;
+    k_place_input_points<<<numBlocks, blockSize>>>(
+        d_input_points, num_input_points,
         d_final, d_grid_status, d_grid_point, d_nb_points, params
         );
-    // cudaDeviceSynchronize();
 
-    // Get nb_points
-    int h_nb_points = 0;
-    cudaMemcpy(&h_nb_points, d_nb_points, sizeof(int), cudaMemcpyDeviceToHost);
+    // ---------------------------------------------------------
+    // 6. Place edge midpoints on grid
+    // ---------------------------------------------------------
+    numBlocks = (num_edges + blockSize - 1) / blockSize;
+    k_place_edge_midpoints<<<numBlocks, blockSize>>>(
+        d_input_points, d_edge_indices, num_edges,
+        d_final, d_grid_status, d_grid_point, d_nb_points, params
+        );
 
-    // 4. Scan Line Fill (Kernel 2)
-    // numBlocks = (h_nb_points + blockSize - 1) / blockSize;
-    // k_scan_line_fill<<<numBlocks, blockSize>>>(
-    //     d_final, d_input_points, d_input_next,
-    //     d_grid_point, d_grid_status, h_nb_points, params
-    //     );
-    // cudaDeviceSynchronize();
+    // Get count of all boundary-placed points (input points + midpoints)
+    int nb_boundary_points = 0;
+    cudaMemcpy(&nb_boundary_points, d_nb_points, sizeof(int), cudaMemcpyDeviceToHost);
 
-    int nb_boundary_points = h_nb_points; //
-
-    // 5. Generate Interior (Kernel 3)
+    // ---------------------------------------------------------
+    // 7. Copy fill from rasterization
+    // ---------------------------------------------------------
     dim3 dimBlock(16, 16);
     dim3 dimGrid((params.grid_size + dimBlock.x - 1) / dimBlock.x,
         (params.grid_size + dimBlock.y - 1) / dimBlock.y);
-    k_copy_fill<<<dimGrid, dimBlock >>>(d_grid_status, d_rasterization_result, params);
+    k_copy_fill<<<dimGrid, dimBlock>>>(d_grid_status, d_rasterization_result, params);
 
+    // ---------------------------------------------------------
+    // 8. Generate interior points
+    // ---------------------------------------------------------
     k_generate_interior<<<dimGrid, dimBlock>>>(
         d_grid_status, d_final, d_nb_points, d_rng_states, params
         );
-    // cudaDeviceSynchronize();
 
-    // Get updated nb_points
+    // Get updated total point count
+    int h_nb_points = 0;
     cudaMemcpy(&h_nb_points, d_nb_points, sizeof(int), cudaMemcpyDeviceToHost);
 
-    // 6. Repulsion Loops
-    auto run_repulsion = [&](float factor, int times) {
+    // ---------------------------------------------------------
+    // 9. Repulsion Loops (interior points only, all placed points act as obstacles)
+    // ---------------------------------------------------------
+    auto run_repulsion = [&](float rep_factor, int times) {
         for ( int t = 0; t < times; ++t ) {
-            // Reset Grid Multi
             dim3 gridDimMax((params.max_size + 15) / 16, (params.max_size + 15) / 16);
-            k_reset_grid_multi<<<gridDimMax, dimBlock >>>(d_grid_multi_point_size, params);
+            k_reset_grid_multi<<<gridDimMax, dimBlock>>>(d_grid_multi_point_size, params);
 
-            // Build Grid
             int blocks = (h_nb_points + 255) / 256;
             k_build_grid<<<blocks, 256>>>(
                 d_final, d_grid_multi_point_size, d_grid_multi_point, h_nb_points, params
                 );
 
-            // Compute Force (Only for non-boundary points)
             int inner_count = h_nb_points - nb_boundary_points;
             if ( inner_count > 0 ) {
                 blocks = (inner_count + 255) / 256;
-                k_compute_repulsion<<<blocks, 256 >>>(
+                k_compute_repulsion<<<blocks, 256>>>(
                     d_final, d_grid_multi_point_size, d_grid_multi_point, d_force,
                     nb_boundary_points, h_nb_points, params
                     );
 
-                // Apply Force
-                k_apply_force<<<blocks, 256 >>>(
-                    d_final, d_force, nb_boundary_points, h_nb_points, factor, params
+                k_apply_force<<<blocks, 256>>>(
+                    d_final, d_force, nb_boundary_points, h_nb_points, rep_factor, params
                     );
             }
-            // cudaDeviceSynchronize();
         }
     };
 
     run_repulsion(f1, t1);
     run_repulsion(f2, t2);
 
-    // 7. Validation
+    // ---------------------------------------------------------
+    // 10. Validate interior points
+    // ---------------------------------------------------------
     int inner_count = h_nb_points - nb_boundary_points;
     if ( inner_count > 0 ) {
         int blocks = (inner_count + 255) / 256;
@@ -621,44 +658,65 @@ void Sampler::sample(
     }
     cudaDeviceSynchronize();
 
-    // 8. Retrieve Data
+    // ---------------------------------------------------------
+    // 11. Retrieve Data
+    // ---------------------------------------------------------
     std::vector<float2> result_final(h_nb_points);
     std::vector<unsigned char> result_valid(h_nb_points);
     cudaMemcpy(result_final.data(), d_final, h_nb_points * sizeof(float2), cudaMemcpyDeviceToHost);
     cudaMemcpy(result_valid.data(), d_valid_status, h_nb_points * sizeof(unsigned char), cudaMemcpyDeviceToHost);
 
-    // Filter valid points (Taichi logic: only return valid points generated inside, excluding boundary?)
-    // The python code: return final[nb_boundary:][valid > 0]
-
-    // 9. triangulate
-    output_points.reserve(points_normalized.size() + inner_count);
-    output_points.resize(points_normalized.size());
-    memcpy(output_points.data(), points_normalized.data(), points_normalized.size() * sizeof(float2));
+    // ---------------------------------------------------------
+    // 12. Build output: input points + valid interior points
+    // ---------------------------------------------------------
+    output_points.reserve(num_input_points + inner_count);
+    output_points.resize(num_input_points);
+    memcpy(output_points.data(), points_normalized.data(), num_input_points * sizeof(float2));
 
     for ( int i = nb_boundary_points; i < h_nb_points; ++i ) {
         if ( result_valid[i] > 0 ) {
             output_points.push_back(result_final[i]);
         }
     }
-    std::vector<int2> constraints(next_point.size());
-    for ( int i = 0; i < next_point.size(); ++i ) {
-        constraints[i] = { i, next_point[i] };
-    }
-    // return output;
+
+    // ---------------------------------------------------------
+    // 13. Triangulate with ALL edges as constraints
+    // ---------------------------------------------------------
+    std::vector<int2> constraints(num_edges);
+    memcpy(constraints.data(), edge_indices.data(), num_edges * sizeof(int2));
+
     auto tris = delaunay_2d_cuda_type_impl(output_points, constraints);
+
+    // ---------------------------------------------------------
+    // 14. Validate triangles
+    // ---------------------------------------------------------
     thrust::device_vector<int3> d_tris(tris.begin(), tris.end());
     thrust::device_vector<unsigned char> d_valid_status_tris(tris.size());
     thrust::device_vector<float2> d_pts(output_points.begin(), output_points.end());
+
+    
+    if ( d_next_point ) cudaFree(d_next_point);
+    cudaMalloc(&d_next_point, num_input_points * sizeof(int));
+    cudaMemcpy(d_next_point, next_point.data(), num_input_points * sizeof(int), cudaMemcpyHostToDevice);
     int block = 256;
-    k_validate_triangles<<<(tris.size() + block - 1) / block,block>>>
-        (d_valid_status_tris.data().get(), d_tris.data().get(),
-        d_grid_status, d_pts.data().get(), d_input_next, radius_scaled,
-        points_normalized.size(), tris.size(), params
+    k_validate_triangles<<<(tris.size() + block - 1) / block, block>>>(
+        d_valid_status_tris.data().get(), d_tris.data().get(),
+        d_grid_status, d_pts.data().get(),
+        d_next_point, 
+        radius_scaled, num_input_points, tris.size(), params
         );
+
+    // ---------------------------------------------------------
+    // 15. Un-normalize output points
+    // ---------------------------------------------------------
     for ( auto& output_point : output_points ) {
         output_point.x = output_point.x / scale - raw_radius * 0.5f + offset.x;
         output_point.y = output_point.y / scale - raw_radius * 0.5f + offset.y;
     }
+
+    // ---------------------------------------------------------
+    // 16. Filter valid triangles
+    // ---------------------------------------------------------
     thrust::host_vector<unsigned char> h_valid_status_tris(d_valid_status_tris);
     output_tris.reserve(tris.size());
     for ( int i = 0; i < tris.size(); ++i ) {
@@ -666,7 +724,6 @@ void Sampler::sample(
             output_tris.push_back(tris[i]);
         }
     }
-
 }
 
 
@@ -674,29 +731,31 @@ void Sampler::sample(
 // Main / Interface
 // ==========================================
 
-void sample_points_impl(std::vector<float>& boundary, std::vector<int>& next_pt, float radius, std::vector<float>& output_points,
-    std::vector<int>& output_tris) {
-    //float radius = 0.05f;
+void sample_points_impl(std::vector<float>& boundary, std::vector<int>& edge_indices_flat,
+    std::vector<int>& curve_sizes, std::vector<int>& is_holes_int,
+    float radius, std::vector<float>& output_points,
+    std::vector<int>& output_tris
+) {
     init_device();
     Sampler sampler{};
 
-    //std::vector<float2> boundary = {
-    //    {0.1f, 0.1f}, {0.9f, 0.1f}, {0.9f, 0.9f}, {0.1f, 0.9f}
-    //};
-    //std::vector<int> next_pt = { 1, 2, 3, 0 };
-    std::vector<float2> boundary_(boundary.size() / 2);
-    std::memcpy(boundary_.data(), boundary.data(), sizeof(float) * boundary.size());
+    int num_points = boundary.size() / 2;
+    std::vector<float2> all_points(num_points);
+    std::memcpy(all_points.data(), boundary.data(), sizeof(float) * boundary.size());
+
+    int num_edges = edge_indices_flat.size() / 2;
+    std::vector<int2> edges(num_edges);
+    std::memcpy(edges.data(), edge_indices_flat.data(), sizeof(int) * edge_indices_flat.size());
+
+    std::vector<bool> is_holes(is_holes_int.size());
+    for ( int i = 0; i < is_holes_int.size(); ++i ) {
+        is_holes[i] = (is_holes_int[i] != 0);
+    }
 
     std::vector<float2> points;
     std::vector<int3> tris;
-    sampler.sample(points, tris, boundary_, next_pt, radius, 0.02f, 15, 0.01f, 35);
-    //std::cout << "Generated " << points.size() << " points." << std::endl;
-    //for (size_t i = 0; i < std::min(points.size(), (size_t)10); i++) {
-    //    std::cout << points[i].x << ", " << points[i].y << std::endl;
-    //}
-    int size = sampler.params.max_size * sampler.params.max_size;
-    // std::vector<unsigned char> res(size);
-    // cudaMemcpy(res.data(), sampler.d_grid_status, size * sizeof(unsigned char), cudaMemcpyDeviceToHost);
+    sampler.sample(points, tris, all_points, edges, curve_sizes, is_holes, radius, 0.02f, 15, 0.01f, 35);
+
     output_points.resize(points.size() * 2);
     std::memcpy(output_points.data(), points.data(), sizeof(float) * output_points.size());
     output_tris.resize(tris.size() * 3);
@@ -743,63 +802,42 @@ std::vector<int> sample_points_debug2(std::vector<float>& boundary, std::vector<
     }
     return res;
 }
-std::vector<unsigned char> sample_points_debug(std::vector<float>& boundary, std::vector<int>& next_pt, float radius) {
-    //float radius = 0.05f;
+
+std::vector<unsigned char> sample_points_debug(std::vector<float>& boundary,
+    std::vector<int>& edge_indices_flat, std::vector<int>& curve_sizes,
+    std::vector<int>& is_holes_int, float radius) {
     START_TIMER;
     Sampler sampler{};
 
-    //std::vector<float2> boundary = {
-    //    {0.1f, 0.1f}, {0.9f, 0.1f}, {0.9f, 0.9f}, {0.1f, 0.9f}
-    //};
-    //std::vector<int> next_pt = { 1, 2, 3, 0 };
-    std::vector<float2> boundary_(boundary.size() / 2);
-    std::memcpy(boundary_.data(), boundary.data(), sizeof(float) * boundary.size());
+    int num_points = boundary.size() / 2;
+    std::vector<float2> all_points(num_points);
+    std::memcpy(all_points.data(), boundary.data(), sizeof(float) * boundary.size());
+
+    int num_edges = edge_indices_flat.size() / 2;
+    std::vector<int2> edges(num_edges);
+    std::memcpy(edges.data(), edge_indices_flat.data(), sizeof(int) * edge_indices_flat.size());
+
+    std::vector<bool> is_holes(is_holes_int.size());
+    for ( int i = 0; i < is_holes_int.size(); ++i ) {
+        is_holes[i] = (is_holes_int[i] != 0);
+    }
 
     std::vector<float2> points;
     std::vector<int3> tris;
-    sampler.sample(points, tris, boundary_, next_pt, radius, 0.02f, 15, 0.01f, 35);
+    sampler.sample(points, tris, all_points, edges, curve_sizes, is_holes, radius, 0.02f, 15, 0.01f, 35);
 
     int size = sampler.params.max_size * sampler.params.max_size;
     RECORD_TIME("sampler.sample");
 
     std::vector<unsigned char> res(size);
     cudaMemcpy(res.data(), sampler.d_grid_status, size * sizeof(unsigned char), cudaMemcpyDeviceToHost);
-    /*thrust::device_vector<float2> vertices(boundary_.size());
-    thrust::copy(boundary_.begin(), boundary_.end(), vertices.begin());
-    thrust::device_vector<float2> query_pts(points.size());
-    thrust::copy(points.begin(), points.end(), query_pts.begin());
-    BVH2D bvh;
-    lbvh2d::initialize(vertices.size());
-    lbvh2d::build_point_bvh(vertices, bvh);
-    CUDA_CHECK(cudaDeviceSynchronize());
-    RECORD_TIME("build bvh");
-
-    thrust::device_vector<NearestResult> results(query_pts.size());
-    int block = 256;
-    int n = query_pts.size();
-    lbvh2d::query_nearest_kernel<<<(n + block - 1) / block, block>>>(
-        query_pts.data().get(), n,
-        bvh.nodes.data().get(), bvh.aabbs.data().get(),
-        bvh.root_idx, results.data().get(),
-        vertices.data().get());
-    CUDA_CHECK(cudaDeviceSynchronize());
-    RECORD_TIME("build bvh");
-
-    std::vector<NearestResult> results_h;
-    results_h.resize(results.size());
-    thrust::copy(results.begin(), results.end(), results_h.begin());
-    std::vector<int> res(n);
-    for ( int i = 0; i < results_h.size(); ++i ) {
-        res[i] = results_h[i].prim_idx;
-    }*/
     return res;
 }
+
 std::vector<int> sample_points_debug3(std::vector<float>& boundary, std::vector<int>& next_pt, float radius) {
     START_TIMER;
     init_device();
-    // auto res = triangulator::earcut(boundary);
 
-    // 2. 创建光栅化器实例
     auto& rasterizer = graphics::VulkanCudaRasterizer::Instance();
 
     std::vector<graphics::Edge> edges(boundary.size() / 2);
@@ -810,10 +848,8 @@ std::vector<int> sample_points_debug3(std::vector<float>& boundary, std::vector<
         edges[i] = { { boundary[i * 2] * factor, boundary[i * 2 + 1] * factor },
             { boundary[j * 2] * factor, boundary[j * 2 + 1] * factor } };
     }
-    // 准备数据
     RECORD_TIME("copy");
 
-    // 3. 渲染 (动态分辨率，如 1024x1024)
     float* d_result = rasterizer.render(edges, 1024, 1024, 0);
     RECORD_TIME("render");
     std::vector<float> res_float(1024 * 1024);
@@ -827,12 +863,26 @@ std::vector<int> sample_points_debug3(std::vector<float>& boundary, std::vector<
     return res;
 }
 
+struct MapPointsFunctor {
+    const float* bounds_source;
+    const float* bounds_target;
+    __device__ void operator()(float2& point) {
+        float2 src_min = { bounds_source[0], bounds_source[1] };
+        float2 src_max = { bounds_source[2], bounds_source[3] };
+        float2 tgt_min = { bounds_target[0], bounds_target[1] };
+        float2 tgt_max = { bounds_target[2], bounds_target[3] };
+
+        point.x = ((point.x - src_min.x) / (src_max.x - src_min.x)) * (tgt_max.x - tgt_min.x) + tgt_min.x;
+        point.y = ((point.y - src_min.y) / (src_max.y - src_min.y)) * (tgt_max.y - tgt_min.y) + tgt_min.y;
+    }
+};
 
 static void find_points_locations(
-    const thrust::device_vector<float2>& query_pts,
+    thrust::device_vector<float2>& query_pts,
     const thrust::device_vector<float2>& vertices,
     const thrust::device_vector<int3>& faces,
-    thrust::device_vector<lbvh2d::LocationResult>& results) {
+    thrust::device_vector<lbvh2d::LocationResult>& results,
+    const bool scale_to_fix = false) {
     unsigned int n_faces = faces.size();
     unsigned int n_queries = query_pts.size();
 
@@ -841,6 +891,21 @@ static void find_points_locations(
     lbvh2d::initialize(faces.size());
     BVH2D bvh;
     lbvh2d::build_face_bvh(vertices, faces, bvh);
+    if ( scale_to_fix ) {
+        float bounds[4];
+        lbvh2d::calc_bounds(query_pts, bounds);
+        thrust::device_vector<float> bounds_source(4);
+        thrust::copy(bounds, bounds + 4, bounds_source.begin());
+
+        lbvh2d::calc_bounds(vertices, bounds);
+        thrust::device_vector<float> bounds_target(4);
+        thrust::copy(bounds, bounds + 4, bounds_target.begin());
+        MapPointsFunctor mapper = {
+            thrust::raw_pointer_cast(bounds_source.data()),
+            thrust::raw_pointer_cast(bounds_target.data())
+        };
+        thrust::for_each(query_pts.begin(), query_pts.end(), mapper);
+    }
     results.resize(n_queries);
     query_location_kernel<<<(n_queries + 255) / 256, 256>>>(
         thrust::raw_pointer_cast(query_pts.data()),
@@ -859,7 +924,8 @@ void find_map_weight_impl(
     const std::vector<float>& map_points,
     const std::vector<int>& map_tris,
     const std::vector<float>& query_points,
-    std::vector<int>& res_index, std::vector<float>& res_weight
+    std::vector<int>& res_index, std::vector<float>& res_weight,
+    bool map_bounds
 ) {
     thrust::device_vector<float2> d_points(query_points.size() / 2);
     cudaMemcpy(d_points.data().get(), query_points.data(), d_points.size() * sizeof(float2), cudaMemcpyHostToDevice);
@@ -868,7 +934,7 @@ void find_map_weight_impl(
     thrust::device_vector<int3> d_faces(map_tris.size() / 3);
     cudaMemcpy(d_faces.data().get(), map_tris.data(), d_faces.size() * sizeof(int3), cudaMemcpyHostToDevice);
     thrust::device_vector<lbvh2d::LocationResult> d_results;
-    find_points_locations(d_points, d_vertices, d_faces, d_results);
+    find_points_locations(d_points, d_vertices, d_faces, d_results, map_bounds);
     thrust::host_vector<lbvh2d::LocationResult> h_results = d_results;
     res_index.resize(h_results.size());
     res_weight.resize(h_results.size() * 3);

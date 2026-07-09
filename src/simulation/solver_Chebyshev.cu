@@ -127,9 +127,8 @@ static __global__ void update_end(
         vertices_local[i] = mul_homo(world_matrices_inv[obj], x);
     }
 }
-void SolverChebyshev::contact_handle() {
-    SolverBase::contact_handle();
-}
+
+
 static __global__ void clear_data(
     Mat3* __restrict__ Jx_diag,
     float3* __restrict__ forces,

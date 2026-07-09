@@ -2,6 +2,30 @@
 #include "common/vec_math.h"
 #include "common/atomic_utils.cuh"
 
+// T. Liu, A. W. Bargteil, J. F. O’Brien, and L. Kavan, "Fast simulation of mass-spring systems," ACM Trans. Graph., vol. 32, no. 6, p. 214:1-214:7, Nov. 2013, doi: 10.1145/2508363.2508406.
+
+static __global__ void pd_precompute_spring_forces(
+    float* __restrict__ Jx_diag_scale,
+    float* __restrict__ Jx_nondiag_scale,
+    const int2* __restrict__ edges,
+    const float* __restrict__ edge_lengths,
+    const ObjectDataInput* __restrict__ obj_data,
+    const int* __restrict__ vertices_obj,
+    const int n // edge size
+) {
+    for ( int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+          i += blockDim.x * gridDim.x ) {
+        auto [v0,v1] = edges[i];
+        float3 ks = obj_data[vertices_obj[v0]].stretch;
+        const float youngs = 4e2;
+        float rest_length = edge_lengths[i];
+        float k = youngs * (ks.x + ks.y + ks.z) * 0.333f;
+        float weight = k;
+        atomicAdd(&Jx_diag_scale[v0], weight);
+        atomicAdd(&Jx_diag_scale[v1], weight);
+        Jx_nondiag_scale[i] -= weight;
+    }
+}
 
 static __global__ void compute_spring_forces(
     Mat3* __restrict__ Jx,
@@ -11,18 +35,21 @@ static __global__ void compute_spring_forces(
     const float3* __restrict__ vertices, // world space
     const int2* __restrict__ edges,
     const float* __restrict__ edge_lengths,
+    const ObjectDataInput* __restrict__ obj_data,
+    const int* __restrict__ vertices_obj,
     const int n // edge size
 ) {
     for ( int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
           i += blockDim.x * gridDim.x ) {
         auto [v0,v1] = edges[i];
         float3 p0 = vertices[v0], p1 = vertices[v1];
-        const float youngs = 4e3;
         float3 e = p0 - p1;
         float length = norm(e);
         if ( length > 1e-8 ) {
+            float3 ks = obj_data[vertices_obj[v0]].stretch;
+            const float youngs = 4e2;
             float rest_length = edge_lengths[i];
-            float k = youngs / rest_length;
+            float k = youngs * (ks.x + ks.y + ks.z) * 0.333f;
             float length_diff = length - rest_length;
             float3 force = e * (length_diff * k / length);
             atomicAddFloat3(&forces[v0], -force);
@@ -297,7 +324,7 @@ static __global__ void compute_ARAP_FEM(
     float mu = 8e3;
     float coef = -mu * area;
 
-    // --- 力的计算 (First Piola-Kirchhoff) ---
+    // --- (First Piola-Kirchhoff) ---
     // R = U * I_{3x2} * V^T
     float3 r_col0 = U0 * v00 + U1 * v01;
     float3 r_col1 = U0 * v10 + U1 * v11;

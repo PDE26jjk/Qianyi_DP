@@ -3,26 +3,17 @@
 
 #include <algorithm>
 
+#include "constraint.cuh"
 #include "geometric_operator.cuh"
-#include "solver_base.cuh"
+#include "geometry.cuh"
 #include "common/atomic_utils.cuh"
 
-static __device__ bool find_edge(int v0, int v1, const int2* lookup, const int2* dir_edges, int& edge) {
-    auto [offset, degree] = lookup[v0];
-    if ( dir_edges[offset].x <= v1 && v1 <= dir_edges[offset + degree - 1].x ) {
-        for ( int d = 0; d < degree; d++ ) {
-            if ( dir_edges[offset + d].x == v1 ) {
-                edge = dir_edges[offset + d].y;
-                return true;
-            }
-        }
-    }
-    return false;
-}
+
 constexpr char stitch_status_running = (char)(0);
 constexpr char stitch_status_done = (char)(1 << 1);
 constexpr char stitch_status_suspend = (char)(1 << 2);
-void SolverBase::init_sewing() {
+void Geometry::init_sewing() {
+    auto& params = *simulator->get_geo_params();
     stitch_sewing.resize(params.nb_all_stitches);
     sewing_edges.resize(params.nb_all_stitches);
     sewing_e2t.resize(params.nb_all_stitches);
@@ -48,7 +39,7 @@ void SolverBase::init_sewing() {
     // 
     thrust::for_each_n(thrust::device, thrust::make_counting_iterator(0), params.nb_all_stitches,
         [
-            vertices = thrust::raw_pointer_cast(vertices_2D.data()), // float3
+            vertices = thrust::raw_pointer_cast(pos_2D.data()), // float3
             triangles = thrust::raw_pointer_cast(triangles.data()), // int3
             edges = thrust::raw_pointer_cast(edges.data()), // int2
             indices = thrust::raw_pointer_cast(triangle_indices.data()), // int3
@@ -311,9 +302,9 @@ static __global__ void update_proxy_triangles(
     }
 }
 
-void SolverBase::check_sewing(bool forced_connect) {
+void Geometry::check_sewing(bool forced_connect) {
+    auto& params = *simulator->get_geo_params();
     int block = 256;
-
     int n = params.nb_all_stitches;
     int stitches_done_count_old;
     cudaMemcpy(&stitches_done_count_old, stitches_done_count.data().get(), sizeof(int), cudaMemcpyDeviceToHost);
@@ -324,14 +315,14 @@ void SolverBase::check_sewing(bool forced_connect) {
         vertex_proxy.data().get(),
         stitches_done_count.data().get(),
         stitches_status.data().get(),
-        vertices_world.data().get(),
+        pos_world.data().get(),
         vertices_mask.data().get(),
         stitches.data().get(),
         min_dist * min_dist, forced_connect, n);
     int stitches_done_count_new;
     cudaMemcpy(&stitches_done_count_new, stitches_done_count.data().get(), sizeof(int), cudaMemcpyDeviceToHost);
 
-    std::cout << "stitches: " << stitches_done_count_new << "/" << n << std::endl;
+    // std::cout << "stitches: " << stitches_done_count_new << "/" << n << std::endl;
     if ( stitches_done_count_new > stitches_done_count_old ) {
         // #define CHECK(v,type) thrust::host_vector<type> _##v = v;\
         // std::vector<type> __##v(_##v.begin(), _##v.end())
@@ -363,13 +354,26 @@ void SolverBase::check_sewing(bool forced_connect) {
             triangle_indices.data().get(),
             e2t.data().get(),
             vertex_proxy.data().get(),
-            vertices_2D.data().get(),
+            pos_2D.data().get(),
             edge_lookup.data().get(),
             dir_edges.data().get(),
             n);
         // CHECK(sewing_lines, SewingData);
         // #undef CHECK
     }
-
+    need_update_inv_mass = true;
     sewing_done = false;
+}
+void Geometry::accumulate_sewing_force() {
+    if ( !sewing_done ) {
+        float min_dist = 2e-3f;
+        int block = 256;
+        int n = params.nb_all_stitches;
+        float sewing_k = max(0.f, get_global_parameter("sewing_k",2e3));
+        compute_stitch_constraint<<<(n + block - 1) / block, block>>>(
+            nullptr, nullptr, forces.data().get(),
+            nullptr,
+            pos_world.data().get(), vertices_obj.data().get(), obj_data.data().get(),
+            vertices_mask.data().get(), stitches.data().get(), min_dist, sewing_k, n);
+    }
 }

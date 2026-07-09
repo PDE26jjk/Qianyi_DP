@@ -3,6 +3,7 @@
 #include <simulation/simulator.h>
 
 #include "common/py_utils.h"
+#include <pybind11/stl.h>
 
 void SimulatorInterface::print() {
     std::cout << "SimulatorInterface::print" << std::endl;
@@ -50,6 +51,7 @@ void SimulatorInterface::input_data(py::dict input) {
         nb_all_e += static_cast<int>(mesh["edges"].cast<py::array>().size());
         nb_all_f += static_cast<int>(mesh["triangles"].cast<py::array>().size());
     }
+
     int nb_all_o = (int)mesh_list.size();
     std::vector<float> vertices_init(nb_all_v);
     std::vector<float> vertices_simulation(nb_all_v);
@@ -63,10 +65,12 @@ void SimulatorInterface::input_data(py::dict input) {
     std::vector<ObjectDataInput> obj_data(nb_all_o);
     std::vector<Mat4> world_matrixs(nb_all_o);
 
-    int nb_all_cloth_v{ nb_all_v }, nb_all_cloth_e{ nb_all_e }, nb_all_cloth_f{ nb_all_f };
+    int nb_all_cloth_v{ nb_all_v }, nb_all_cloth_e{ nb_all_e }, nb_all_cloth_f{ nb_all_f },
+    nb_all_cloth_o{ nb_all_o };
     nb_all_v = nb_all_e = nb_all_f = 0;
-    std::vector<int> vertex_index_offsets(mesh_list.size());
-    std::vector<int> triangle_index_offsets(mesh_list.size());
+    std::vector<int> vertex_index_offsets(nb_all_o + 1);
+    std::vector<int> edge_index_offsets(nb_all_o + 1);
+    std::vector<int> triangle_index_offsets(nb_all_o + 1);
 
     for ( size_t i = 0; i < nb_all_o; i++ ) {
         auto mesh = mesh_list[i];
@@ -77,6 +81,7 @@ void SimulatorInterface::input_data(py::dict input) {
         }
         copy_and_add(vertices_simulation, nb_all_v, _vertices);
         vertex_index_offsets[i] = nb_all_v / 3;
+        edge_index_offsets[i] = nb_all_e / 2;
         triangle_index_offsets[i] = nb_all_f / 3;
         int object_type = mesh["object_type"].cast<int>();
         // pybind11::print(nb_all_v);
@@ -85,10 +90,7 @@ void SimulatorInterface::input_data(py::dict input) {
             nb_all_cloth_v = nb_all_v;
             nb_all_cloth_e = nb_all_e;
             nb_all_cloth_f = nb_all_f;
-            // local normal of cloth, should be (0,0,1)
-            for ( size_t j = 2; j < nb_all_cloth_f; j += 3 ) {
-                normals[j] = 1.f;
-            }
+            nb_all_cloth_o = i;
         }
         if ( object_type != 0 ) {
             auto _normals = mesh["normals"].cast<py::array_t<float>>();
@@ -110,22 +112,33 @@ void SimulatorInterface::input_data(py::dict input) {
         if ( object_type == 0 ) {
             obj_data[i].mass_densitys = mesh["mass"].cast<float>();
             // mass_densitys[i] = mesh["mass"].cast<float>();
-            obj_data[i].granularity = mesh["granularity"].cast<float>();
+            obj_data[i].granularity = mesh["granularity"].cast<float>() * 0.001f; // mm->m
             obj_data[i].friction = mesh["friction"].cast<float>();
-            obj_data[i].thickness = mesh["thickness"].cast<float>();
+            obj_data[i].thickness = mesh["thickness"].cast<float>() * 0.001f;// mm->m
             obj_data[i].stretch = to_float3(mesh["stretch"].cast<py::array_t<float>>());
-            obj_data[i].shear = to_float3(mesh["shear"].cast<py::array_t<float>>());
+            // obj_data[i].shear = to_float3(mesh["shear"].cast<py::array_t<float>>());
             obj_data[i].bending = to_float3(mesh["bending"].cast<py::array_t<float>>());
-
+            obj_data[i].kinetic = false;
         }
         else {
             obj_data[i].mass_densitys = 1.f;
+            obj_data[i].kinetic = true; // TODO soft body
         }
+        obj_data[i].collision_layer = mesh["collision_layer"].cast<int>();
         auto world_matrix = mesh["world_matrix"].cast<py::array_t<float>>();
         Mat4 mat;
         memcpy(&mat.r, world_matrix.data(), sizeof(float) * 16);
         world_matrixs[i] = mat;
     }
+    vertex_index_offsets[nb_all_o] = nb_all_v / 3;
+    edge_index_offsets[nb_all_o] = nb_all_e / 2;
+    triangle_index_offsets[nb_all_o] = nb_all_f / 3;
+    
+    // local normal of cloth, should be (0,0,1)
+    for ( size_t j = 2; j < nb_all_cloth_f; j += 3 ) {
+        normals[j] = 1.f;
+    }
+    
     int nb_all_s{};
     auto sewings_dict = input["sewings"].cast<py::list>();
 
@@ -152,13 +165,28 @@ void SimulatorInterface::input_data(py::dict input) {
         sewings[i].count = nb_all_s - sewings[i].start_idx;
         i++;
     }
-    auto& simulator = Simulator::instance();
-    simulator.init(vertices_init, vertices_simulation,
-        edges, triangles, normals, object_types, obj_data, world_matrixs,
-        vertex_index_offsets,
-        triangle_index_offsets, pin_fixed, pin_attached,
-        sewings, stitches,
-        nb_all_cloth_v, nb_all_cloth_e, nb_all_cloth_f);
+    GeoDataInput geo{
+        .vertices = std::move(vertices_init),
+        .vertices_sim = std::move(vertices_simulation),
+        .edges = std::move(edges),
+        .triangles = std::move(triangles),
+        .normals = std::move(normals),
+        .object_types = std::move(object_types),
+        .obj_data_input = std::move(obj_data),
+        .world_matrices = std::move(world_matrixs),
+        .vertex_index_offsets = std::move(vertex_index_offsets),
+        .edge_index_offsets = std::move(edge_index_offsets),
+        .triangle_index_offsets = std::move(triangle_index_offsets),
+        .pin_fixed = std::move(pin_fixed),
+        .pin_attached = std::move(pin_attached),
+        .sewings = std::move(sewings),
+        .stitches = std::move(stitches),
+        .nb_all_cloth_v = nb_all_cloth_v,
+        .nb_all_cloth_e = nb_all_cloth_e,
+        .nb_all_cloth_f = nb_all_cloth_f,
+        .nb_all_cloth_o = nb_all_cloth_o
+    };
+    Simulator::instance().init(geo);
 }
 void SimulatorInterface::update(float dt) {
     py::gil_scoped_release release;
@@ -175,7 +203,7 @@ void SimulatorInterface::update_local_vertices(int index, py::array_t<float> ver
 py::array_t<float> SimulatorInterface::get_simulation_data(bool world_space = false) {
     auto& simulator = Simulator::instance();
     auto result = py::array_t<float>(
-        { (py::ssize_t)simulator.get_params()->nb_all_cloth_vertices, (py::ssize_t)3 });
+        { (py::ssize_t)simulator.get_geo_params()->nb_all_cloth_vertices, (py::ssize_t)3 });
     py::buffer_info buf = result.request();
     float* ptr = static_cast<float*>(buf.ptr);
     simulator.copy_vertices(ptr, world_space);
@@ -184,7 +212,7 @@ py::array_t<float> SimulatorInterface::get_simulation_data(bool world_space = fa
 py::array_t<float> SimulatorInterface::get_debug_colors() {
     auto& simulator = Simulator::instance();
     auto result = py::array_t<float>(
-        { (py::ssize_t)simulator.get_params()->nb_all_cloth_vertices, (py::ssize_t)3 });
+        { (py::ssize_t)simulator.get_geo_params()->nb_all_cloth_vertices, (py::ssize_t)3 });
     py::buffer_info buf = result.request();
     float* ptr = static_cast<float*>(buf.ptr);
     simulator.copy_debug_colors(ptr);
@@ -227,6 +255,28 @@ void SimulatorInterface::set_parameters(const std::unordered_map<std::string, fl
     for ( const auto& [fst, snd] : params ) {
         Simulator::instance().set_parameter(fst, snd);
     }
+}
+py::tuple float3_to_tuple(float3 data) {
+    py::tuple res(3);
+    res[0] = data.x;
+    res[1] = data.y;
+    res[2] = data.z;
+    return res;
+}
+py::dict SimulatorInterface::check_point_attributes(int index) {
+    auto data = Simulator::instance().get_check_point_data(index);
+    py::dict d;
+    d["mass"] = data.mass;
+    d["force"] = float3_to_tuple(data.force);
+    d["nearby_faces"] = data.nearby_faces;
+    return d;
+}
+py::dict SimulatorInterface::check_edge_attributes(int p0,int p1) {
+    auto data = Simulator::instance().get_check_edge_data(p0,p1);
+    py::dict d;
+    d["nearby_edges"] = data.nearby_edges;
+    d["nearby_faces"] = data.nearby_faces;
+    return d;
 }
 void SimulatorInterface::on_exit() {
     Simulator::instance().reset();

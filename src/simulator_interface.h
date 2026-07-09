@@ -30,5 +30,7 @@ public:
     static void set_parameter(const std::string& key, float value);
     static void set_parameters(const std::unordered_map<std::string, float>& params);
     
+    static py::dict check_point_attributes(int index);
+    static py::dict check_edge_attributes(int p0, int p1);
     static void on_exit();
 };

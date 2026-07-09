@@ -33,7 +33,8 @@ public:
 
     // Helper device memory for inputs
     float2* d_input_points = nullptr;
-    int* d_input_next = nullptr;
+    int2* d_edge_indices = nullptr;
+    int* d_next_point = nullptr;
     Sampler();
     ~Sampler();
     void set_radius(float _radius);
@@ -41,7 +42,8 @@ public:
     void sample(
         std::vector<float2>& output_points,
         std::vector<int3>& output_tris,
-        const std::vector<float2>& boundary_points,
-        const std::vector<int>& next_point, float raw_radius, float f1, int t1, float f2, int t2
+        const std::vector<float2>& all_points,
+        const std::vector<int2>& edge_indices, const std::vector<int>& curve_sizes, const std::vector<bool>& is_holes, float
+        raw_radius, float f1, int t1, float f2, int t2
     );
 };

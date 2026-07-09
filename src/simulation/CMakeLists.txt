@@ -1,28 +1,43 @@
 add_library(simulation)
 file(GLOB DYNAMIC_SOLVER "dynamics/*.cuh")
 file(GLOB CONTACT "contact/*.cuh")
+file(GLOB CUDA_TOOLS "cuda_tools/*")
+file(GLOB SDF "sdf/*")
 target_sources(
    simulation PRIVATE
    simulator.h
    simulator.cu
+   sewing.cu
    picker.cu
+   pin.cu
    ${DYNAMIC_SOLVER}
    ${CONTACT}
+   ${CUDA_TOOLS}
+   ${SDF}
    contact/lbvh.cu
-   collision_Wu2021.cu
+   # collision_Wu2021.cu
    collision.cu
+   geometry.cuh
+   geometry.cu
+   subspace.cu
    solver_base.cuh
    solver_base.cu
-   solver_PCG.cuh
-   solver_PCG.cu
-   solver_PNCG.cuh
-   solver_PNCG.cu
-   solver_Chebyshev.cuh
-   solver_Chebyshev.cu
+   solver_explicit.cuh
+   solver_explicit.cu
+   solver_XPBD.cuh
+   solver_XPBD.cu
+   solver_PDNewton.cuh
+   solver_PDNewton.cu
+   linear/solver_linear.cuh
+   linear/solver_linear.cu
+   linear/solver_PCG.cu
+   # solver_PNCG.cuh
+   # solver_PNCG.cu
+   # solver_Chebyshev.cuh
+   # solver_Chebyshev.cu
    constraint.cuh
    geometric_operator.cuh
-   sewing.cu
-   pin.cu
+
 )
 target_include_directories(simulation PUBLIC ${PROJECT_SOURCE_DIR}/src)
 target_compile_options(simulation PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda>)

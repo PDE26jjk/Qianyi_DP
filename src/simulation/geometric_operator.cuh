@@ -47,3 +47,15 @@ static __device__ int v2e_include_stitches(int v0, int v1, const int2* lookup, c
     return -1;
 }
 
+static __device__ bool find_edge(int v0, int v1, const int2* lookup, const int2* dir_edges, int& edge) {
+    auto [offset, degree] = lookup[v0];
+    if ( dir_edges[offset].x <= v1 && v1 <= dir_edges[offset + degree - 1].x ) {
+        for ( int d = 0; d < degree; d++ ) {
+            if ( dir_edges[offset + d].x == v1 ) {
+                edge = dir_edges[offset + d].y;
+                return true;
+            }
+        }
+    }
+    return false;
+}
