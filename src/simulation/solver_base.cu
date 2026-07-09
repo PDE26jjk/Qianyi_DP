@@ -18,7 +18,7 @@
 
 
 void SolverBase::init() {
-    auto& params = *simulator->get_geo_params();
+    // auto& params = *simulator->get_geo_params();
 
     // init single device pool
     pool.resize(1024);
@@ -27,12 +27,12 @@ void SolverBase::init() {
 }
 
 
-static __device__ int get_opposite_point(int2 edge, int3 tri, const int2* edges) {
-    int v0 = edges[tri.x].x, v1 = edges[tri.x].y, v2 = edges[tri.y].y;
-    if ( v0 != edge.x && v0 != edge.y ) return v0;
-    if ( v1 != edge.x && v1 != edge.y ) return v1;
-    return v2;
-}
+// static __device__ int get_opposite_point(int2 edge, int3 tri, const int2* edges) {
+//     int v0 = edges[tri.x].x, v1 = edges[tri.x].y, v2 = edges[tri.y].y;
+//     if ( v0 != edge.x && v0 != edge.y ) return v0;
+//     if ( v1 != edge.x && v1 != edge.y ) return v1;
+//     return v2;
+// }
 
 // static __device__ __forceinline__
 // float3 mul_homo_vec(const Mat4 m, const float3 v) {

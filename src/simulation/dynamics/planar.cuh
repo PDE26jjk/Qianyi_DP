@@ -5,8 +5,8 @@
 // T. Liu, A. W. Bargteil, J. F. O’Brien, and L. Kavan, "Fast simulation of mass-spring systems," ACM Trans. Graph., vol. 32, no. 6, p. 214:1-214:7, Nov. 2013, doi: 10.1145/2508363.2508406.
 
 static __global__ void pd_precompute_spring_forces(
-    float* __restrict__ Jx_diag_scale,
-    float* __restrict__ Jx_nondiag_scale,
+    float* __restrict__ Jx_diag_scalar,
+    float* __restrict__ Jx_nondiag_scalar,
     const int2* __restrict__ edges,
     const float* __restrict__ edge_lengths,
     const ObjectDataInput* __restrict__ obj_data,
@@ -21,9 +21,9 @@ static __global__ void pd_precompute_spring_forces(
         float rest_length = edge_lengths[i];
         float k = youngs * (ks.x + ks.y + ks.z) * 0.333f;
         float weight = k;
-        atomicAdd(&Jx_diag_scale[v0], weight);
-        atomicAdd(&Jx_diag_scale[v1], weight);
-        Jx_nondiag_scale[i] -= weight;
+        atomicAdd(&Jx_diag_scalar[v0], weight);
+        atomicAdd(&Jx_diag_scalar[v1], weight);
+        Jx_nondiag_scalar[i] -= weight;
     }
 }
 

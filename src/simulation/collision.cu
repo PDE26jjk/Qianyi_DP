@@ -359,7 +359,7 @@ static __global__ void compute_ee_force(
     float e1_stiff = (static_diags[edge.x] + static_diags[edge.y]) * 0.5f;
     float3 p0 = pos[edge.x];
     float3 p1 = pos[edge.y];
-    float3 E = p1 - p0;
+    // float3 E = p1 - p0;
     float thickness0 = obj_data[vertices_obj[edge.x]].thickness;
     int layer0 = obj_data[vertices_obj[edge.x]].collision_layer;
     float3 edge_normal0 = edge_normals[eid];

@@ -7,7 +7,8 @@ struct SolverXPBD : SolverBase {
     // ~SolverExplicit() = default;
     explicit SolverXPBD(Simulator* simulator):SolverBase(simulator){}
 
-    // void init() override;
+    void init() override;
     void step(float h) override;
-    
+private:
+    thrust::device_vector<float3> delta;
 };

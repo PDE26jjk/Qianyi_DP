@@ -17,6 +17,7 @@
 #include "geometric_operator.cuh"
 #include "geometry.cuh"
 #include "solver_PDNewton.cuh"
+#include "solver_XPBD.cuh"
 #include "contact/contact.cuh"
 
 Simulator::Simulator() {}
@@ -180,6 +181,9 @@ void Simulator::create_solver() {
     }
     else if ( m_solver_name == "PDNewton" ) {
         m_solver = new SolverPDNewton(this);
+    }
+    else if ( m_solver_name == "XPBD" ) {
+        m_solver = new SolverXPBD(this);
     }
     // else if ( m_solver_name == "Chebyshev" ) {
     //     m_solver = new SolverChebyshev(this);
