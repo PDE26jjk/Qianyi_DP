@@ -534,7 +534,8 @@ void Geometry::init_triangle_data() {
             int p3_idx = t_adj.y != -1 ? get_opposite_point(e_i, triangles[t_adj.y], edges) : -1;
             edge_opposite_points[i] = make_int2(p0_idx, p3_idx);
         });
-    average_mass_by_cloth();
+    if ((bool)get_global_parameter("average_mass_by_cloth",0.f))
+        average_mass_by_cloth();
 
 }
 float Geometry::get_global_parameter(const std::string& key, float default_value) const {
@@ -643,8 +644,8 @@ static __global__ void fill_inv_mass_kernel(
     float* __restrict__ invMass,
     const int* __restrict__ vertex_obj,
     const int* __restrict__ object_types,
-    float* masses,
-    char* mask,
+    const float* __restrict__ masses,
+    const char* __restrict__ mask,
     int num_vertices
 ) {
     int vid = blockIdx.x * blockDim.x + threadIdx.x;
