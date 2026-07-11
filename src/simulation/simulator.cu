@@ -99,11 +99,13 @@ void Simulator::update(float h) {
     float dt_rest = h;
     float step_h = max(1e-20f, get_parameter("step_h", 0.001f));
     if ( step_h > h || step_h <= 0.0f ) step_h = h;
-    for ( int substep = 0; dt_rest > 1e-8f; substep++ ) {
+    int iters = (int)ceilf( h / step_h);
+    step_h = h / (float)iters;
+    for ( int substep = 0; substep < iters; substep++ ) {
         if ( substep > 10000 ) break;
-        step_h = step_h > dt_rest ? dt_rest : step_h;
+        // step_h = step_h > dt_rest ? dt_rest : step_h;
         dt_rest -= step_h;
-        float factor = clamp(1.f - (dt_rest / dt) + 0.1f, 0., 1.f);
+        float factor = clamp(1.f - (dt_rest / dt), 0., 1.f);
 
         m_geo->update_for_step(step_h, factor);
         m_solver->step(step_h);
