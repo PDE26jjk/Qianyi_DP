@@ -10,19 +10,20 @@
 
 #include "solver_PDNewton.cuh"
 #include "common/atomic_utils.cuh"
+#include "cuda_tools/cub_tools.cuh"
 // #include <thrust/transform_reduce.h>
 // Define utility macro used to call cub functions that use dynamic temporary storage
-#ifndef CALL_CUBS
-#ifdef _WIN32
-#define CALL_CUBS(func, ...) \
-CUDA_CHECK(cub::func(nullptr, temp_mem_size, __VA_ARGS__)); \
-CUDA_CHECK(cub::func(get_device_temp_memory(), temp_mem_size, __VA_ARGS__))
-#else// fdef _WIN32
-#define CALL_CUBS(func, args...) \
-CUDA_CHECK(cub::func(nullptr, temp_mem_size, args)); \
-CUDA_CHECK(cub::func(get_device_temp_memory(), temp_mem_size, args))
-#endif// ifdef _WIN32
-#endif// ifndef CALL_CUBS
+// #ifndef CALL_CUBS
+// #ifdef _WIN32
+// #define CALL_CUBS(func, ...) \
+// CUDA_CHECK(cub::func(nullptr, temp_mem_size, __VA_ARGS__)); \
+// CUDA_CHECK(cub::func(get_device_temp_memory(), temp_mem_size, __VA_ARGS__))
+// #else// fdef _WIN32
+// #define CALL_CUBS(func, args...) \
+// CUDA_CHECK(cub::func(nullptr, temp_mem_size, args)); \
+// CUDA_CHECK(cub::func(get_device_temp_memory(), temp_mem_size, args))
+// #endif// ifdef _WIN32
+// #endif// ifndef CALL_CUBS
 
 struct f3Min {
     __device__ __forceinline__

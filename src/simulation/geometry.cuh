@@ -126,7 +126,7 @@ public:
     void upload_local_vertices(int obj_index, const std::vector<float>& vertices);
     void copy_vertices(float* ptr, bool world_space);
     void copy_debug_colors(float* ptr);
-    void* get_device_temp_memory();
+    // void* get_device_temp_memory();
 
     SimulatorParams params;
 

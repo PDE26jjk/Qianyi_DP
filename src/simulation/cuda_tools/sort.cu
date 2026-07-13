@@ -12,6 +12,8 @@
 
 #include <cub/cub.cuh>
 
+#include "cub_tools.cuh"
+
 // temporary buffer for radix sort
 struct RadixSortTemp {
     void* mem = NULL;
@@ -19,7 +21,7 @@ struct RadixSortTemp {
 };
 
 // use unique temp buffers per CUDA stream to avoid race conditions
-static std::unordered_map<void*, RadixSortTemp> g_radix_sort_temp_map;
+// static std::unordered_map<void*, RadixSortTemp> g_radix_sort_temp_map;
 
 
 template <typename KeyType>
@@ -35,20 +37,20 @@ void radix_sort_reserve_internal(void* stream, int n, void** mem_out, size_t* si
             NULL, sort_temp_size, d_keys, d_values, n, 0, sizeof(KeyType) * 8, (cudaStream_t)stream)
     );
 
-    RadixSortTemp& temp = g_radix_sort_temp_map[stream];
-
-    if (sort_temp_size > temp.size) {
-        if (temp.mem) {
-            CUDA_CHECK(cudaFree(temp.mem));
-        }
-        CUDA_CHECK(cudaMalloc(&temp.mem, sort_temp_size));
-        temp.size = sort_temp_size;
-    }
+    // RadixSortTemp& temp = g_radix_sort_temp_map[stream];
+    //
+    // if (sort_temp_size > temp.size) {
+    //     if (temp.mem) {
+    //         CUDA_CHECK(cudaFree(temp.mem));
+    //     }
+    //     CUDA_CHECK(cudaMalloc(&temp.mem, sort_temp_size));
+    //     temp.size = sort_temp_size;
+    // }
 
     if (mem_out)
-        *mem_out = temp.mem;
+        *mem_out = get_device_temp_memory((cudaStream_t)stream, sort_temp_size);
     if (size_out)
-        *size_out = temp.size;
+        *size_out = sort_temp_size;
 }
 
 void radix_sort_reserve(void* stream, int n, void** mem_out, size_t* size_out)
@@ -56,15 +58,6 @@ void radix_sort_reserve(void* stream, int n, void** mem_out, size_t* size_out)
     radix_sort_reserve_internal<int>(stream, n, mem_out, size_out);
 }
 
-void radix_sort_release(void* stream)
-{
-    // release temporary buffer for the given stream, if it exists
-    auto it = g_radix_sort_temp_map.find(stream);
-    if (it != g_radix_sort_temp_map.end()) {
-        CUDA_CHECK(cudaFree(it->second.mem));
-        g_radix_sort_temp_map.erase(it);
-    }
-}
 
 template <typename KeyType, class ValueType>
 void radix_sort_pairs(void* stream, KeyType* keys, ValueType* values, int n)

@@ -10,24 +10,20 @@
 #include <thrust/execution_policy.h>
 
 #include "solver_base.cuh"
-// #include "solver_Chebyshev.cuh"
 #include "solver_explicit.cuh"
-// #include "solver_PCG.cuh"
 // #include "solver_PNCG.cuh"
 #include "geometric_operator.cuh"
 #include "geometry.cuh"
 #include "solver_PDNewton.cuh"
+#include "solver_VBD.cuh"
 #include "solver_XPBD.cuh"
 #include "contact/contact.cuh"
 
 Simulator::Simulator() {}
-extern bool device_initialized;
-extern int active_device_id;
 void Simulator::reset() {
     try {
-        if ( !device_initialized ) return;
-        cudaError_t err = cudaSetDevice(active_device_id);
-        if ( err == cudaSuccess ) {
+        if ( !cuda_device_initialized() ) return;
+        if ( cuda_device_valid() ) {
             delete m_solver;
             delete m_geo;
             m_solver = nullptr;
@@ -41,7 +37,7 @@ void Simulator::reset() {
     catch ( ... ) {
         throw;
     }
-    device_initialized = false;
+    g_cuda_device_initialized = false;
 }
 Simulator::~Simulator() {
     reset();
@@ -99,7 +95,7 @@ void Simulator::update(float h) {
     float dt_rest = h;
     float step_h = max(1e-20f, get_parameter("step_h", 0.001f));
     if ( step_h > h || step_h <= 0.0f ) step_h = h;
-    int iters = (int)ceilf( h / step_h);
+    int iters = (int)ceilf(h / step_h);
     step_h = h / (float)iters;
     for ( int substep = 0; substep < iters; substep++ ) {
         if ( substep > 10000 ) break;
@@ -187,6 +183,9 @@ void Simulator::create_solver() {
     else if ( m_solver_name == "XPBD" ) {
         m_solver = new SolverXPBD(this);
     }
+    else if ( m_solver_name == "VBD" ) {
+        m_solver = new SolverVBD(this);
+    }
     // else if ( m_solver_name == "Chebyshev" ) {
     //     m_solver = new SolverChebyshev(this);
     // }
@@ -230,12 +229,12 @@ CheckEdgeData Simulator::get_check_edge_data(int p0, int p1) const {
     CheckEdgeData res;
     int* e;
     cudaMalloc(&e, sizeof(int));
-    get_edge_by_points_index<<<1,1>>>(p0,p1,e,m_geo->dir_edges.data().get(),m_geo->edge_lookup.data().get());
+    get_edge_by_points_index<<<1,1>>>(p0, p1, e, m_geo->dir_edges.data().get(), m_geo->edge_lookup.data().get());
     CUDA_CHECK(cudaDeviceSynchronize());
     int eid;
-    cudaMemcpy(&eid,e,sizeof(int),cudaMemcpyDeviceToHost);
+    cudaMemcpy(&eid, e, sizeof(int), cudaMemcpyDeviceToHost);
     cudaFree(e);
-    if (eid < 0) throw std::runtime_error("Failed to get edge data");
+    if ( eid < 0 ) throw std::runtime_error("Failed to get edge data");
 
     Contact& contact = m_geo->get_contact();
     std::vector<int> nearby_edges(broad_phase_size);

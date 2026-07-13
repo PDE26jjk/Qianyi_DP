@@ -223,10 +223,9 @@ void SolverPDNewton::init() {
     int n = params.nb_all_cloth_edges;
     pd_precompute_spring_forces<<<(n + block - 1) / block, block>>>(
         Jx_diag_pd.data().get(), Jx_nondiag_pd.data().get(),
-        geo->edges.data().get(), geo->edge_lengths.data().get(),
+        geo->edges.data().get(),
         geo->obj_data.data().get(), geo->vertices_obj.data().get(),
-        n
-        );
+        n);
     geo->precompute_subspace_H(Jx_diag_pd.data().get(), Jx_nondiag_pd.data().get());
     subspace_rhs.resize(geo->basis_size);
     subspace_dy.resize(geo->basis_size);

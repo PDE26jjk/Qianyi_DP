@@ -16,20 +16,21 @@
 #include "geometric_operator.cuh"
 #include "common/cuda_utils.h"
 #include "contact/collision.cuh"
+#include "cuda_tools/cub_tools.cuh"
 #include "dynamics/bending.cuh"
 
 // Define utility macro used to call cub functions that use dynamic temporary storage
-#ifndef CALL_CUBS
-#ifdef _WIN32
-#define CALL_CUBS(func, ...) \
-CUDA_CHECK(cub::func(nullptr, temp_mem_size, __VA_ARGS__)); \
-CUDA_CHECK(cub::func(get_device_temp_memory(), temp_mem_size, __VA_ARGS__))
-#else// fdef _WIN32
-#define CALL_CUBS(func, args...) \
-CUDA_CHECK(cub::func(nullptr, temp_mem_size, args)); \
-CUDA_CHECK(cub::func(get_device_temp_memory(), temp_mem_size, args))
-#endif// ifdef _WIN32
-#endif// ifndef CALL_CUBS
+// #ifndef CALL_CUBS
+// #ifdef _WIN32
+// #define CALL_CUBS(func, ...) \
+// CUDA_CHECK(cub::func(nullptr, temp_mem_size, __VA_ARGS__)); \
+// CUDA_CHECK(cub::func(get_device_temp_memory(), temp_mem_size, __VA_ARGS__))
+// #else// fdef _WIN32
+// #define CALL_CUBS(func, args...) \
+// CUDA_CHECK(cub::func(nullptr, temp_mem_size, args)); \
+// CUDA_CHECK(cub::func(get_device_temp_memory(), temp_mem_size, args))
+// #endif// ifdef _WIN32
+// #endif// ifndef CALL_CUBS
 
 template<typename T, typename otherT=T>
 static void copy_to_device(const std::vector<T>& data, thrust::device_vector<otherT>& dst) {
@@ -135,11 +136,11 @@ void Geometry::init(const GeoDataInput& geo) {
     init_sewing();
 }
 
-void* Geometry::get_device_temp_memory() {
-    if ( temp_mem.size() < temp_mem_size )
-        temp_mem.resize(temp_mem_size);
-    return thrust::raw_pointer_cast(temp_mem.data());
-}
+// void* Geometry::get_device_temp_memory() {
+//     if ( temp_mem.size() < temp_mem_size )
+//         temp_mem.resize(temp_mem_size);
+//     return thrust::raw_pointer_cast(temp_mem.data());
+// }
 
 static __global__ void transform_to_world(
     float3* __restrict__ vertices_world,

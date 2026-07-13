@@ -8,7 +8,6 @@ static __global__ void pd_precompute_spring_forces(
     float* __restrict__ Jx_diag_scalar,
     float* __restrict__ Jx_nondiag_scalar,
     const int2* __restrict__ edges,
-    const float* __restrict__ edge_lengths,
     const ObjectDataInput* __restrict__ obj_data,
     const int* __restrict__ vertices_obj,
     const int n // edge size
@@ -18,7 +17,7 @@ static __global__ void pd_precompute_spring_forces(
         auto [v0,v1] = edges[i];
         float3 ks = obj_data[vertices_obj[v0]].stretch;
         const float youngs = 4e2;
-        float rest_length = edge_lengths[i];
+        // float rest_length = edge_lengths[i];
         float k = youngs * (ks.x + ks.y + ks.z) * 0.333f;
         float weight = k;
         atomicAdd(&Jx_diag_scalar[v0], weight);

@@ -152,13 +152,13 @@ static int init_cuda_device() {
     CUDA_CHECK(cudaGetDeviceProperties(&prop, deviceIdx));
     return deviceIdx;
 }
-bool device_initialized = false;
-int active_device_id = -1;
+bool g_cuda_device_initialized = false;
+int g_cuda_active_device_id = -1;
 void init_device() {
-    if ( device_initialized ) return;
+    if ( g_cuda_device_initialized ) return;
     auto device_id = init_cuda_device();
-    active_device_id = device_id;
+    g_cuda_active_device_id = device_id;
     graphics::VulkanCudaRasterizer::Init(device_id);
-    graphics::VulkanCudaRasterizer::SetResourceDirectory(module_dir);
-    device_initialized = true;
+    graphics::VulkanCudaRasterizer::SetResourceDirectory(g_module_dir);
+    g_cuda_device_initialized = true;
 }

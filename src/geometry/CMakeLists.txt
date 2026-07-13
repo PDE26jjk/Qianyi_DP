@@ -1,5 +1,5 @@
 add_library(geometry)
-file(GLOB COLOR_GRAPH "color_graph/*")
+
 target_sources(
    geometry PRIVATE
    sample_points.cu
@@ -11,7 +11,7 @@ target_sources(
    triangulator.cpp
    pattern_helper.h
    pattern_helper.cu
-   ${COLOR_GRAPH}
+
 )
 target_include_directories(geometry PUBLIC ${PROJECT_SOURCE_DIR}/src)
 if(MSVC)

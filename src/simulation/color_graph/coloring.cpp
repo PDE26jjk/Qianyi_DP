@@ -398,7 +398,7 @@ void convert_to_color_groups(
         color_groups[color].push_back(node_idx);
     }
 }
-int graph_coloring(int num_nodes, const std::vector<int2>& edges, int algorithm, std::vector<int>& node_colors, bool balance,
+int graph_coloring_cpu(int num_nodes, const std::vector<int2>& edges, int algorithm, std::vector<int>& node_colors, bool balance,
     float target_max_min_ratio) {
     Graph graph(num_nodes, edges);
 

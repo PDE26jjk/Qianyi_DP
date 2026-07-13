@@ -18,7 +18,7 @@
 #include <stdlib.h>
 
 inline void __cudaCheckError(cudaError_t err, const char* file, const int line) {
-    if (err != cudaSuccess) {
+    if ( err != cudaSuccess ) {
         fprintf(stderr, "CUDA Error: %s\n", cudaGetErrorString(err)); //
         fprintf(stderr, "File: %s\n", file);                          //
         fprintf(stderr, "Line: %d\n", line);                          //
@@ -44,3 +44,15 @@ inline void __cudaCheckError(cudaError_t err, const char* file, const int line) 
     std::cout << (name) <<" time: " << duration.count() << std::endl; \
     start_time = end_time
 
+extern bool g_cuda_device_initialized;
+extern int g_cuda_active_device_id;
+inline bool cuda_device_initialized() {
+    return g_cuda_device_initialized;
+}
+inline bool cuda_device_valid() {
+    if ( cuda_device_initialized() ) {
+        cudaError_t err = cudaSetDevice(g_cuda_active_device_id);
+        return err == cudaSuccess;
+    }
+    return false;
+}

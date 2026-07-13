@@ -188,7 +188,7 @@ static __global__ void compute_quadratic_Bending_IBM(
     Mat3* __restrict__ Jx_bend_cross,
     float3* __restrict__ forces,
     float* __restrict__ enerys,
-    const float4* __restrict__ _q,
+    const float4* __restrict__ IBM_q,
     const float3* __restrict__ vertices,
     const int2* __restrict__ edges,
     const int2* __restrict__ e2t,
@@ -205,7 +205,7 @@ static __global__ void compute_quadratic_Bending_IBM(
     int p0_idx = e_i.x, p1_idx = e_i.y;
     int p2_idx = p_op.x, p3_idx = p_op.y;
     float3 x0 = vertices[p0_idx], x1 = vertices[p1_idx], x2 = vertices[p2_idx], x3 = vertices[p3_idx];
-    float4 q = _q[i];
+    float4 q = IBM_q[i];
     float3 qtX = x0 * q.x + x1 * q.y + x2 * q.z + x3 * q.w;
     if ( enerys ) {
         atomicAdd(&enerys[p0_idx],0.5f * kb * len_sq(qtX));

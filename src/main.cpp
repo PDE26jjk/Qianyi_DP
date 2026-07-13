@@ -26,7 +26,7 @@ int add(int i, int j) {
 #include "simulator_interface.h"
 namespace py = pybind11;
 
-std::string module_dir;
+std::string g_module_dir;
 std::string get_module_dir(py::module_& m) {
     py::object file_attr = m.attr("__file__");
     if ( file_attr.is_none() ) {
@@ -53,7 +53,7 @@ PYBIND11_MODULE(Qianyi_DP, m) {
         .. currentmodule:: Qianyi_DP
 
     )pbdoc";
-    module_dir = get_module_dir(m);
+    g_module_dir = get_module_dir(m);
     // std::string shader_path = (std::filesystem::path(module_dir) / "resources").string();
 
 // 	m.def("add", &add, R"pbdoc(
