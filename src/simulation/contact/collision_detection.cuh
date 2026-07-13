@@ -187,7 +187,7 @@ static __global__ void query_ee_pairs_capsule_kernel(
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if ( i >= num_queries ) return;
     AABB q_aabb = aabbs[i];
-    if ( sorted_indices ) i = sorted_indices[i];
+    if ( sorted_indices ) i = sorted_indices[i]; // or nodes[i].x - 1
 
     int2 edge = edges[i];
     float3 p0 = pos[edge.x];

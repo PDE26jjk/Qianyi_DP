@@ -26,8 +26,14 @@ void register_test_bindings(pybind11::module_& m) {
         py::arg("verify") = false);
 
     test_.def("sdf_benchmark", &sdf_benchmark,
-        py::arg("vertices_in"), py::arg("faces_in"),py::arg("use_parity") = true, py::arg("warmup") = 2, py::arg("runs") = 10);
-    
+        py::arg("vertices_in"), py::arg("faces_in"), py::arg("use_parity") = true, py::arg("warmup") = 2, py::arg("runs") = 10);
+
     test_.def("sdf_check_inside", &sdf_check_inside,
         py::arg("vertices_in"), py::arg("faces_in"), py::arg("query_points"), py::arg("warmup") = 2, py::arg("runs") = 10);
+
+    test_.def("graph_coloring_benchmark", &graph_coloring_benchmark,
+        py::arg("num_nodes"), py::arg("edges"), py::arg("algorithm"),
+        py::arg("balance") = false, py::arg("target_max_min_ratio") = 1.1,
+        py::arg("warmup") = 2, py::arg("runs") = 10,
+        py::arg("verify") = true);
 }

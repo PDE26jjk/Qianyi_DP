@@ -962,7 +962,6 @@ static __global__ void record_color_offsets(
 
 static __global__ void query_ee_pairs_kernel(
     const float3*__restrict__ query_pts,
-    const unsigned int* __restrict__ sorted_indices,
     unsigned int num_queries,
     const int2*__restrict__ nodes, const AABB*__restrict__ aabbs, unsigned int root_idx,
     const float3* vertices, const int2*__restrict__ edges, const float radius,
@@ -971,7 +970,7 @@ static __global__ void query_ee_pairs_kernel(
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if ( i >= num_queries ) return;
-    if ( sorted_indices ) i = sorted_indices[i];
+    i = nodes[i].x - 1;
     int2 edge = edges[i];
     float3 p0 = query_pts[edge.x];
     float3 p1 = query_pts[edge.y];

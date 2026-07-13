@@ -400,7 +400,13 @@ void compute_bounds(const float3* points, unsigned int n, float3& min_res, float
     max_res = thrust::reduce(thrust::device, points,
         points + n, init_max, float3_max());
 }
-void compute_and_sort_by_morton_codes(float3* points, unsigned int n, unsigned int* sorted_indices) {
+__global__ void compute_rank_kernel(const unsigned int* indices_sorted, unsigned int* rank, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if ( i < n ) {
+        rank[indices_sorted[i]] = i;
+    }
+}
+void compute_and_sort_by_morton_codes(float3* points, unsigned int n, unsigned int* sorted_indices, bool reverse_index) {
     auto& s = storage::instance();
     float3 min_res, max_res;
     compute_bounds(points, n, min_res, max_res);
@@ -408,12 +414,17 @@ void compute_and_sort_by_morton_codes(float3* points, unsigned int n, unsigned i
     thrust::copy(h_bounds, h_bounds + 6, s.scene_bounds.begin());
 
     unsigned int* d_codes = thrust::raw_pointer_cast(s.morton_codes.data());
-    {
-        const float* d_bounds = thrust::raw_pointer_cast(s.scene_bounds.data());
-        int blocks = (n + 255) / 256;
-        compute_morton_codes_kernel<<<blocks, 256>>>(points, n, d_bounds, d_codes, sorted_indices);
-    }
+    const float* d_bounds = thrust::raw_pointer_cast(s.scene_bounds.data());
+    int blocks = (n + 255) / 256;
+    compute_morton_codes_kernel<<<blocks, 256>>>(points, n, d_bounds, d_codes, sorted_indices);
     radix_sort_pairs(nullptr, d_codes, sorted_indices, n);
+    if ( reverse_index ) {
+        unsigned int* d_rank_out;
+        cudaMalloc(&d_rank_out, n * sizeof(unsigned int));
+        compute_rank_kernel<<<blocks, 256>>>(sorted_indices, d_rank_out, n);
+        cudaMemcpyAsync(sorted_indices, d_rank_out, n * sizeof(unsigned int), cudaMemcpyDeviceToDevice);
+        cudaFree(d_rank_out);
+    }
 }
 unsigned int* get_sorted_indices() {
     return thrust::raw_pointer_cast(storage::instance().sorted_indices.data());
@@ -510,7 +521,8 @@ __global__ void refit_face_bvh_kernel(
     const int2* __restrict__ nodes,
     const unsigned int* __restrict__ parent,
     unsigned int* __restrict__ child_count,
-    AABB3D* __restrict__ aabbs) {
+    AABB3D* __restrict__ aabbs
+) {
     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
     if ( i >= n ) return;
 
@@ -519,7 +531,7 @@ __global__ void refit_face_bvh_kernel(
     int3 f = faces[prim_idx];
     float3 v0 = vertices[f.x], v1 = vertices[f.y], v2 = vertices[f.z];
     aabbs[i].min = fmin3(v0, fmin3(v1, v2));
-    aabbs[i].max = fmax3(v0, fmax3(v1, v2));;
+    aabbs[i].max = fmax3(v0, fmax3(v1, v2));
 
     if ( additional_offset ) {
         v0 += additional_offset[f.x];
@@ -572,7 +584,8 @@ __global__ void refit_edge_bvh_kernel(
     const int2* __restrict__ nodes,
     const unsigned int* __restrict__ parent,
     unsigned int* __restrict__ child_count,
-    AABB3D* __restrict__ aabbs) {
+    AABB3D* __restrict__ aabbs
+) {
     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
     if ( i >= n ) return;
 

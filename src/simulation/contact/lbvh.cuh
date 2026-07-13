@@ -34,20 +34,20 @@ __device__ __forceinline__ float dist_sq_point_aabb_3d(float3 p, const AABB3D& b
 }
 __global__ void compute_morton_codes_kernel(const float3* centroids, unsigned int n,
     const float* bounds, unsigned int* codes, unsigned int* indices);
-void compute_bounds(const float3* points,unsigned int n, float3& min_res, float3& max_res);
-void compute_and_sort_by_morton_codes(float3* points,unsigned int n, unsigned int* sorted_indices);
+void compute_bounds(const float3* points, unsigned int n, float3& min_res, float3& max_res);
+void compute_and_sort_by_morton_codes(float3* points, unsigned int n, unsigned int* sorted_indices, bool reverse_index = false);
 unsigned int* get_sorted_indices();
 
 void initialize(unsigned int max_primitives);
 void cleanup();
 void build_face_bvh(const thrust::device_vector<float3>& vertices,
-    const thrust::device_vector<int3>& faces, BVH3D& bvh,const float3* additional_offset=nullptr);
+    const thrust::device_vector<int3>& faces, BVH3D& bvh, const float3* additional_offset = nullptr);
 void build_edge_bvh(const thrust::device_vector<float3>& vertices,
-    const thrust::device_vector<int2>& edges, BVH3D& bvh,const float3* additional_offset=nullptr);
+    const thrust::device_vector<int2>& edges, BVH3D& bvh, const float3* additional_offset = nullptr);
 void refit_face_bvh(const float3* vertices,
-    const thrust::device_vector<int3>& faces, BVH3D& bvh,const float3* additional_offset=nullptr);
+    const thrust::device_vector<int3>& faces, BVH3D& bvh, const float3* additional_offset = nullptr);
 void refit_edge_bvh(const float3* vertices,
-    const thrust::device_vector<int2>& edges, BVH3D& bvh,const float3* additional_offset=nullptr);
+    const thrust::device_vector<int2>& edges, BVH3D& bvh, const float3* additional_offset = nullptr);
 // void build_point_bvh(const thrust::device_vector<float3>& vertices, BVH3D& bvh);
 __global__ void query_nearest_face_kernel(
     const float3* query_pts, unsigned int num_queries,

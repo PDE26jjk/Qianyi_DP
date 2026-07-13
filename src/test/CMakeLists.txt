@@ -8,6 +8,7 @@ target_sources(
    sort_test.cu
    bvh_test.cu
    bvh_test2.cu
+   color_graph_test.cu
    test.cpp
    test.h
    ${BVH}

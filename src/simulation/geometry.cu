@@ -232,7 +232,6 @@ void Geometry::init_edge_data() {
     // -------------------------------------------------------
     // 步骤 2: 排序 (完全等价于 np.lexsort)
     // -------------------------------------------------------
-    // 对 64位整数排序比对 struct 排序快得多
     thrust::stable_sort_by_key(thrust::device, sort_keys.begin(), sort_keys.end(), sort_values.begin());
 
     // -------------------------------------------------------

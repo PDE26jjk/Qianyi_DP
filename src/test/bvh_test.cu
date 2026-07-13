@@ -191,7 +191,8 @@ query_vf_pairs_kernel2(
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if ( i >= num_queries ) return;
-    i = sorted_indices[i];
+    if ( sorted_indices )
+        i = sorted_indices[i];
     float3 qp = query_pts[i];
 
     // float max_dist_sq = max_dist * max_dist;
@@ -220,9 +221,6 @@ query_vf_pairs_kernel2(
     int* query_result = &query_results[i * result_size];
     int query_count = 0;
 
-    // 【关键优化】：将栈缩小到 32！
-    // 绝大多数 BVH 查询深度不超过 30。32 足以覆盖百万级三角形。
-    // 这能节省一半的寄存器，彻底消除 Local Memory 溢出。
     unsigned int stack[32];
     int sp = 0;
     stack[sp++] = root_idx;
@@ -255,7 +253,6 @@ query_vf_pairs_kernel2(
                 query_result[++query_count] = prim_idx;
             }
         }
-        // 优化：sp < 30 留 2 个空位防溢出，去掉 else if 判断
         else if ( sp < 30 ) {
             stack[sp++] = node.x - 1;
             stack[sp++] = node.y - 1;
@@ -281,7 +278,7 @@ std::vector<int> bvh_benchmark(const std::vector<float>& vertices_in,
     lbvh3d::BVH3D bvh;
     for ( int i = 0; i < warmup; i++ ) {
         bvh = lbvh3d::BVH3D();
-        lbvh3d::build_face_bvh(d_vertices, d_faces, bvh); 
+        lbvh3d::build_face_bvh(d_vertices, d_faces, bvh);
         cudaDeviceSynchronize();
     }
     for ( int i = 0; i < runs; i++ ) {
@@ -367,22 +364,8 @@ std::vector<int> bvh_benchmark(const std::vector<float>& vertices_in,
     thrust::device_vector<unsigned int> sorted_indices(num_queries * 2);
 
     lbvh3d::compute_and_sort_by_morton_codes(thrust::raw_pointer_cast(d_points.data()),
-        num_queries, sorted_indices.data().get());
-    // float3 min_res, max_res;
-    // lbvh3d::compute_bounds(thrust::raw_pointer_cast(d_points.data()), num_queries, min_res, max_res);
-    //
-    // float h_bounds[6] = { min_res.x, min_res.y, min_res.z, max_res.x, max_res.y, max_res.z };
-    // thrust::copy(h_bounds, h_bounds + 6, scene_bounds.begin());
-    // unsigned int* d_codes = thrust::raw_pointer_cast(morton_codes.data());
-    // unsigned int* d_indices = thrust::raw_pointer_cast(sorted_indices.data());
-    // {
-    //     const float* d_bounds = thrust::raw_pointer_cast(scene_bounds.data());
-    //     const float3* d_centroids = thrust::raw_pointer_cast(d_points.data());
-    //     int blocks = (num_queries + 255) / 256;
-    //     lbvh3d::compute_morton_codes_kernel<<<blocks, 256>>>(d_centroids, num_queries, d_bounds, d_codes, d_indices);
-    // }
-    // thrust::sort_by_key(morton_codes.begin(), morton_codes.begin() + num_queries,
-    //     sorted_indices.begin());
+        num_queries, sorted_indices.data().get(), false);
+
     for ( int i = 0; i < runs; i++ ) {
         cudaMemset(d_query_results.data().get(), 0, d_query_results.size() * sizeof(int));
         timer.start("bvh_query_pairs");
@@ -489,9 +472,9 @@ std::vector<int> bvh_edge_benchmark(const std::vector<float>& vertices_in,
 
     thrust::device_vector<int> d_query_results(num_queries * max_pairs_per_query);
 
-    thrust::device_vector<unsigned int> sorted_indices(num_queries);
-    cudaMemcpyAsync(sorted_indices.data().get(), lbvh3d::get_sorted_indices(),
-        sizeof(unsigned int) * sorted_indices.size(), cudaMemcpyDeviceToDevice);
+    // thrust::device_vector<unsigned int> sorted_indices(num_queries);
+    // cudaMemcpyAsync(sorted_indices.data().get(), lbvh3d::get_sorted_indices(),
+    // sizeof(unsigned int) * sorted_indices.size(), cudaMemcpyDeviceToDevice);
 
     // lbvh3d::compute_and_sort_by_morton_codes(thrust::raw_pointer_cast(d_points.data()),
     //     num_queries, sorted_indices.data().get());
@@ -500,7 +483,6 @@ std::vector<int> bvh_edge_benchmark(const std::vector<float>& vertices_in,
         cudaMemset(d_query_results.data().get(), 0, d_query_results.size() * sizeof(int));
         query_ee_pairs_kernel<<<blocksPerGrid, threadsPerBlock>>>(
             thrust::raw_pointer_cast(d_points.data()),
-            thrust::raw_pointer_cast(sorted_indices.data()),
             num_queries,
             thrust::raw_pointer_cast(bvh.nodes.data()),
             thrust::raw_pointer_cast(bvh.aabbs.data()),
@@ -523,7 +505,6 @@ std::vector<int> bvh_edge_benchmark(const std::vector<float>& vertices_in,
 
         query_ee_pairs_kernel<<<blocksPerGrid, threadsPerBlock>>>(
             thrust::raw_pointer_cast(d_points.data()),
-            thrust::raw_pointer_cast(sorted_indices.data()),
             num_queries,
             thrust::raw_pointer_cast(bvh.nodes.data()),
             thrust::raw_pointer_cast(bvh.aabbs.data()),
