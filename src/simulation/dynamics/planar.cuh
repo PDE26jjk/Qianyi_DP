@@ -2,8 +2,9 @@
 #include "common/vec_math.h"
 #include "common/atomic_utils.cuh"
 
-// T. Liu, A. W. Bargteil, J. F. O’Brien, and L. Kavan, "Fast simulation of mass-spring systems," ACM Trans. Graph., vol. 32, no. 6, p. 214:1-214:7, Nov. 2013, doi: 10.1145/2508363.2508406.
+constexpr float base_spring_stiffness = 4e2; // empirical global stiffness factor
 
+// T. Liu, A. W. Bargteil, J. F. O’Brien, and L. Kavan, "Fast simulation of mass-spring systems," ACM Trans. Graph., vol. 32, no. 6, p. 214:1-214:7, Nov. 2013, doi: 10.1145/2508363.2508406.
 static __global__ void pd_precompute_spring_forces(
     float* __restrict__ Jx_diag_scalar,
     float* __restrict__ Jx_nondiag_scalar,
@@ -16,21 +17,94 @@ static __global__ void pd_precompute_spring_forces(
           i += blockDim.x * gridDim.x ) {
         auto [v0,v1] = edges[i];
         float3 ks = obj_data[vertices_obj[v0]].stretch;
-        const float youngs = 4e2;
-        // float rest_length = edge_lengths[i];
-        float k = youngs * (ks.x + ks.y + ks.z) * 0.333f;
+        
+        float k = base_spring_stiffness * (ks.x + ks.y + ks.z) * 0.333f;
         float weight = k;
         atomicAdd(&Jx_diag_scalar[v0], weight);
         atomicAdd(&Jx_diag_scalar[v1], weight);
         Jx_nondiag_scalar[i] -= weight;
     }
 }
+enum HessianRegularization:char {
+    NONE = 0,                  // Exact Hessian (may be indefinite under compression)
+    PROJECTIVE,                // H = k * I  (isotropic, always SPD)
+    SPD_CLAMP                  // H = k*(n n^T) + k*max(1-L0/l, -eps)*(I - n n^T)
+};
 
-static __global__ void compute_spring_forces(
-    Mat3* __restrict__ Jx,
+__device__ inline void calc_spring_elastic(
+    const float3 p0,
+    const float3 p1,
+    const float rest_length,
+    float stiffness,
+    float3& force_elastic,         // f for v0, -f for v1
+    Mat3* H_elastic_ptr = nullptr, // K for diag, -K for non-diag
+    HessianRegularization reg_type = NONE,
+    float* energy_ptr = nullptr
+) {
+    float3 d = p0 - p1;
+    float len = norm(d);
+    // ---- Degenerate case: length nearly zero ----
+    if ( len < 1e-12f ) {
+        force_elastic = make_float3(0, 0, 0);
+        if ( H_elastic_ptr ) *H_elastic_ptr = Mat3::zero();
+        if ( energy_ptr ) *energy_ptr = 0.0f;
+        return;
+    }
+
+    // ---- Direction and strain ----
+    float3 n = d / len;                  // unit vector from v1 to v0
+    float strain = len - rest_length;
+
+    // ---- Force (exact gradient) ----
+    // E = 1/2 k (l - L0)^2
+    // f0 = -dE/dx0 = -k (l - L0) * (dl/dx0) = -k (l - L0) n
+    force_elastic = -stiffness * strain * n;
+
+    // ---- Energy (optional) ----
+    if ( energy_ptr ) {
+        *energy_ptr = 0.5f * strain * strain * stiffness;
+    }
+
+    // ---- Hessian (self‑block for v0) ----
+    if ( H_elastic_ptr ) {
+        Mat3& H_elastic = *H_elastic_ptr;
+        if ( reg_type == PROJECTIVE ) {
+            // Projective Dynamics isotropic approximation:
+            // H_PD = k I   (always SPD, ignores directional stiffness)
+            H_elastic = Mat3::identity(stiffness);
+        }
+        else if ( reg_type == SPD_CLAMP ) {
+            // Exact H decomposed as:
+            //   H = k (n n^T) + k(1 - L0/l) (I - n n^T)
+            // We clamp the lateral eigenvalue to avoid indefiniteness:
+            //   k_t = k * max(1 - L0/l, epsilon)
+            // Then H_SPD = k (n n^T) + k_t (I - n n^T)
+            const float eps = -1.0e-3f;
+            float kt = stiffness * max(1.0f - rest_length / len, eps);
+            float kn = stiffness;
+            // Construct as: H = (kn - kt) * (n n^T) + kt * I
+            Mat3 h = Mat3::outer_product(n, n * (kn - kt));
+            h.add_diag(kt);
+            H_elastic = h;
+        }
+        else { // NONE
+            // Exact Hessian:
+            // H = k I - k (L0/l) (I - n n^T)
+            //   = (k - k L0/l) I + (k L0/l) n n^T
+            float coef = stiffness * (rest_length / len); // = k * L0/l
+            Mat3 h = Mat3::outer_product(n, n * coef); // + coef * n n^T
+            h.add_diag(stiffness - coef); // + (k - coef) * I
+            H_elastic = h;
+        }
+    }
+}
+
+
+static __global__ void accumulate_spring_forces(
+    Mat3* __restrict__ Jx_nondiag,
     Mat3* __restrict__ Jx_diag,
     float3* __restrict__ forces,
-    float* __restrict__ enerys,
+    float* __restrict__ energys,
     const float3* __restrict__ vertices, // world space
     const int2* __restrict__ edges,
     const float* __restrict__ edge_lengths,
@@ -42,40 +116,25 @@ static __global__ void compute_spring_forces(
           i += blockDim.x * gridDim.x ) {
         auto [v0,v1] = edges[i];
         float3 p0 = vertices[v0], p1 = vertices[v1];
-        float3 e = p0 - p1;
-        float length = norm(e);
-        if ( length > 1e-8 ) {
-            float3 ks = obj_data[vertices_obj[v0]].stretch;
-            const float youngs = 4e2;
-            float rest_length = edge_lengths[i];
-            float k = youngs * (ks.x + ks.y + ks.z) * 0.333f;
-            float length_diff = length - rest_length;
-            float3 force = e * (length_diff * k / length);
-            atomicAddFloat3(&forces[v0], -force);
-            atomicAddFloat3(&forces[v1], force);
-            if ( enerys ) {
-                float enery = 0.5f * length_diff * length_diff * k;
-                atomicAdd(&enerys[v0], enery);
-            }
-            if ( Jx || Jx_diag ) {
-
-                auto I = Mat3::identity();
-                // float l_inv = 1.0f / length;
-                // auto dxtdx =  Mat3::outer_product(e,e);
-                // Mat3 K = -(I - (I - dxtdx * l_inv * l_inv ) * rest_length * l_inv) * k;
-
-                // Hessian Filter for SPD
-                float val1 = max(1.0f - rest_length / length, -0.001f);
-                float3 dir = (p1 - p0) / length;
-                Mat3 dir_dirT = Mat3::outer_product(dir, dir);
-                Mat3 K = -((I - dir_dirT) * val1 + dir_dirT) * k;
-                if ( Jx_diag ) {
-                    atomicAddMat3(&Jx_diag[v0], K);
-                    atomicAddMat3(&Jx_diag[v1], K);
-                }
-                if ( Jx ) {
-                    atomicAddMat3(&Jx[i], -K);
-                }
+        float3 ks = obj_data[vertices_obj[v0]].stretch;
+        float rest_length = edge_lengths[i];
+        float k = base_spring_stiffness * (ks.x + ks.y + ks.z) * 0.333f;
+        float3 force;
+        Mat3 K;
+        float energy;
+        calc_spring_elastic(p0, p1, rest_length, k, force,
+            Jx_diag ? &K : nullptr, SPD_CLAMP,
+            energys ? &energy : nullptr);
+        atomicAddFloat3(&forces[v0], force);
+        atomicAddFloat3(&forces[v1], -force);
+        if ( energys ) {
+            atomicAdd(&energys[v0], energy);
+        }
+        if (Jx_diag) {
+            atomicAddMat3(&Jx_diag[v0], K);
+            atomicAddMat3(&Jx_diag[v1], K);
+            if (Jx_nondiag) {
+                atomicAddMat3(&Jx_nondiag[i], -K);
             }
         }
     }
@@ -83,7 +142,6 @@ static __global__ void compute_spring_forces(
 
 // triangular finite element. The formula derivation comes from
 //T. Kim and D. Eberle, "Dynamic deformables: implementation and production practicalities (now with code!)," in ACM SIGGRAPH 2022 Courses  (Chapter 10)
-// very expensive
 static __global__ void compute_BW_FEM(
     Mat3* __restrict__ Jx,
     Mat3* __restrict__ Jx_diag,
@@ -139,9 +197,7 @@ static __global__ void compute_BW_FEM(
     float3 Cudp2 = wu_ * wudp2;
     float3 Cvdp2 = wv_ * wvdp2;
 
-    // int obj = vertices_obj[v0_idx];
-    // float k = YoungsModulus[obj];
-    float k = 8e3f;
+    float k = 1.38e3f;
 
     //  Projector Matrices
     Mat3 I = Mat3::identity();

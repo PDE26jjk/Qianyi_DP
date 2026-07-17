@@ -235,83 +235,6 @@ void SolverPDNewton::init() {
     subspace_solver->init(geo->basis_size, 0);
 
 }
-// void SolverPDNewton::compute_constraint() {
-//     int block = 256;
-//
-//     int n = params.nb_all_cloth_edges;
-//     compute_spring_forces<<<(n + block - 1) / block, block>>>(
-//         nullptr, nullptr, f, nullptr, q, edges,
-//         geo->edge_lengths.data().get(), n);
-//
-//     Mat3* Jx_diag = linear->Jx_diag.data().get();
-//     Mat3* Jx = linear->Jx_nondiag.data().get();
-//     Mat3* Jx_bend_cross = linear->Jx_bend_cross.data().get();
-//
-//     n = params.nb_all_cloth_edges;
-//     int blocksPerGrid = (n + block - 1) / block;
-//     // compute_spring_forces<<<blocksPerGrid, block>>>(
-//     //     Jx, Jx_diag,
-//     //     forces.data().get(), nullptr,
-//     //     vertices_world.data().get(),
-//     //     edges.data().get(),
-//     //     edge_lengths.data().get(),
-//     //     n);
-//     // n = params.nb_all_cloth_triangles;
-//     // float3* y = vertices_world.data().get();
-//     // compute_BW_FEM<<<(n + block - 1) / block, block>>>(
-//     //     // compute_ARAP_FEM<<<(n + block - 1) / block, block>>>(
-//     //     Jx, Jx_diag,
-//     //     forces.data().get(), nullptr,
-//     //     y,
-//     //     triangles.data().get(),
-//     //     edges.data().get(),
-//     //     vertices_obj.data().get(),
-//     //     nullptr,
-//     //     Dms.data().get(),
-//     //     n);
-//     // n = params.nb_all_cloth_edges;
-//     // float bending_k = max(0.f, get_global_parameter("bending_k", 1.f));
-//     // compute_dihedral_bending_Fizt<<<(n + block - 1) / block, block>>>(
-//     //     Jx,Jx_diag,Jx_bend_cross,
-//     //     forces.data().get(),
-//     //     vertices_world.data().get(),
-//     //     edges.data().get(),
-//     //     e2t.data().get(),
-//     //     triangles.data().get(),
-//     //     edge_opposite_points.data().get(),
-//     //     n, bending_k);
-//     // // compute_quadratic_Bending_IBM<<<(n + block - 1) / block, block>>>(
-//     // //     Jx, Jx_diag, Jx_bend_cross,
-//     // //     forces.data().get(), nullptr,
-//     // //     IBM_q.data().get(),
-//     // //     y,
-//     // //     edges.data().get(),
-//     // //     e2t.data().get(),
-//     // //     triangles.data().get(),
-//     // //     edge_opposite_points.data().get(),
-//     // //     n, 0.2f);
-//     // if ( !sewing_done ) {
-//     //     float sewing_k = max(0.f, get_global_parameter("sewing_k", 1e6f));
-//     //     float min_dist = 2e-3f;
-//     //     n = params.nb_all_stitches;
-//     //     compute_stitch_constraint<<<(n + block - 1) / block, block>>>(
-//     //         nullptr, Jx_diag, forces.data().get(), nullptr, y, vertices_obj.data().get(),
-//     //         obj_data.data().get(),
-//     //         vertices_mask.data().get(), stitches.data().get(), min_dist, sewing_k, n);
-//     // }
-//     // int num_constraints = pp_result_size_h + tp_result_size_h + ee_result_size_h;
-//     // if ( num_constraints > 0 ) {
-//     //     float IPC_k = max(0.f, get_global_parameter("IPC_k", 1500.f));
-//     //     if ( IPC_k > 0.f )
-//     //         compute_normal_constraint_IPC_energy<<<(num_constraints + block - 1) / block, block>>>(
-//     //             Jx_diag, forces.data().get(),
-//     //             normal_constraints.data().get(),
-//     //             y, mass_inv.data().get(), obj_data.data().get(),
-//     //             vertices_obj.data().get(), IPC_k,
-//     //             num_constraints);
-//     // }
-// }
-
 
 static __global__ void truncate_forces_kernel(
     float3* __restrict__ forces,
@@ -408,7 +331,7 @@ void SolverPDNewton::step(float h) {
         // compute_constraint();
         // geo->accumulate_sewing_force();
 
-        compute_spring_forces<<<(n + block - 1) / block, block>>>(
+        accumulate_spring_forces<<<(n + block - 1) / block, block>>>(
             nullptr, nullptr, f, nullptr, q, edges,
             geo->edge_lengths.data().get(),
             geo->obj_data.data().get(), geo->vertices_obj.data().get(),

@@ -59,8 +59,8 @@ public:
     thrust::device_vector<float> mass_inv;
     thrust::device_vector<Mat4> world_matrices;
     thrust::device_vector<Mat4> world_matrices_inv;
-    thrust::device_vector<int2> dir_edges;
-    thrust::device_vector<int2> edge_lookup;
+    thrust::device_vector<int2> dir_edges; // size = 2 * nb_all_edges,  [target, edge_id] per element
+    thrust::device_vector<int2> edge_lookup; // size = nb_all_vertices, [offset, count] per vertex
     thrust::device_vector<int2> e2t;
     thrust::device_vector<int2> edge_opposite_points;
     thrust::device_vector<Mat2> Dms;
@@ -176,6 +176,20 @@ public:
     void accumulate_sewing_force();
 
     void update_pin(float3* q);
+
+    // color graph for vbd
+    void color_graph();
+    thrust::device_vector<int> node_colors;
+    thrust::device_vector<int> colors_index_offsets;
+    std::vector<int> h_colors_index_offsets;
+    thrust::device_vector<int> color_groups;
+    
+    // build adjacency data for vbd, vertices -> constraints
+    void build_adj_data();
+    thrust::device_vector<int2> v_adj_bending;
+    thrust::device_vector<int> v_adj_bending_offsets;
+    thrust::device_vector<int2> v_adj_tris;
+    thrust::device_vector<int> v_adj_tris_offsets;
     
     // picker
     std::mutex pick_mutex;

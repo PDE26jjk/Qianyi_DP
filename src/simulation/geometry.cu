@@ -10,10 +10,12 @@
 #include <thrust/sort.h>
 // #include <thrust/transform_reduce.h>
 
+#include <cub/device/device_run_length_encode.cuh>
 #include <cub/device/device_segmented_reduce.cuh>
 
 #include "constraint.cuh"
 #include "geometric_operator.cuh"
+#include "color_graph/coloring.h"
 #include "common/cuda_utils.h"
 #include "contact/collision.cuh"
 #include "cuda_tools/cub_tools.cuh"
@@ -100,7 +102,7 @@ void Geometry::init(const GeoDataInput& geo) {
 
     temp_vertices_f3.resize(params.nb_all_vertices);
     temp_mem.clear();
-    
+
     inertial_offset.resize(params.nb_all_vertices);
 
     init_vertex_data();
@@ -191,112 +193,116 @@ void Geometry::init_edge_data() {
     int nb_all_v = params.nb_all_vertices;
     size_t num_edges = edges.size();
     size_t num_dir_edges = num_edges * 2;
+    dir_edges.resize(num_dir_edges);
+    edge_lookup.resize(nb_all_v);
+    edges_to_csr(nb_all_v, num_edges, edges.data().get(),
+        dir_edges.data().get(), edge_lookup.data().get());
 
     // -------------------------------------------------------
     // 步骤 1: 准备排序键 (Keys) 和 值 (Values)
     // -------------------------------------------------------
     // Keys: 存储打包后的 (Source << 32 | Target)
     // Values: 存储 EdgeID (对应 Python 的 np.arange)
-    thrust::device_vector<unsigned long long> sort_keys(num_dir_edges);
-    thrust::device_vector<int> sort_values(num_dir_edges); // 存 EdgeID
-
-    // 使用 transform 填充数据
-    // 线程 i 处理一条输入边，同时生成“正向”和“反向”两条数据
-    thrust::for_each(thrust::device,
-        thrust::make_counting_iterator<size_t>(0),
-        thrust::make_counting_iterator<size_t>(num_edges),
-        [
-            in_ptr = thrust::raw_pointer_cast(edges.data()),
-            keys_ptr = thrust::raw_pointer_cast(sort_keys.data()),
-            vals_ptr = thrust::raw_pointer_cast(sort_values.data()),
-            num_edges
-        ] __device__ (size_t i) {
-            int2 e = in_ptr[i];
-            if ( e.x > e.y ) {
-                e = make_int2(e.y, e.x);
-                in_ptr[i] = e;
-            }
-            int u = e.x;
-            int v = e.y;
-
-            // 正向边: u -> v, ID = i
-            // Key 高位是 u (Primary sort), 低位是 v (Secondary sort)
-            keys_ptr[i] = ((unsigned long long)u << 32) | (unsigned int)v;
-            vals_ptr[i] = (int)i;
-
-            // 反向边: v -> u, ID = i
-            keys_ptr[i + num_edges] = ((unsigned long long)v << 32) | (unsigned int)u;
-            vals_ptr[i + num_edges] = (int)i;
-        }
-        );
-
-    // -------------------------------------------------------
-    // 步骤 2: 排序 (完全等价于 np.lexsort)
-    // -------------------------------------------------------
-    thrust::stable_sort_by_key(thrust::device, sort_keys.begin(), sort_keys.end(), sort_values.begin());
-
-    // -------------------------------------------------------
-    // 步骤 3: 生成 dir_edges (解包)
-    // -------------------------------------------------------
-    // Python 返回的是 dir_edges[:, 1:]，即 [Target, EdgeID]
-    // 我们的 sort_keys 低 32 位正是 Target，sort_values 正是 EdgeID
-    dir_edges.resize(num_dir_edges);
-
-    thrust::transform(
-        thrust::make_zip_iterator(thrust::make_tuple(sort_keys.begin(), sort_values.begin())),
-        thrust::make_zip_iterator(thrust::make_tuple(sort_keys.end(), sort_values.end())),
-        dir_edges.begin(),
-        [] __device__ (const thrust::tuple<unsigned long long, int>& t) {
-            // 解包：Target 在低32位
-            int target = (int)(thrust::get<0>(t) & 0xFFFFFFFF);
-            int edge_id = thrust::get<1>(t);
-            return make_int2(target, edge_id);
-        }
-        );
-
-    // -------------------------------------------------------
-    // 步骤 4: 生成 Lookup Table (CSR 格式)
-    // -------------------------------------------------------
-    // 我们需要 Source 数组来计算 offset。Source 就在 sort_keys 的高32位。
-
-    // 提取 Source 序列 (为了 lower_bound)
-    // 注意：这里不用显式分配大数组，用 transform_iterator 包装即可，节省显存
-    auto source_iter_begin = thrust::make_transform_iterator(
-        sort_keys.begin(),
-        [] __host__ __device__ (unsigned long long key) { return (int)(key >> 32); }
-        );
-    auto source_iter_end = source_iter_begin + (int)num_dir_edges;
-
-    // 准备查询序列 [0, 1, ..., nb_all_v - 1]
-    thrust::device_vector<int> query_vertices(nb_all_v);
-    thrust::sequence(thrust::device, query_vertices.begin(), query_vertices.end());
-
-    // 计算 Offsets (Lower Bound) 和 Ends (Upper Bound)
-    thrust::device_vector<int> offsets(nb_all_v);
-    thrust::device_vector<int> counts(nb_all_v); // 暂存 counts，最后合并
-
-    thrust::lower_bound(thrust::device,
-        source_iter_begin, source_iter_end,
-        query_vertices.begin(), query_vertices.end(),
-        offsets.begin()
-        );
-
-    thrust::upper_bound(thrust::device,
-        source_iter_begin, source_iter_end,
-        query_vertices.begin(), query_vertices.end(),
-        counts.begin() // 这里先存 end index，下一步做减法
-        );
-
-    // 合并结果到 lookup_table: .x = offset, .y = count
-    edge_lookup.resize(nb_all_v);
-    thrust::transform(
-        offsets.begin(), offsets.end(),
-        counts.begin(), // 此时里面存的是 upper_bound 的结果
-        edge_lookup.begin(),
-        [] __device__ (int start, int end) {
-            return make_int2(start, end - start);
-        }
-        );
+    // thrust::device_vector<unsigned long long> sort_keys(num_dir_edges);
+    // thrust::device_vector<int> sort_values(num_dir_edges); // 存 EdgeID
+    //
+    // // 使用 transform 填充数据
+    // // 线程 i 处理一条输入边，同时生成“正向”和“反向”两条数据
+    // thrust::for_each(thrust::device,
+    //     thrust::make_counting_iterator<size_t>(0),
+    //     thrust::make_counting_iterator<size_t>(num_edges),
+    //     [
+    //         in_ptr = thrust::raw_pointer_cast(edges.data()),
+    //         keys_ptr = thrust::raw_pointer_cast(sort_keys.data()),
+    //         vals_ptr = thrust::raw_pointer_cast(sort_values.data()),
+    //         num_edges
+    //     ] __device__ (size_t i) {
+    //         int2 e = in_ptr[i];
+    //         if ( e.x > e.y ) {
+    //             e = make_int2(e.y, e.x);
+    //             in_ptr[i] = e;
+    //         }
+    //         int u = e.x;
+    //         int v = e.y;
+    //
+    //         // 正向边: u -> v, ID = i
+    //         // Key 高位是 u (Primary sort), 低位是 v (Secondary sort)
+    //         keys_ptr[i] = ((unsigned long long)u << 32) | (unsigned int)v;
+    //         vals_ptr[i] = (int)i;
+    //
+    //         // 反向边: v -> u, ID = i
+    //         keys_ptr[i + num_edges] = ((unsigned long long)v << 32) | (unsigned int)u;
+    //         vals_ptr[i + num_edges] = (int)i;
+    //     }
+    //     );
+    //
+    // // -------------------------------------------------------
+    // // 步骤 2: 排序 (完全等价于 np.lexsort)
+    // // -------------------------------------------------------
+    // thrust::stable_sort_by_key(thrust::device, sort_keys.begin(), sort_keys.end(), sort_values.begin());
+    //
+    // // -------------------------------------------------------
+    // // 步骤 3: 生成 dir_edges (解包)
+    // // -------------------------------------------------------
+    // // Python 返回的是 dir_edges[:, 1:]，即 [Target, EdgeID]
+    // // 我们的 sort_keys 低 32 位正是 Target，sort_values 正是 EdgeID
+    // dir_edges.resize(num_dir_edges);
+    //
+    // thrust::transform(
+    //     thrust::make_zip_iterator(thrust::make_tuple(sort_keys.begin(), sort_values.begin())),
+    //     thrust::make_zip_iterator(thrust::make_tuple(sort_keys.end(), sort_values.end())),
+    //     dir_edges.begin(),
+    //     [] __device__ (const thrust::tuple<unsigned long long, int>& t) {
+    //         // 解包：Target 在低32位
+    //         int target = (int)(thrust::get<0>(t) & 0xFFFFFFFF);
+    //         int edge_id = thrust::get<1>(t);
+    //         return make_int2(target, edge_id);
+    //     }
+    //     );
+    //
+    // // -------------------------------------------------------
+    // // 步骤 4: 生成 Lookup Table (CSR 格式)
+    // // -------------------------------------------------------
+    // // 我们需要 Source 数组来计算 offset。Source 就在 sort_keys 的高32位。
+    //
+    // // 提取 Source 序列 (为了 lower_bound)
+    // // 注意：这里不用显式分配大数组，用 transform_iterator 包装即可，节省显存
+    // auto source_iter_begin = thrust::make_transform_iterator(
+    //     sort_keys.begin(),
+    //     [] __host__ __device__ (unsigned long long key) { return (int)(key >> 32); }
+    //     );
+    // auto source_iter_end = source_iter_begin + (int)num_dir_edges;
+    //
+    // // 准备查询序列 [0, 1, ..., nb_all_v - 1]
+    // thrust::device_vector<int> query_vertices(nb_all_v);
+    // thrust::sequence(thrust::device, query_vertices.begin(), query_vertices.end());
+    //
+    // // 计算 Offsets (Lower Bound) 和 Ends (Upper Bound)
+    // thrust::device_vector<int> offsets(nb_all_v);
+    // thrust::device_vector<int> counts(nb_all_v); // 暂存 counts，最后合并
+    //
+    // thrust::lower_bound(thrust::device,
+    //     source_iter_begin, source_iter_end,
+    //     query_vertices.begin(), query_vertices.end(),
+    //     offsets.begin()
+    //     );
+    //
+    // thrust::upper_bound(thrust::device,
+    //     source_iter_begin, source_iter_end,
+    //     query_vertices.begin(), query_vertices.end(),
+    //     counts.begin() // 这里先存 end index，下一步做减法
+    //     );
+    //
+    // // 合并结果到 lookup_table: .x = offset, .y = count
+    // edge_lookup.resize(nb_all_v);
+    // thrust::transform(
+    //     offsets.begin(), offsets.end(),
+    //     counts.begin(), // 此时里面存的是 upper_bound 的结果
+    //     edge_lookup.begin(),
+    //     [] __device__ (int start, int end) {
+    //         return make_int2(start, end - start);
+    //     }
+    //     );
     calc_edge_length();
 }
 
@@ -346,21 +352,6 @@ void Geometry::calc_edge_length() {
     CALL_CUBS(DeviceSegmentedReduce::Sum, d_edge_len, d_sums.data().get(), num_objects,
         thrust::raw_pointer_cast(d_offsets.data()),
         thrust::raw_pointer_cast(d_offsets.data()) + 1);
-    // void* d_temp_storage = nullptr;
-    // size_t temp_storage_bytes = 0;
-    // cub::DeviceSegmentedReduce::Sum(
-    //     d_temp_storage, temp_storage_bytes,
-    //     d_edge_len, d_sums, num_objects,
-    //     thrust::raw_pointer_cast(d_offsets.data()),
-    //     thrust::raw_pointer_cast(d_offsets.data()) + 1);
-    //
-    // cudaMalloc(&d_temp_storage, temp_storage_bytes);
-    //
-    // cub::DeviceSegmentedReduce::Sum(
-    //     d_temp_storage, temp_storage_bytes,
-    //     d_edge_len, d_sums, num_objects,
-    //     thrust::raw_pointer_cast(d_offsets.data()),
-    //     thrust::raw_pointer_cast(d_offsets.data()) + 1);
 
     int threads = 256;
     int blocks = (num_objects + threads - 1) / threads;
@@ -534,7 +525,7 @@ void Geometry::init_triangle_data() {
             int p3_idx = t_adj.y != -1 ? get_opposite_point(e_i, triangles[t_adj.y], edges) : -1;
             edge_opposite_points[i] = make_int2(p0_idx, p3_idx);
         });
-    if ((bool)get_global_parameter("average_mass_by_cloth",0.f))
+    if ( (bool)get_global_parameter("average_mass_by_cloth", 0.f) )
         average_mass_by_cloth();
 
 }
@@ -619,7 +610,7 @@ __global__ void forward_step(
     if ( external_force ) {
         f_ext += external_force[i] * im;
     }
-    if (mask[i]) {
+    if ( mask[i] ) {
         inertia_out[i] = p;
         static_diags[i] += mask_stiff;
     }
@@ -818,8 +809,8 @@ static __global__ void update_interpolated_position(
     for ( int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
           i += blockDim.x * gridDim.x ) {
         // constexpr char mask = static_cast<char>(MaskBit::pick_mesh_mask);
-        if (mask[i]) {
-            
+        if ( mask[i] ) {
+
             vertices_interpolated[i] =
                 vertices_world_old[i] * (1.f - factor) + vertices_world_new[i] * factor;
             // if (mask[i] | static_cast<char>(MaskBit::pick_mesh_mask)) {
@@ -850,7 +841,7 @@ void Geometry::update_for_step(float h, float time_factor) {
         update_interpolated_position<<<(n + block - 1) / block, block>>>(
             pos_world.data().get(), pos_interpolation_new.data().get(),
             pos_interpolation_old.data().get(),
-            time_factor,vertices_mask.data().get(), n);
+            time_factor, vertices_mask.data().get(), n);
     }
 
     float gravity_z = 0.f;
@@ -907,4 +898,164 @@ void Geometry::end_for_frame() {
     }
     reset_pick_mask();
     CUDA_CHECK(cudaDeviceSynchronize());
+}
+__global__ void compute_color_offsets_kernel(
+    const int* __restrict__ d_sorted_colors,
+    int num_vertices,
+    int num_colors,
+    int* __restrict__ d_offsets) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if ( c > num_colors ) return;   // extra threads in the last block
+
+    if ( c == num_colors ) {
+        d_offsets[c] = num_vertices;
+        return;
+    }
+
+    // binary search for lower_bound(c) = first index with d_sorted_colors[i] >= c
+    int low = 0, high = num_vertices;
+    while ( low < high ) {
+        int mid = (low + high) >> 1;
+        if ( d_sorted_colors[mid] < c )
+            low = mid + 1;
+        else
+            high = mid;
+    }
+    d_offsets[c] = low;
+}
+
+__global__ void calc_offsets_kernel(
+    const int* __restrict__ sorted_keys, // size: num_pairs + 1, last key should be num_values
+    int num_pairs,
+    int* __restrict__ offsets
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if ( i > num_pairs ) return;
+
+    int prev_key = i == 0 ? -1 : sorted_keys[i - 1];
+    int key = sorted_keys[i];
+    for ( int j = prev_key + 1; j <= key; j++ ) {
+        offsets[j] = i;
+    }
+}
+
+void Geometry::color_graph() {
+    // Collect valid edges in graph
+    int num_edges = params.nb_all_cloth_edges;
+    int num_nodes = params.nb_all_cloth_vertices;
+    int num_stitches = params.nb_all_stitches;
+    // edges and bending
+    thrust::device_vector<int2> valid_edges(num_edges * 2 + num_stitches);
+    node_colors.assign(params.nb_all_vertices, -1);
+    int2* d_valid_edges = thrust::raw_pointer_cast(valid_edges.data());
+    cudaMemcpyAsync(d_valid_edges, edges.data().get(), num_edges * sizeof(int2), cudaMemcpyDeviceToDevice);
+    auto end = thrust::copy_if(thrust::device, edge_opposite_points.begin(), edge_opposite_points.end(),
+        valid_edges.begin() + num_edges, [] __device__ (int2 e) {
+            return e.x != -1 && e.y != -1;
+        });
+    int offset = end - valid_edges.begin();
+    // stitches
+    if ( num_stitches > 0 )
+        cudaMemcpyAsync(d_valid_edges + offset, stitches.data().get(), num_stitches * sizeof(int2), cudaMemcpyDeviceToDevice);
+
+    int num_colors = graph_coloring_cuda(num_nodes, offset + num_stitches,
+        d_valid_edges, node_colors.data().get(), true);
+
+    // Build color‑based partition of vertices (sorted order + CSR‑style offsets)
+    color_groups.resize(num_nodes);
+    thrust::sequence(color_groups.begin(), color_groups.end());
+    thrust::device_vector<int> d_keys(num_nodes + 1, num_colors);
+    CALL_CUBS(DeviceRadixSort::SortPairs, node_colors.data().get(), d_keys.data().get(),
+        color_groups.data().get(), color_groups.data().get(), num_nodes);
+
+    colors_index_offsets.resize(num_colors + 1);
+    int threads = 256;
+    int blocks = (num_nodes + 1 + threads - 1) / threads;
+    calc_offsets_kernel<<<blocks, threads>>>(
+        thrust::raw_pointer_cast(d_keys.data()), num_nodes,
+        thrust::raw_pointer_cast(colors_index_offsets.data()));
+    h_colors_index_offsets.resize(colors_index_offsets.size());
+    cudaMemcpy(h_colors_index_offsets.data(), colors_index_offsets.data().get(), colors_index_offsets.size() * sizeof(int),
+        cudaMemcpyDeviceToHost);
+    // for (int i = 0; i < num_colors; ++i) {
+    //     h_colors_index_offsets[i] = h_colors_index_offsets[i+1] - h_colors_index_offsets[i];
+    // }
+}
+__global__ void bending_fill_keys_and_values(
+    const int2* __restrict__ edges,
+    const int2* __restrict__ edge_opposite_points,
+    int num_edges,
+    int* __restrict__ d_keys,
+    int2* __restrict__ d_values
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if ( tid >= num_edges ) return;
+
+    int2 op = edge_opposite_points[tid];
+    if ( op.x == -1 || op.y == -1 ) {
+        return;
+    }
+    int2 e = edges[tid];
+
+    int base = tid * 4;
+    d_keys[base] = e.x;
+    d_keys[base + 1] = e.y;
+    d_keys[base + 2] = op.x;
+    d_keys[base + 3] = op.y;
+    d_values[base] = make_int2(tid, 0);
+    d_values[base + 1] = make_int2(tid, 1);
+    d_values[base + 2] = make_int2(tid, 2);
+    d_values[base + 3] = make_int2(tid, 3);
+}
+__global__ void tris_fill_keys_and_values(
+    const int3* __restrict__ tris,
+    int num_tris,
+    int* __restrict__ d_keys,
+    int2* __restrict__ d_values
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if ( tid >= num_tris ) return;
+
+    int3 tri = tris[tid];
+    int base = tid * 3;
+
+    d_keys[base] = tri.x;
+    d_keys[base + 1] = tri.y;
+    d_keys[base + 2] = tri.z;
+    d_values[base] = make_int2(tid, 0);
+    d_values[base + 1] = make_int2(tid, 1);
+    d_values[base + 2] = make_int2(tid, 2);
+}
+void Geometry::build_adj_data() {
+    // bending 
+    int num_edges = params.nb_all_cloth_edges;
+    int num_vertices = params.nb_all_cloth_vertices;
+    int num_pairs = num_edges * 4;
+    thrust::device_vector<int> keys(num_pairs + 1, num_vertices);
+    v_adj_bending.resize(num_pairs);
+    v_adj_bending_offsets.resize(num_vertices + 1);
+    int* d_keys = keys.data().get();
+    int2* d_values = v_adj_bending.data().get();
+    int blockSize = 256;
+    int gridSize = (num_edges + blockSize - 1) / blockSize;
+    bending_fill_keys_and_values<<<gridSize, blockSize>>>(
+        edges.data().get(), edge_opposite_points.data().get(),
+        num_edges, d_keys, d_values);
+    CALL_CUBS(DeviceRadixSort::SortPairs, d_keys, d_keys, d_values, d_values, num_pairs);
+    calc_offsets_kernel<<< (num_pairs + 1 + blockSize - 1) / blockSize, blockSize>>>(
+        d_keys, num_pairs, v_adj_bending_offsets.data().get());
+
+    // triangle FEM
+    int num_faces = params.nb_all_cloth_triangles;
+    num_pairs = num_faces * 3;
+    keys.assign(num_pairs + 1, num_vertices);
+    v_adj_tris.resize(num_pairs);
+    v_adj_tris_offsets.resize(num_vertices + 1);
+    d_values = v_adj_tris.data().get();
+    tris_fill_keys_and_values<<<gridSize, blockSize>>>(
+        triangle_indices.data().get(), num_faces, d_keys, d_values);
+    CALL_CUBS(DeviceRadixSort::SortPairs, d_keys, d_keys, d_values, d_values, num_pairs);
+    calc_offsets_kernel<<< (num_pairs + 1 + blockSize - 1) / blockSize, blockSize>>>(
+        d_keys, num_pairs, v_adj_tris_offsets.data().get());
+
 }

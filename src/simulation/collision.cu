@@ -220,7 +220,8 @@ void Contact::refit_bvh(const float3* pos, const float3* offset) {
     lbvh3d::refit_edge_bvh(pos, geo->edges, edge_bvh, offset);
 }
 
-static __global__ void compute_vf_force(
+
+__global__ void compute_vf_force(
     float3* __restrict__ forces,
     Mat3* __restrict__ Jx,
     // float* __restrict__ weight,
@@ -265,43 +266,52 @@ static __global__ void compute_vf_force(
         float sign = fid > 0 ? 1.0f : -1.0f;
         fid = abs(fid);
         int3 tri = tri_indices[fid];
-        int i1 = tri.x;
-        int i2 = tri.y;
-        int i3 = tri.z;
-        float3 x1 = pos[i1];
-        float3 x2 = pos[i2];
-        float3 x3 = pos[i3];
-        float3 normal = cross(x2 - x1, x3 - x1);
-        float normal_len = norm(normal);
-        if ( normal_len < 1e-8f ) continue;
-        normal = normal / normal_len;
-        int layer1 = obj_data[vertices_obj[i1]].collision_layer;
-        if ( layer1 == layer0 ) {
-            normal = normal * sign;
-        }
-        else if ( layer0 < layer1 ) {
-            if ( dot(normal, normal_v) > 0.0f ) normal = -normal;
-        }
+        int i1 = tri.x, i2 = tri.y, i3 = tri.z;
+        float3 x1 = pos[i1], x2 = pos[i2], x3 = pos[i3];
 
-        float dist = dot(x0 - x1, normal);
+        // float3 normal = cross(x2 - x1, x3 - x1);
+        // float normal_len = norm(normal);
+        // if ( normal_len < 1e-8f ) continue;
+        // normal = normal / normal_len;
+        // int layer1 = obj_data[vertices_obj[i1]].collision_layer;
+        // if ( layer1 == layer0 ) {
+        //     normal = normal * sign;
+        // }
+        // else if ( layer0 < layer1 ) {
+        //     if ( dot(normal, normal_v) > 0.0f ) normal = -normal;
+        // }
+        //
+        // float dist = dot(x0 - x1, normal);
+        // float thickness = thickness0 + obj_data[vertices_obj[i1]].thickness;
+        // if ( dist > thickness ) continue;
+        //
+        // float3 closest_pt = x0 - dist * normal;
+        // float u, v, w;
+        // barycentric(x1, x2, x3, closest_pt, u, v, w);
+        // if ( u < 0.0f || v < 0.0f || w < 0.0f ) continue;
+        float3 normal;
         float thickness = thickness0 + obj_data[vertices_obj[i1]].thickness;
-        if ( dist > thickness ) continue;
+        float u, v, w, pen;
+        if ( !compute_point_triangle_contact(
+            x0, x1, x2, x3,
+            thickness,
+            layer0 - obj_data[vertices_obj[i1]].collision_layer,
+            sign, normal_v,
+            normal, u, v, w, pen)
+        ) {
 
-        float3 closest_pt = x0 - dist * normal;
-        float u, v, w;
-        barycentric(x1, x2, x3, closest_pt, u, v, w);
-        if ( u < 0.0f || v < 0.0f || w < 0.0f ) continue;
+            continue;
+        }
         float stiff = k * vert_stiff;
         if ( static_diags[i1] > 0.f && static_diags[i2] > 0.f && static_diags[i3] > 0.f ) {
             float face_stiff = (static_diags[i1] + static_diags[i2] + static_diags[i3]) * 0.333333f;
             stiff = k * (vert_stiff * face_stiff) / (vert_stiff + face_stiff);
         }
         else if ( vert_stiff <= 0.f ) continue;
-        // float sign_dist = (dist > 0.0f) ? 1.0f : -1.0f;
+
         float3 force;
-        float diff = thickness - dist;
         if ( force_type == 0 ) {
-            float force_mag = stiff * diff;
+            float force_mag = stiff * pen;
             force = normal * force_mag;
             if ( Jx ) {
                 Mat3 hess = Mat3::outer_product(normal, normal * stiff);
@@ -314,11 +324,11 @@ static __global__ void compute_vf_force(
             }
         }
         else {
-            float d = max(dist, thickness * 0.1f);
+            float d = max(thickness - pen, thickness * 0.1f);
             float d_ratio = d / thickness;
+            float diff = thickness - d;
             float log_term = logf(d_ratio);
             log_term = min(log_term, 1e8f);
-            diff = thickness - d;
 
             float E_prime = stiff * diff * (2.0f * log_term + 1.0f - 1.0f / d_ratio);
             force = log_term * E_prime * normal;
@@ -338,7 +348,6 @@ static __global__ void compute_vf_force(
 static __global__ void compute_ee_force(
     float3* __restrict__ forces,
     Mat3* __restrict__ Jx,
-    // float* __restrict__ weight,
     const int* __restrict__ broad_phase_pairs,
     const int broad_phase_size,
     const float3*__restrict__ pos,
@@ -376,61 +385,67 @@ static __global__ void compute_ee_force(
         float sign = eid2 > 0 ? 1.0f : -1.0f;
         eid2 = abs(eid2);
         int2 e = edges[eid2];
-        float3 v0 = pos[e.x];
-        float3 v1 = pos[e.y];
+        float3 q0 = pos[e.x], q1 = pos[e.y];
 
-        float s, t;
-        float3 ab;
-        segment_segment_closest_robust(p0, p1, v0, v1, s, t, ab);
-        ab = -ab;
         // float s, t;
-        // float3 closest_A, closest_B;
-        // if ( !edge_edge_closest_points(p0, p1, v0, v1, closest_A, closest_B, s, t) ) {
+        // float3 ab;
+        // segment_segment_closest_robust(p0, p1, v0, v1, s, t, ab);
+        // ab = -ab;
+        //
+        // if ( s <= 0.0f || s >= 1.0f || t <= 0.0f || t >= 1.0f ) {
         //     continue;
         // }
-        if ( s <= 0.0f || s >= 1.0f || t <= 0.0f || t >= 1.0f ) {
+        // // float3 ab = closest_B - closest_A;
+        // float dist = norm(ab);
+        // float3 normal;
+        // if ( dist < 1e-16f ) {
+        //     normal = edge_normal0;
+        //     ab = normal;
+        // }
+        // else {
+        //     normal = ab / -dist;
+        // }
+        //
+        // // layer
+        // int layer1 = obj_data[vertices_obj[e.x]].collision_layer;
+        // if ( layer1 == layer0 ) {
+        //     // float sign_new = dot(ab, cross(v1 - p0, E)) < 0.0f ? 1.0f : -1.0f;
+        //     float sign_new = dot(ab, edge_normal0) < 0.0f ? 1.0f : -1.0f;
+        //     sign *= sign_new;
+        //     if ( sign < 0.0f ) {
+        //         dist = -dist;
+        //         normal = -normal;
+        //     }
+        // }
+        // else {
+        //     bool reverse = false;
+        //     if ( layer0 < layer1 ) {
+        //         reverse = dot(normal, edge_normal0) > 0.0f;
+        //     }
+        //     else {
+        //         float3 edge_normal1 = edge_normals[eid2];
+        //         reverse = dot(normal, edge_normal1) < 0.0f;
+        //     }
+        //     if ( reverse ) {
+        //         normal = -normal;
+        //         dist = -dist;
+        //     }
+        // }
+        //
+        float thickness = thickness0 + obj_data[vertices_obj[e.x]].thickness;
+        // if ( dist > thickness ) continue;
+        float s, t;
+        float3 normal;
+        float pen;
+        if ( !compute_edge_edge_contact(
+            p0, p1, q0, q1,
+            thickness,
+            layer0 - obj_data[vertices_obj[e.x]].collision_layer,
+            sign, edge_normal0, edge_normals[eid2],
+            s, t, normal, pen)
+        ) {
             continue;
         }
-        // float3 ab = closest_B - closest_A;
-        float dist = norm(ab);
-        float3 normal;
-        if ( dist < 1e-16f ) {
-            normal = edge_normal0;
-            ab = normal;
-        }
-        else {
-            normal = ab / -dist;
-        }
-
-        // layer
-        int layer1 = obj_data[vertices_obj[e.x]].collision_layer;
-        if ( layer1 == layer0 ) {
-            // float sign_new = dot(ab, cross(v1 - p0, E)) < 0.0f ? 1.0f : -1.0f;
-            float sign_new = dot(ab, edge_normal0) < 0.0f ? 1.0f : -1.0f;
-            sign *= sign_new;
-            if ( sign < 0.0f ) {
-                dist = -dist;
-                normal = -normal;
-            }
-        }
-        else {
-            bool reverse = false;
-            if ( layer0 < layer1 ) {
-                reverse = dot(normal, edge_normal0) > 0.0f;
-            }
-            else {
-                float3 edge_normal1 = edge_normals[eid2];
-                reverse = dot(normal, edge_normal1) < 0.0f;
-            }
-            if ( reverse ) {
-                normal = -normal;
-                dist = -dist;
-            }
-        }
-
-        float thickness = thickness0 + obj_data[vertices_obj[e.x]].thickness;
-        if ( dist > thickness ) continue;
-
         float stiff = k * e1_stiff;
         if ( static_diags[e.x] > 0.f && static_diags[e.y] > 0.f ) {
             float e2_stiff = (static_diags[e.x] + static_diags[e.y]) * 0.5f;
@@ -439,9 +454,8 @@ static __global__ void compute_ee_force(
         else if ( e1_stiff <= 0.f ) continue;
 
         float3 force;
-        float diff = thickness - dist;
         if ( force_type == 0 ) {
-            float force_mag = stiff * diff;
+            float force_mag = stiff * pen;
             force = normal * force_mag;
             if ( Jx ) {
                 Mat3 hess = Mat3::outer_product(normal, normal) * stiff;
@@ -454,11 +468,11 @@ static __global__ void compute_ee_force(
             }
         }
         else {
-            float d = max(dist, thickness * 0.05f);
+            float d = max(thickness - pen, thickness * 0.05f);
             float d_ratio = d / thickness;
             float log_term = logf(d_ratio);
             log_term = min(log_term, 1e8f);
-            diff = thickness - d;
+            float diff = thickness - d;
 
             float E_prime = stiff * diff * (2.0f * log_term + 1.0f - 1.0f / d_ratio);
             force = log_term * E_prime * normal;

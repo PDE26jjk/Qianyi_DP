@@ -4,6 +4,7 @@
 #include "geometric_operator.cuh"
 #include "geometry.cuh"
 #include "contact/collision.cuh"
+#include "contact/collision_detection.cuh"
 #include "dynamics/bending.cuh"
 #include "dynamics/planar.cuh"
 
@@ -127,8 +128,7 @@ __global__ void xpbd_solve_springs_kernel(
     if ( denom <= 0.0f ) return;
 
     float3 ks = obj_data[vertices_obj[v0]].stretch;
-    const float youngs = 4e2;
-    const float ke = youngs * (ks.x + ks.y + ks.z) * 0.333f;
+    const float ke = base_spring_stiffness * (ks.x + ks.y + ks.z) * 0.333f;
     const float kd = damping;
     if ( ke <= 0.0f ) return;
 
@@ -389,38 +389,48 @@ __global__ void xpbd_solve_vf_contacts_kernel(
         const int i1 = tri.x, i2 = tri.y, i3 = tri.z;
 
         const float3 x1 = pos[i1], x2 = pos[i2], x3 = pos[i3];
-        const float3 v1 = vel[i1], v2 = vel[i2], v3 = vel[i3];
-        const float w1 = inv_mass[i1], w2 = inv_mass[i2], w3 = inv_mass[i3];
 
-        float3 normal = cross(x2 - x1, x3 - x1);
-        float normal_len = norm(normal);
-        if ( normal_len < 1e-8f ) continue;
-        normal = normal / normal_len;
-
-        int layer1 = obj_data[vertices_obj[i1]].collision_layer;
-        if ( layer1 == layer0 ) {
-            normal = normal * sign;
+        // float3 normal = cross(x2 - x1, x3 - x1);
+        // float normal_len = norm(normal);
+        // if ( normal_len < 1e-8f ) continue;
+        // normal = normal / normal_len;
+        //
+        // int layer1 = obj_data[vertices_obj[i1]].collision_layer;
+        // if ( layer1 == layer0 ) {
+        //     normal = normal * sign;
+        // }
+        // else if ( layer0 < layer1 ) {
+        //     if ( dot(normal, normal_v) > 0.0f ) normal = -normal;
+        // }
+        //
+        // float dist = dot(x0 - x1, normal);
+        // float thickness = thickness0 + obj_data[vertices_obj[i1]].thickness;
+        // if ( dist > thickness ) continue;
+        //
+        // float3 closest_pt = x0 - dist * normal;
+        // float u, v, w;
+        // barycentric(x1, x2, x3, closest_pt, u, v, w);
+        // if ( u < 0.0f || v < 0.0f || w < 0.0f ) continue;
+        float3 normal;
+        float u, v, w, pen;
+        if ( !compute_point_triangle_contact(
+            x0, x1, x2, x3,
+            thickness0 + obj_data[vertices_obj[i1]].thickness,
+            layer0 - obj_data[vertices_obj[i1]].collision_layer,
+            sign, normal_v,
+            normal, u, v, w, pen)
+        ) {
+            continue;
         }
-        else if ( layer0 < layer1 ) {
-            if ( dot(normal, normal_v) > 0.0f ) normal = -normal;
-        }
-
-        float dist = dot(x0 - x1, normal);
-        float thickness = thickness0 + obj_data[vertices_obj[i1]].thickness;
-        if ( dist > thickness ) continue;
-
-        float3 closest_pt = x0 - dist * normal;
-        float u, v, w;
-        barycentric(x1, x2, x3, closest_pt, u, v, w);
-        if ( u < 0.0f || v < 0.0f || w < 0.0f ) continue;
 
         // --- Normal constraint ---
-        float C_n = dist - thickness;                // negative when penetrating
+        float C_n = -pen;                // negative when penetrating
         float3 grad0_n = normal;
         float3 grad1_n = -u * normal;
         float3 grad2_n = -v * normal;
         float3 grad3_n = -w * normal;
 
+        const float w1 = inv_mass[i1], w2 = inv_mass[i2], w3 = inv_mass[i3];
         float denom_n = w0 + w1 * u * u + w2 * v * v + w3 * w * w;
         if ( denom_n <= 0.0f ) continue;
 
@@ -434,6 +444,7 @@ __global__ void xpbd_solve_vf_contacts_kernel(
         is_collided = true;
 
         // --- Tangential friction ---
+        const float3 v1 = vel[i1], v2 = vel[i2], v3 = vel[i3];
         float friction_mu = (friction_mu0 + obj_data[vertices_obj[i1]].friction) * 0.5f;
         float3 v_contact = v0 - (v1 * u + v2 * v + v3 * w);
         float3 vt = v_contact - normal * dot(v_contact, normal);
@@ -512,62 +523,72 @@ __global__ void xpbd_solve_ee_contacts_kernel(
         eid2 = abs(eid2);
         const int2 edge2 = edges[eid2];
         const int ic = edge2.x, id = edge2.y;
-
         const float3 q0 = pos[ic], q1 = pos[id];
-        const float3 vq0 = vel[ic], vq1 = vel[id];
-        const float wc = inv_mass[ic], wd = inv_mass[id];
 
-        float s, t;
-        float3 ab;
-        segment_segment_closest_robust(p0, p1, q0, q1, s, t, ab);
-        if ( s <= 0.0f || s >= 1.0f || t <= 0.0f || t >= 1.0f ) continue;
-
-        ab = -ab;
-        float dist = norm(ab);
-        float3 normal;
-        if ( dist < 1e-16f ) {
-            normal = edge_normal0;
-            ab = normal;
-        }
-        else {
-            normal = ab / dist;
-        }
-
-        // Original direction logic (exactly as in compute_ee_force)
-        int layer1 = obj_data[vertices_obj[ic]].collision_layer;
-        if ( layer1 == layer0 ) {
-            float sign_new = (dot(ab, edge_normal0) < 0.0f) ? 1.0f : -1.0f;
-            sign *= sign_new;
-            if ( sign < 0.0f ) {
-                dist = -dist;
-                normal = -normal;
-            }
-        }
-        else {
-            bool reverse = false;
-            if ( layer0 < layer1 ) {
-                reverse = (dot(normal, edge_normal0) > 0.0f);
-            }
-            else {
-                const float3 edge_normal1 = edge_normals[eid2];
-                reverse = (dot(normal, edge_normal1) < 0.0f);
-            }
-            if ( reverse ) {
-                normal = -normal;
-                dist = -dist;
-            }
-        }
+        // float s, t;
+        // float3 ab;
+        // segment_segment_closest_robust(p0, p1, q0, q1, s, t, ab);
+        // if ( s <= 0.0f || s >= 1.0f || t <= 0.0f || t >= 1.0f ) continue;
+        //
+        // ab = -ab;
+        // float dist = norm(ab);
+        // float3 normal;
+        // if ( dist < 1e-16f ) {
+        //     normal = edge_normal0;
+        //     ab = normal;
+        // }
+        // else {
+        //     normal = ab / dist;
+        // }
+        //
+        // // Original direction logic (exactly as in compute_ee_force)
+        // int layer1 = obj_data[vertices_obj[ic]].collision_layer;
+        // if ( layer1 == layer0 ) {
+        //     float sign_new = (dot(ab, edge_normal0) < 0.0f) ? 1.0f : -1.0f;
+        //     sign *= sign_new;
+        //     if ( sign < 0.0f ) {
+        //         dist = -dist;
+        //         normal = -normal;
+        //     }
+        // }
+        // else {
+        //     bool reverse = false;
+        //     if ( layer0 < layer1 ) {
+        //         reverse = (dot(normal, edge_normal0) > 0.0f);
+        //     }
+        //     else {
+        //         const float3 edge_normal1 = edge_normals[eid2];
+        //         reverse = (dot(normal, edge_normal1) < 0.0f);
+        //     }
+        //     if ( reverse ) {
+        //         normal = -normal;
+        //         dist = -dist;
+        //     }
+        // }
 
         float thickness = thickness0 + obj_data[vertices_obj[ic]].thickness;
-        if ( dist > thickness ) continue;
+        // if ( dist > thickness ) continue;
+        float s, t;
+        float3 normal;
+        float pen;
+        if ( !compute_edge_edge_contact(
+            p0, p1, q0, q1,
+            thickness,
+            layer0 - obj_data[vertices_obj[ic]].collision_layer,
+            sign, edge_normal0, edge_normals[eid2],
+            s, t, normal, pen)
+        ) {
+            continue;
+        }
 
         // --- Normal constraint ---
-        float C_n = dist - thickness;
+        float C_n = -pen;
         float3 grad_a = normal * (1.0f - s);
         float3 grad_b = normal * s;
         float3 grad_c = -normal * (1.0f - t);
         float3 grad_d = -normal * t;
 
+        const float wc = inv_mass[ic], wd = inv_mass[id];
         float denom_n = wa * (1.0f - s) * (1.0f - s) +
             wb * s * s +
             wc * (1.0f - t) * (1.0f - t) +
@@ -584,6 +605,7 @@ __global__ void xpbd_solve_ee_contacts_kernel(
         is_collided = true;
 
         // --- Tangential friction ---
+        const float3 vq0 = vel[ic], vq1 = vel[id];
         float friction_mu = (friction_mu0 + obj_data[vertices_obj[ic]].friction) * 0.5f;
         float3 v_contact_a = v0 * (1.0f - s) + v1 * s;
         float3 v_contact_b = vq0 * (1.0f - t) + vq1 * t;
@@ -699,7 +721,6 @@ void SolverXPBD::step(float h) {
 
     for ( int i = 0; i < iters; i++ ) {
         if ( constitutive_model_planar == 0 ) {
-
             n = params.nb_all_cloth_edges;
             xpbd_solve_springs_kernel<<<(n + block - 1) / block, block>>>(nullptr, dx,
                 q, v, mass_inv, edges,

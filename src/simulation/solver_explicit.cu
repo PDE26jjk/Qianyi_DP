@@ -147,7 +147,7 @@ void SolverExplicit::step(float h) {
     // }
 
     n = params.nb_all_cloth_edges;
-    compute_spring_forces<<<(n + block - 1) / block, block>>>(nullptr, nullptr,
+    accumulate_spring_forces<<<(n + block - 1) / block, block>>>(nullptr, nullptr,
         f, nullptr, q, edges,
         geo->edge_lengths.data().get(),
         geo->obj_data.data().get(), geo->vertices_obj.data().get(),

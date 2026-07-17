@@ -127,8 +127,8 @@ static __global__ void query_vf_pairs_capsule_kernel(
     const auto& od = &obj_data[vertices_obj[i]];
     float r_p = fmaxf(min_radius, od->thickness);
     AABB q_aabb = {
-        .min = fmin3(P0,P1) - r_p,
-        .max = fmax3(P0,P1) + r_p,
+        .min = fmin3(P0, P1) - r_p,
+        .max = fmax3(P0, P1) + r_p,
     };
 
     bool is_active = i < active_vertices_size;
@@ -193,7 +193,7 @@ static __global__ void query_ee_pairs_capsule_kernel(
     float3 p0 = pos[edge.x];
     float3 p1 = pos[edge.y];
     // float3 E = p1 - p0;
-    float3 N = edge_normals[i]; 
+    float3 N = edge_normals[i];
 
     const auto& od = &obj_data[vertices_obj[edge.x]];
     float r_e1_thick = fmaxf(min_radius, od->thickness);
@@ -203,7 +203,7 @@ static __global__ void query_ee_pairs_capsule_kernel(
     float3 B0 = p1, B1 = B0 + inertial_offset[edge.y];
     float3 E1_0_c = (A0 + B0) * 0.5f;
     float3 E1_1_c = (A1 + B1) * 0.5f;
-    
+
     float r_E1 = sqrtf(fmaxf(len_sq(A0 - E1_0_c), len_sq(A1 - E1_1_c))) + r_e1_thick;
     q_aabb.min = q_aabb.min - r_e1_thick;
     q_aabb.max = q_aabb.max + r_e1_thick;
@@ -265,4 +265,145 @@ static __global__ void query_ef_pairs_kernel(
         if (prim_idx == adj_tris.x || prim_idx == adj_tris.y ) continue;
         query_result[++query_count] = prim_idx;
         );
+}
+
+/**
+ * Evaluates point-triangle contact geometry.
+ *
+ * @param x0                   vertex position
+ * @param x1, x2, x3           triangle vertex positions
+ * @param combined_thickness   sum of vertex and triangle thickness (precomputed outside)
+ * @param layer_diff           layer0 - layer1 (0: same layer, negative: vertex layer is smaller)
+ * @param contact_side_sign    sign stored during broad phase, used only when layers are equal
+ *                             (+1 or -1, indicating which side was originally detected)
+ * @param vertex_normal        smoothed normal of the vertex (used when layer_diff < 0)
+ * @param normal               output: unit normal pointing towards the vertex
+ * @param u, v, w              output: barycentric coordinates of the closest point on the triangle
+ * @param penetration          output: positive value when penetrating (= combined_thickness - signed distance)
+ * @return                     true if a valid contact exists (barycentric coords inside triangle)
+ */
+__device__ inline bool compute_point_triangle_contact(
+    const float3 x0,
+    const float3 x1, const float3 x2, const float3 x3,
+    const float combined_thickness,
+    const int layer_diff,
+    const float contact_side_sign,
+    const float3 vertex_normal,
+    float3& normal,
+    float& u, float& v, float& w,
+    float& penetration
+) {
+    // Triangle normal
+    float3 tri_normal = cross(x2 - x1, x3 - x1);
+    float len = norm(tri_normal);
+    if ( len < 1e-8f )
+        return false;
+    tri_normal = tri_normal / len;
+
+    // Orient the normal to point towards the vertex
+    if ( layer_diff == 0 ) {
+        // Same layer: use the sign stored during broad phase detection
+        tri_normal = tri_normal * contact_side_sign;
+    }
+    else if ( layer_diff < 0 ) {
+        // Vertex layer is smaller: flip normal if it points away from the vertex
+        if ( dot(tri_normal, vertex_normal) > 0.0f ) {
+            tri_normal = -tri_normal;
+        }
+    }
+    // If layer_diff > 0, no adjustment is applied (preserving original behavior)
+
+    float dist = dot(x0 - x1, tri_normal);
+    float pen = combined_thickness - dist;
+    if ( pen <= 0.0f )
+        return false;
+
+    // Closest point and barycentric test
+    float3 closest = x0 - dist * tri_normal;
+    barycentric(x1, x2, x3, closest, u, v, w);
+    if ( u < 0.0f || v < 0.0f || w < 0.0f )
+        return false;
+
+    normal = tri_normal;
+    penetration = pen;
+    return true;
+}
+
+/**
+ * Evaluates edge-edge contact geometry.
+ *
+ * @param p0, p1               endpoints of the first edge
+ * @param q0, q1               endpoints of the second edge
+ * @param combined_thickness   sum of the thickness values of the two edges (precomputed)
+ * @param layer_diff           layer0 - layer1 (0: same, negative: edge0's layer < edge1's, positive: edge0's layer > edge1's)
+ * @param contact_side_sign    sign stored during broad phase (+1 or -1), used only when layers are equal
+ * @param edge_normal0         smoothed normal of the first edge
+ * @param edge_normal1         smoothed normal of the second edge (used only when layer_diff > 0)
+ * @param s, t                 output: closest-point parameters along the two edges
+ * @param normal               output: unit normal pointing towards the first edge (after sign/layer correction)
+ * @param penetration          output: positive value when penetrating (= combined_thickness - corrected distance)
+ * @return                     true if the contact lies strictly inside both segments and penetration > 0
+ */
+__device__ inline bool compute_edge_edge_contact(
+    const float3 p0, const float3 p1,
+    const float3 q0, const float3 q1,
+    const float combined_thickness,
+    const int layer_diff,
+    const float contact_side_sign,
+    const float3 edge_normal0,
+    const float3 edge_normal1,
+    float& s, float& t,
+    float3& normal,
+    float& penetration
+) {
+    float3 ab;
+    segment_segment_closest_robust(p0, p1, q0, q1, s, t, ab);
+
+    // Only interior contacts are valid
+    if ( s <= 0.0f || s >= 1.0f || t <= 0.0f || t >= 1.0f )
+        return false;
+
+    ab = -ab;  // vector from closest point on edge2 to closest point on edge1
+    float dist = norm(ab);
+
+    // Degenerate case: fall back to edge_normal0
+    if ( dist < 1e-16f ) {
+        normal = edge_normal0;
+        ab = normal;
+    }
+    else {
+        normal = ab / dist;
+    }
+
+    // Direction correction based on layer difference and broad-phase sign
+    if ( layer_diff == 0 ) {
+        // Same layer: use the sign stored during broad phase
+        float sign_new = (dot(ab, edge_normal0) < 0.0f) ? 1.0f : -1.0f;
+        sign_new *= contact_side_sign;
+        if ( sign_new < 0.0f ) {
+            dist = -dist;
+            normal = -normal;
+        }
+    }
+    else if ( layer_diff < 0 ) {
+        // edge0's layer is smaller
+        if ( dot(normal, edge_normal0) > 0.0f ) {
+            normal = -normal;
+            dist = -dist;
+        }
+    }
+    else { // layer_diff > 0
+        // edge0's layer is larger
+        if ( dot(normal, edge_normal1) < 0.0f ) {
+            normal = -normal;
+            dist = -dist;
+        }
+    }
+
+    float pen = combined_thickness - dist;
+    if ( pen <= 0.0f )
+        return false;
+
+    penetration = pen;
+    return true;
 }
