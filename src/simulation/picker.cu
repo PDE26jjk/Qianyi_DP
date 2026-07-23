@@ -95,8 +95,7 @@ static __global__ void triangles_query_points(
                     int p_idx = table[h].point_indices[k];
                     float3 pos = points[p_idx].second;
 
-                    float3 closest_pt;
-                    float dist_sq = point_triangle_sq_dist(pos, v0, v1, v2, &closest_pt);
+                    float dist_sq = dist_sq_point_triangle_3d(pos, v0, v1, v2);
 
                     if ( dist_sq < query_dist_sq ) {
                         if ( dist_sq < results[p_idx].min_dist_sq ) {

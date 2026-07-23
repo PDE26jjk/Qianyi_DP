@@ -289,6 +289,7 @@ void SolverPDNewton::step(float h) {
     float3* q_inertia = geo->pos_inertia.data().get();
     float3* q_tr = geo->pos_inertia.data().get();
     float3* v = geo->velocities.data().get();
+    float3* v_prev = geo->vel_prev.data().get();
     float3* f = geo->forces.data().get();
     float3* dx = this->dx.data().get();
     int2* edges = geo->edges.data().get();
@@ -309,8 +310,8 @@ void SolverPDNewton::step(float h) {
     cudaMemcpyAsync(static_diags, Jx_diag_pd, n * sizeof(float), cudaMemcpyDeviceToDevice);
     float mask_stiff = max(0.f, get_global_parameter("mask_stiff", 1e2f));
     forward_step<<<(n + block - 1) / block, block>>>(
-        q, v, mass_inv, nullptr,
-        mask, q_inertia, dx, static_diags, h, mask_stiff, geo->gravity, n);
+        v, v_prev, mass_inv, nullptr, mask,
+        q, q_inertia, dx, static_diags, h, mask_stiff, geo->gravity, true, n);
     int iters = max(1, (int)get_global_parameter("pd_iters", 10));
     int linear_iters = max(1, (int)get_global_parameter("linear_iters", 10));
     int subspace_iters = max(0, (int)get_global_parameter("subspace_iters", 1));
@@ -380,6 +381,7 @@ void SolverPDNewton::step(float h) {
         // CUDA_CHECK(cudaDeviceSynchronize());
     }
     n = params.nb_all_vertices;
+    cudaMemcpyAsync(v_prev, v, n * sizeof(float3), cudaMemcpyDeviceToDevice);
     step_end_kernel<<<(n + block - 1) / block, block>>>(
         q, v, q_prev, mask, obj_data, vertices_obj, h, max_vel, geo->ground, ground_f, n);
     // CUDA_CHECK(cudaDeviceSynchronize());

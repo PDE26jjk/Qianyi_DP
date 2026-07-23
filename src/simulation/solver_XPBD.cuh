@@ -11,4 +11,5 @@ struct SolverXPBD : SolverBase {
     void step(float h) override;
 private:
     thrust::device_vector<float3> delta;
+    thrust::device_vector<float> lambdas;
 };

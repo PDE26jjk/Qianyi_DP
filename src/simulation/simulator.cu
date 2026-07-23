@@ -86,6 +86,7 @@ void Simulator::init(const GeoDataInput& geo
 
 void Simulator::update(float h) {
     dt = h;
+    frame += 1;
     m_geo->update_for_frame();
     m_geo->collision_detect();
 
@@ -107,7 +108,6 @@ void Simulator::update(float h) {
         m_solver->step(step_h);
     }
     m_geo->end_for_frame();
-    frame += 1;
 }
 
 const SimulatorParams* Simulator::get_geo_params() const {

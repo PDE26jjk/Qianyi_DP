@@ -17,6 +17,8 @@ struct Contact {
     void refit_bvh();
     void refit_bvh(const float3* pos, const float3* offset);
     void accumulate_contact_force(float3* forces, Mat3* Jx_diag);
+    void ccd_truncation_traverse_bvh(const float3* pos_prev, const float3* pos_target);
+    void check_truncation_traverse_bvh(const float3* pos_prev, float3* pos_target);
     // // contact
     // uint32_t point_hash_table_size;
     // uint32_t edge_hash_table_size;
@@ -72,8 +74,11 @@ struct Contact {
 
     thrust::device_vector<unsigned int> point_sorted_indices;
     thrust::device_vector<unsigned int> edge_sorted_indices;
+    thrust::device_vector<unsigned int> edge_sorted_rank;
     
     thrust::device_vector<int> broad_phase_ee;
     thrust::device_vector<int> broad_phase_ef;
     thrust::device_vector<int> broad_phase_vf;
+    
+    thrust::device_vector<float> truncation_t;
 };

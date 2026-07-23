@@ -1,4 +1,6 @@
 ﻿#pragma once
+// Deprecated, just a backup
+
 #include "common/cuda_utils.h"
 #include "common/atomic_utils.cuh"
 #include "collision_type.cuh"

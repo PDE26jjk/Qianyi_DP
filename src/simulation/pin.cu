@@ -65,7 +65,7 @@ static __global__ void compute_attach_info_kernel(
     attach_data[vert_idx] = info;
 }
 void Geometry::init_pin() {
-    thrust::transform(thrust::device, thrust::make_counting_iterator(0),
+    thrust::transform(thrust::cuda::par_nosync, thrust::make_counting_iterator(0),
         thrust::make_counting_iterator(params.nb_all_cloth_vertices),
         vertices_mask.begin(), [
             pin_attached = thrust::raw_pointer_cast(pin_attached.data()),
@@ -101,7 +101,8 @@ void Geometry::init_pin() {
         lbvh3d::initialize(num_obstacle_triangles);
         lbvh3d::build_face_bvh(pos_world, obstacle_faces, obstacle_bvh);
         thrust::device_vector<float3> attached_verts_world(num_attached);
-        thrust::gather(thrust::device, attached_indices.begin(), attached_indices.end(), pos_world.begin(),
+        thrust::gather(thrust::cuda::par_nosync, attached_indices.begin(),
+            attached_indices.end(), pos_world.begin(),
             attached_verts_world.begin());
 
         thrust::device_vector<int> nearest_obstacle_faces(num_attached);
@@ -118,7 +119,7 @@ void Geometry::init_pin() {
             thrust::raw_pointer_cast(obstacle_faces.data()),
             thrust::raw_pointer_cast(nearest_obstacle_faces.data())
             );
-        thrust::transform(thrust::device, nearest_obstacle_faces.begin(), nearest_obstacle_faces.end(),
+        thrust::transform(thrust::cuda::par_nosync, nearest_obstacle_faces.begin(), nearest_obstacle_faces.end(),
             nearest_obstacle_faces.begin(),
             [offset = params.nb_all_cloth_triangles] __device__ (unsigned int local_idx) {
                 return local_idx + offset;

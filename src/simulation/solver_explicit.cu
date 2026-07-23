@@ -121,11 +121,11 @@ void SolverExplicit::step(float h) {
     cudaMemsetAsync(f, 0, params.nb_all_cloth_vertices * sizeof(float3));
 
     forward_step<<<(n + block - 1) / block, block>>>(
-        q, v, mass_inv,
+        nullptr, v, mass_inv,
         nullptr,
-        mask, q_inertia, nullptr,
+        mask, q_inertia, nullptr,q,
         static_diags,
-        h, 1e2, geo->gravity, n);
+        h, 1e2, geo->gravity,false, n);
     // n = pp_result_size_h;
     // compute_collision_penalty_force_point_point<<<(n + block - 1) / block, block>>>(
     //     nullptr, nullptr,

@@ -1,4 +1,6 @@
 ﻿#pragma once
+// Deprecated, just a backup
+#include "common/cuda_utils.h"
 
 #define MAX_POINTS_PER_CELL 7
 struct PointHashCell {
@@ -42,3 +44,9 @@ struct UnifiedNormalConstraint {
     int color;
     Mat3 H;
 };
+
+static __device__ __forceinline__ int get_hash(int3 p, int table_size) {
+    long long h = (p.x * 73856093LL) ^ (p.y * 19349663LL) ^ (p.z * 83492791LL);
+    // Use unsigned modulo arithmetic
+    return (int)(abs(h) % table_size);
+}

@@ -33,6 +33,7 @@ struct Storage {
     thrust::device_vector<unsigned int> child_count;
     // Scene bounds: [min_x, min_y, min_z, max_x, max_y, max_z]
     thrust::device_vector<float> scene_bounds;
+    ~Storage() {} // TODO
 };
 static Storage* inst = nullptr;
 inline Storage& instance() {
@@ -43,22 +44,7 @@ inline Storage& instance() {
 }
 }
 
-//==============================================================================
-// Helper Functors for Thrust
-//==============================================================================
-struct float3_min {
-    __host__ __device__ float3 operator()(const float3& a, const float3& b) const {
-        return make_float3(fminf(a.x, b.x), fminf(a.y, b.y), fminf(a.z, b.z));
-    }
-};
-struct float3_max {
-    __host__ __device__ float3 operator()(const float3& a, const float3& b) const {
-        return make_float3(fmaxf(a.x, b.x), fmaxf(a.y, b.y), fmaxf(a.z, b.z));
-    }
-};
-//==============================================================================
 // Morton Code 3D (10 bits per axis → 30-bit code, shifted left by 2 to fill 32 bits)
-//==============================================================================
 __device__ __host__ unsigned int expand_bits_3d(unsigned int v) {
     v &= 0x000003FF;
     v = (v | (v << 16)) & 0x030000FF;
@@ -70,9 +56,7 @@ __device__ __host__ unsigned int expand_bits_3d(unsigned int v) {
 __device__ __host__ __forceinline__ unsigned int morton_code_3d(unsigned int x, unsigned int y, unsigned int z) {
     return (expand_bits_3d(z) << 2) | (expand_bits_3d(y) << 1) | expand_bits_3d(x);
 }
-//==============================================================================
-// Kernels
-//==============================================================================
+
 // Centroid Calculations (Writing to float3)
 __global__ void compute_face_centroids_kernel(const float3* vertices, const int3* faces,
     unsigned int n, float3* centroids) {
@@ -392,6 +376,19 @@ void cleanup() {
     s.child_count.clear();
     s.scene_bounds.clear();
 }
+
+// Helper Functors for Thrust
+struct float3_min {
+    __host__ __device__ float3 operator()(const float3& a, const float3& b) const {
+        return fmin3(a, b);
+    }
+};
+struct float3_max {
+    __host__ __device__ float3 operator()(const float3& a, const float3& b) const {
+        return fmax3(a, b);
+    }
+};
+
 void compute_bounds(const float3* points, unsigned int n, float3& min_res, float3& max_res) {
     float3 init_min = make_float3(FLT_MAX, FLT_MAX, FLT_MAX);
     float3 init_max = make_float3(-FLT_MAX, -FLT_MAX, -FLT_MAX);
@@ -514,6 +511,7 @@ void build_bvh_internal(BVH3D& bvh, unsigned int n) {
     // thrust::inclusive_scan(counts.begin(), counts.begin() + num_levels, bvh.level_offsets.begin() + 1);
 }
 
+
 __global__ void refit_face_bvh_kernel(
     const float3* vertices, const float3* additional_offset,
     const int3* faces,
@@ -542,38 +540,39 @@ __global__ void refit_face_bvh_kernel(
     }
 
     // Step 2: Bottom-up refit — walk toward root
-    unsigned int index = i;
-    for ( ;; ) {
-        unsigned int p = parent[index];
-        // Reached root (parent points to self) or no parent
-        if ( p == index || p == UINT_MAX ) return;
-
-        // Ensure our AABB write is visible before signaling completion
-        __threadfence();
-
-        unsigned int finished = atomicAdd(&child_count[p], 1);
-
-        if ( finished == 1 ) {
-            // Both children complete — merge their AABBs into parent
-            int2 node = nodes[p];
-            unsigned int lc = node.x - 1;
-            unsigned int rc = node.y - 1;
-            AABB3D a = aabbs[lc];
-            AABB3D b = aabbs[rc];
-            aabbs[p].min = make_float3(fminf(a.min.x, b.min.x),
-                fminf(a.min.y, b.min.y),
-                fminf(a.min.z, b.min.z));
-            aabbs[p].max = make_float3(fmaxf(a.max.x, b.max.x),
-                fmaxf(a.max.y, b.max.y),
-                fmaxf(a.max.z, b.max.z));
-            // Continue up the tree
-            index = p;
-        }
-        else {
-            // First child done — sibling will merge, terminate this thread
-            break;
-        }
-    }
+    // unsigned int index = i;
+    // for ( ;; ) {
+    //     unsigned int p = parent[index];
+    //     // Reached root (parent points to self) or no parent
+    //     if ( p == index || p == UINT_MAX ) return;
+    //
+    //     // Ensure our AABB write is visible before signaling completion
+    //     __threadfence();
+    //
+    //     unsigned int finished = atomicAdd(&child_count[p], 1);
+    //
+    //     if ( finished == 1 ) {
+    //         // Both children complete — merge their AABBs into parent
+    //         int2 node = nodes[p];
+    //         unsigned int lc = node.x - 1;
+    //         unsigned int rc = node.y - 1;
+    //         AABB3D a = aabbs[lc];
+    //         AABB3D b = aabbs[rc];
+    //         aabbs[p].min = make_float3(fminf(a.min.x, b.min.x),
+    //             fminf(a.min.y, b.min.y),
+    //             fminf(a.min.z, b.min.z));
+    //         aabbs[p].max = make_float3(fmaxf(a.max.x, b.max.x),
+    //             fmaxf(a.max.y, b.max.y),
+    //             fmaxf(a.max.z, b.max.z));
+    //         // Continue up the tree
+    //         index = p;
+    //     }
+    //     else {
+    //         // First child done — sibling will merge, terminate this thread
+    //         break;
+    //     }
+    // }
+    bottom_up_refit(i, nodes, parent, child_count, aabbs);
 }
 
 __global__ void refit_edge_bvh_kernel(
@@ -598,36 +597,38 @@ __global__ void refit_edge_bvh_kernel(
     if ( additional_offset ) {
         v0 += additional_offset[e.x];
         v1 += additional_offset[e.y];
-        aabbs[i].min = fmin3(v0, aabbs[i].min);
-        aabbs[i].max = fmax3(v0, aabbs[i].max);
+        aabbs[i].min = fmin3(v1, fmin3(v0, aabbs[i].min));
+        aabbs[i].max = fmax3(v1, fmax3(v0, aabbs[i].max));
     }
 
     // Bottom-up refit
-    unsigned int index = i;
-    for ( ;; ) {
-        unsigned int p = parent[index];
-        if ( p == index || p == UINT_MAX ) return;
-        __threadfence();
-        unsigned int finished = atomicAdd(&child_count[p], 1);
-        if ( finished == 1 ) {
-            int2 node = nodes[p];
-            unsigned int lc = node.x - 1;
-            unsigned int rc = node.y - 1;
-            AABB3D a = aabbs[lc];
-            AABB3D b = aabbs[rc];
-            aabbs[p].min = make_float3(fminf(a.min.x, b.min.x),
-                fminf(a.min.y, b.min.y),
-                fminf(a.min.z, b.min.z));
-            aabbs[p].max = make_float3(fmaxf(a.max.x, b.max.x),
-                fmaxf(a.max.y, b.max.y),
-                fmaxf(a.max.z, b.max.z));
-            index = p;
-        }
-        else {
-            break;
-        }
-    }
+    // unsigned int index = i;
+    // for ( ;; ) {
+    //     unsigned int p = parent[index];
+    //     if ( p == index || p == UINT_MAX ) return;
+    //     __threadfence();
+    //     unsigned int finished = atomicAdd(&child_count[p], 1);
+    //     if ( finished == 1 ) {
+    //         int2 node = nodes[p];
+    //         unsigned int lc = node.x - 1;
+    //         unsigned int rc = node.y - 1;
+    //         AABB3D a = aabbs[lc];
+    //         AABB3D b = aabbs[rc];
+    //         aabbs[p].min = make_float3(fminf(a.min.x, b.min.x),
+    //             fminf(a.min.y, b.min.y),
+    //             fminf(a.min.z, b.min.z));
+    //         aabbs[p].max = make_float3(fmaxf(a.max.x, b.max.x),
+    //             fmaxf(a.max.y, b.max.y),
+    //             fmaxf(a.max.z, b.max.z));
+    //         index = p;
+    //     }
+    //     else {
+    //         break;
+    //     }
+    // }
+    bottom_up_refit(i, nodes, parent, child_count, aabbs);
 }
+
 // Public Build Functions
 void build_face_bvh(const thrust::device_vector<float3>& vertices,
     const thrust::device_vector<int3>& faces, BVH3D& bvh, const float3* additional_offset) {
@@ -658,7 +659,8 @@ void build_face_bvh(const thrust::device_vector<float3>& vertices,
     // }
     unsigned int num_nodes = 2 * n - 1;
     // Zero child_count for refit synchronization
-    thrust::fill(s.child_count.begin(), s.child_count.begin() + num_nodes, 0u);
+    cudaMemsetAsync(s.child_count.data().get(), 0, num_nodes * sizeof(unsigned int));
+    // thrust::fill(s.child_count.begin(), s.child_count.begin() + num_nodes, 0u);
 
     // Single-kernel bottom-up refit (replaces leaf AABB + level-by-level merge)
     refit_face_bvh_kernel<<<blocks, 256>>>(
@@ -677,7 +679,8 @@ void refit_face_bvh(const float3* vertices, const thrust::device_vector<int3>& f
 
     unsigned int num_nodes = 2 * n - 1;
     // Zero child_count for refit synchronization
-    thrust::fill(s.child_count.begin(), s.child_count.begin() + num_nodes, 0u);
+    cudaMemsetAsync(s.child_count.data().get(), 0, num_nodes * sizeof(unsigned int));
+    // thrust::fill(s.child_count.begin(), s.child_count.begin() + num_nodes, 0u);
 
     // Single-kernel bottom-up refit (replaces leaf AABB + level-by-level merge)
     refit_face_bvh_kernel<<<blocks, 256>>>(
@@ -741,7 +744,6 @@ void refit_edge_bvh(const float3* vertices, const thrust::device_vector<int2>& e
         thrust::raw_pointer_cast(bvh.parent.data()),
         thrust::raw_pointer_cast(s.child_count.data()),
         thrust::raw_pointer_cast(bvh.aabbs.data()));
-    CUDA_CHECK(cudaDeviceSynchronize());
 }
 // void build_point_bvh(const thrust::device_vector<float3>& vertices, BVH3D& bvh) {
 //     unsigned int n = vertices.size();

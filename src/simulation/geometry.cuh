@@ -67,6 +67,7 @@ public:
     thrust::device_vector<float> areas;
     thrust::device_vector<float3> pos_inertia;
     thrust::device_vector<float3> pos_world;
+    thrust::device_vector<float3> pos_temp;
     thrust::device_vector<float3> pos_step_prev;
     thrust::device_vector<float3> pos_interpolation_old;
     thrust::device_vector<float3> pos_interpolation_new;
@@ -76,6 +77,7 @@ public:
     thrust::device_vector<float> edge_lengths;
     thrust::device_vector<float> static_diags;
     thrust::device_vector<float3> velocities;
+    thrust::device_vector<float3> vel_prev;
     thrust::device_vector<char> vertices_mask;
 
     // sewing
@@ -214,16 +216,18 @@ private:
     thrust::device_vector<char> temp_mem;
 };
 __global__ void forward_step(
-    const float3* __restrict__ pos,
     const float3* __restrict__ vel,
+    const float3* __restrict__ vel_prev,
     const float* __restrict__ inv_mass,
     const float3* __restrict__ external_force,
     const char* __restrict__ mask,
+    float3* __restrict__ pos,
     float3* __restrict__ inertia_out,
     float3* __restrict__ dx,
     float* __restrict__ static_diags,
     float dt,
     float mask_stiff,
     float3 gravity,
+    bool warm_start,
     int num_vertices
 );

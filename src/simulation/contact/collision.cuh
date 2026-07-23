@@ -470,9 +470,9 @@ static __global__ void edges_query_edges_via_point_hash(
 
                         // 4. 计算 边-边 最短距离
                         float s, t; // 线段参数
-                        float3 closest_A, closest_B;
-
-                        float dist_sq = edge_edge_dist_sq(v0, v1, v2, v3, closest_A, closest_B, s, t);
+                        float3 ba;
+                        segment_segment_closest_robust(v0,v1, v2, v3,s,t, ba);
+                        float dist_sq = len_sq(ba);
                         if ( s < 0.0f || s > 1.0f || t < 0.0f || t > 1.0f ) {
                             continue;
                         }
@@ -484,7 +484,7 @@ static __global__ void edges_query_edges_via_point_hash(
                             // 如果只是静态干涉：
                             if ( dist_sq > 1e-8f ) {
                                 float d = sqrtf(dist_sq);
-                                normal = (closest_A - closest_B) * (1.0f / d);
+                                normal = ba * (1.0f / d);
                             }
                             else continue;
 

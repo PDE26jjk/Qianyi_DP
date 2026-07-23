@@ -19,12 +19,20 @@ void SolverVBD::init() {
     auto& params = *simulator->get_geo_params();
     displacement.resize(params.nb_all_vertices);
     hessians.resize(params.nb_all_vertices);
+    geo->pos_temp.resize(params.nb_all_vertices);
+
+    vf_lambdas.resize(params.nb_all_vertices * broad_phase_size);
+    vf_penalties.resize(params.nb_all_vertices * broad_phase_size);
+    ee_lambdas.resize(params.nb_all_edges * broad_phase_size);
+    ee_penalties.resize(params.nb_all_edges * broad_phase_size);
+    ground_lambdas.resize(params.nb_all_vertices);
 }
 
 
 static __global__ void step_end_kernel(
     float3* __restrict__ velocities,
-    const float3* __restrict__ vertices_world,
+    float3* __restrict__ pos_world,
+    const float* __restrict__ truncation_ts,
     const float3* __restrict__ pos_prev,
     const char* __restrict__ vertices_mask,
     const float h,
@@ -34,7 +42,11 @@ static __global__ void step_end_kernel(
     for ( int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
           i += blockDim.x * gridDim.x ) {
         if ( !vertices_mask[i] ) {
-            float3 v = (vertices_world[i] - pos_prev[i]) / h;
+            float3 dx = pos_world[i] - pos_prev[i];
+            if ( truncation_ts )
+                dx *= truncation_ts[i];
+            pos_world[i] = pos_prev[i] + dx;
+            float3 v = dx / h;
             if ( norm(v) > max_velocity )
                 v = normalized(v) * max_velocity;
             v = v * expf(-h * 0.5f);
@@ -61,8 +73,10 @@ __device__ void block_reduce_sum(TYPE& val) {
 template<int BLOCK_SIZE>
 __global__ void solve_elasticity_springs_kernel(
     float3* __restrict__ dx,
-    const float3* __restrict__ pos_prev,
     const float3* __restrict__ pos,
+    float3* __restrict__ particle_forces,
+    Mat3* __restrict__ particle_hessians,
+    const float3* __restrict__ pos_prev,
     const float* __restrict__ inv_mass,
     const float* __restrict__ static_diags,
     const float3* __restrict__ inertia,
@@ -72,8 +86,6 @@ __global__ void solve_elasticity_springs_kernel(
     const float* __restrict__ edge_rest_lengths,
     const int2* __restrict__ edge_lookup,
     const int2* __restrict__ dir_edges,
-    const float3* __restrict__ particle_forces,
-    const Mat3* __restrict__ particle_hessians,
     const int* __restrict__ color_groups,
     const float kd,// damping
     float dt,
@@ -128,12 +140,45 @@ __global__ void solve_elasticity_springs_kernel(
         float sd = static_diags[pid];
         // ---------- add mass, inertia and external contributions ----------
         H_total.add_diag(sd);               // H += m/dt² I
-        H_total += particle_hessians[pid];
+        // // H_total += particle_hessians[pid];
+        //
+        float3 rhs = f_total + (inertia[pid] - pos[pid]) * sd;
+        // // + particle_forces[pid];
+        // float3 delta = H_total.inverse() * rhs;
+        // pos[pid] += delta;
+        // dx[pid] = pos[pid] - pos_prev[pid];
+        particle_hessians[pid] += H_total;
+        particle_forces[pid] += rhs;
+    }
+}
+__device__ void evaluate_self_contact_force_norm(
+    float penetration_depth, float collision_radius, float k, float& dEdD, float& d2E_dDdD) {
+    // Penetration depth (not used in all branches but kept for clarity)
+    float dis = collision_radius - penetration_depth;
 
-        float3 rhs = f_total + (inertia[pid] - pos[pid]) * sd
-            + particle_forces[pid];
-        float3 delta = H_total.inverse() * rhs;
-        dx[pid] = delta;
+    // C2 continuous barrier parameters
+    float tau = collision_radius * 0.5f;
+    dis = max(dis, tau);
+    const float d_min = 1.0e-5f;
+
+    if ( tau > dis && dis > d_min ) {
+        // Log-barrier region: E ∝ -ln(dis)
+        float k2 = tau * tau * k;
+        dEdD = -k2 / dis;
+        d2E_dDdD = k2 / (dis * dis);
+    }
+    else if ( dis <= d_min ) {
+        // Quadratic extension below d_min (Taylor expansion of the log-barrier at d_min)
+        // Preserves C2 continuity: constant Hessian, linear gradient
+        float k2 = tau * tau * k;
+        float d_min_sq = d_min * d_min;
+        dEdD = k2 * (dis - 2.0f * d_min) / d_min_sq;
+        d2E_dDdD = k2 / d_min_sq;
+    }
+    else {
+        // Outside barrier region: standard penalty force
+        dEdD = -k * penetration_depth;
+        d2E_dDdD = k;
     }
 }
 constexpr int kNumThreadsPerPrimitive = 4;
@@ -222,7 +267,20 @@ __global__ void vbd_self_contact_kernel(
             float fmag = ee_force_k * pen;
             float3 force = normal * fmag;
             Mat3 hess = Mat3::outer_product(normal, normal * ee_force_k);
+            // float dEdD, d2E_dDdD;
+            // evaluate_self_contact_force_norm(pen, comb_thick,
+            //     ee_force_k, dEdD, d2E_dDdD);
+            // // float max_stiffness = 1.0e5f;
+            // // d2E_dDdD = fminf(d2E_dDdD, max_stiffness);
+            // // float fmag = ee_force_k * pen;
+            // float3 force = normal * -dEdD;
+            // Mat3 hess = Mat3::outer_product(normal, normal * d2E_dDdD);
             if ( v1 < active_vertices_size ) {
+                if ( e1 == 7 ) {
+                    printf("[DEBUG] e2=%d, pen=%f, dEdD=%e,d2E_dDdD=%e, normal=(%f, %f, %f), force=(%f, %f, %f)\n",
+                        e2_raw, pen, -fmag, ee_force_k, normal.x, normal.y, normal.z,
+                        force.x, force.y, force.z);
+                }
                 if ( c1 == current_color ) {
                     float w = 1.0f - s;
                     atomicAddFloat3(&particle_forces[v1], force * w);
@@ -297,6 +355,12 @@ __global__ void vbd_self_contact_kernel(
             float fmag = vf_force_k * pen;
             float3 force = normal * fmag;
             Mat3 hess = Mat3::outer_product(normal, normal * vf_force_k);
+            // float dEdD, d2E_dDdD;
+            // evaluate_self_contact_force_norm(
+            //     pen, combined_thickness, vf_force_k,
+            //     dEdD, d2E_dDdD);
+            // float3 force = normal * dEdD;
+            // Mat3 hess = Mat3::outer_product(normal, normal * d2E_dDdD);
 
             // Accumulate per vertex, only for those belonging to current_color
             if ( v_idx < active_vertices_size && cv == current_color ) {
@@ -346,10 +410,13 @@ __global__ void add_ground_contact(
     }
 }
 
-__global__ void apply_truncation_ts_kernel(
+__global__ void apply_force_color_kernel(
     float3* __restrict__ pos,
-    const float3* __restrict__ dx,
-    const float* __restrict__ truncation_ts,
+    const float3* __restrict__ pos_prev,
+    const float* __restrict__ static_diags,
+    const float3* __restrict__ particle_forces,
+    const Mat3* __restrict__ particle_hessians,
+    const char* __restrict__ vertices_mask,
     float max_displacement,
     const int* __restrict__ color_groups,
     int color_groups_size
@@ -357,6 +424,54 @@ __global__ void apply_truncation_ts_kernel(
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if ( i >= color_groups_size ) return;
     int vid = color_groups[i];
+    if ( vertices_mask[vid] ) return;
+    Mat3 hess = particle_hessians[vid];
+    // hess.add_diag(static_diags[vid]);
+
+    float3 disp = hess.inverse() * particle_forces[vid];
+
+    float len2 = dot(disp, disp);
+    if ( len2 > max_displacement * max_displacement ) {
+        disp = disp * (max_displacement / sqrtf(len2));
+    }
+    float3 ori_disp = pos[vid] - pos_prev[vid];
+    pos[vid] += disp;
+    if ( vid == 7 ) {
+        if ( len_sq(particle_forces[vid]) < 1e-6f ) {
+            printf("[vid=7] disp=0............\n");
+            return;
+        }
+        printf("====================================================\n");
+        printf("[vid=7] disp=(%e,%e,%e), ori_disp=(%e,%e,%e)\n",
+            disp.x, disp.y, disp.z,
+            ori_disp.x, ori_disp.y, ori_disp.z);
+        printf("  force=(%e,%e,%e)\n",
+            particle_forces[vid].x, particle_forces[vid].y, particle_forces[vid].z);
+        printf("  Hessian:\n");
+        printf("    (%e,%e,%e)\n", hess.r[0].x, hess.r[0].y, hess.r[0].z);
+        printf("    (%e,%e,%e)\n", hess.r[1].x, hess.r[1].y, hess.r[1].z);
+        printf("    (%e,%e,%e)\n", hess.r[2].x, hess.r[2].y, hess.r[2].z);
+        printf("  static_diags[7]=%e, max_displacement=%e\n",
+            static_diags[vid], max_displacement);
+        printf("  pos_prev=(%e,%e,%e), new_pos=(%e,%e,%e)\n",
+            pos_prev[vid].x, pos_prev[vid].y, pos_prev[vid].z,
+            pos[vid].x, pos[vid].y, pos[vid].z);
+    }
+}
+__global__ void apply_truncation_ts_color_kernel(
+    float3* __restrict__ pos,
+    const float3* __restrict__ pos_saved,
+    const float3* __restrict__ dx,
+    const float* __restrict__ truncation_ts,
+    const char* __restrict__ vertices_mask,
+    float max_displacement,
+    const int* __restrict__ color_groups,
+    int color_groups_size
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if ( i >= color_groups_size ) return;
+    int vid = color_groups[i];
+    if ( vertices_mask[vid] ) return;
     float t = truncation_ts ? truncation_ts[vid] : 1.f;
     float3 disp = dx[vid] * t;
 
@@ -364,7 +479,8 @@ __global__ void apply_truncation_ts_kernel(
     if ( len2 > max_displacement * max_displacement ) {
         disp = disp * (max_displacement / sqrtf(len2));
     }
-    pos[vid] = pos[vid] + disp;
+    pos[vid] = pos_saved[vid] + disp;
+    // pos_saved[vid] = pos[vid];
 }
 
 // A. H. Chen, Z. Liu, Y. Yang, and C. Yuksel, "Vertex Block Descent," ACM Trans. Graph. 43, 4, Article 116 (July 2024), 16 pages.
@@ -382,10 +498,12 @@ void SolverVBD::step(float h) {
     int block = 256;
 
     float3* q = geo->pos_world.data().get();
+    float3* q_saved = geo->pos_temp.data().get();
     const float3* q_prev = geo->pos_step_prev.data().get();
     float3* q_inertia = geo->pos_inertia.data().get();
     float3* dx = this->displacement.data().get();
     float3* v = geo->velocities.data().get();
+    float3* v_prev = geo->vel_prev.data().get();
     float3* f = geo->forces.data().get();
     Mat3* Jx_diag = this->hessians.data().get();
     int2* edges = geo->edges.data().get();
@@ -398,15 +516,17 @@ void SolverVBD::step(float h) {
     int* vertices_obj = geo->vertices_obj.data().get();
     float* static_diags = geo->static_diags.data().get();
     float max_vel = max(0.f, get_global_parameter("max_vel", 1000));
+    auto& contact = geo->get_contact();
+    float* truncation_t = contact.truncation_t.data().get();
 
     cudaMemsetAsync(static_diags, 0, params.nb_all_vertices * sizeof(float));
 
     forward_step<<<(n + block - 1) / block, block>>>(
-        q, v, mass_inv,
+        v_prev, v, mass_inv,
         nullptr,
-        mask, q_inertia, nullptr,
+        mask, q, q_inertia, nullptr,
         static_diags,
-        h, 1e2, geo->gravity, n);
+        h, 1e2, geo->gravity, true, n);
 
     int iters = max(1, (int)get_global_parameter("vbd_iters", 10));
     float damping = max(0.f, get_global_parameter("vbd_damping", 0.f));
@@ -419,10 +539,11 @@ void SolverVBD::step(float h) {
     int num_colors = geo->h_colors_index_offsets.size() - 1;
     int* color_groups = geo->color_groups.data().get();
     constexpr int dynamics_block_size = 8;
-    auto& contact = geo->get_contact();
-    cudaMemcpyAsync(q, q_inertia,
-        active_vertices_size * sizeof(float3), cudaMemcpyDeviceToDevice);
+    // cudaMemcpyAsync(q, q_inertia,
+    //     active_vertices_size * sizeof(float3), cudaMemcpyDeviceToDevice);
     for ( int i = 0; i < iters; i++ ) {
+        cudaMemcpyAsync(q_saved, q,
+            num_vertices * sizeof(float3), cudaMemcpyDeviceToDevice);//todo use swap
         cudaMemsetAsync(f, 0, active_vertices_size * sizeof(float3));
         cudaMemsetAsync(Jx_diag, 0, active_vertices_size * sizeof(Mat3));
         cudaMemsetAsync(dx, 0, active_vertices_size * sizeof(float3));
@@ -431,9 +552,23 @@ void SolverVBD::step(float h) {
             int color_size = geo->h_colors_index_offsets[c + 1] - color_index;
             int total_threads = kNumThreadsPerPrimitive * max(num_vertices, num_edges);
             int* color_group_begin = color_groups + color_index;
+
+            solve_elasticity_springs_kernel<dynamics_block_size><<<color_size, dynamics_block_size>>>
+                (dx, q_saved, f, Jx_diag, q_prev, mass_inv, static_diags, q_inertia,
+                obj_data, vertices_obj,
+                edges, geo->edge_lengths.data().get(),
+                geo->edge_lookup.data().get(),
+                geo->dir_edges.data().get(),
+                color_group_begin, damping, h,
+                color_size);
+
+            // contact.ccd_truncation_traverse_bvh(q_prev, q);
+            // apply_truncation_ts_color_kernel<<<(color_size + block - 1) / block, block>>>(
+            //     q, q_prev, dx, nullptr, mask,  1000.f, color_group_begin, color_size);
+
             vbd_self_contact_kernel<<<(total_threads + block - 1) / block, block>>>(
                 f, Jx_diag,
-                q, geo->node_colors.data().get(),
+                q_saved, geo->node_colors.data().get(),
                 obj_data, vertices_obj,
                 tris, edges,
                 geo->vertex_normals.data().get(), geo->edge_normals.data().get(),
@@ -444,29 +579,17 @@ void SolverVBD::step(float h) {
             if ( ground )
                 add_ground_contact<<<(color_size + block - 1) / block, block>>>(
                     f, Jx_diag,
-                    q, obj_data, vertices_obj, color_group_begin, vf_ground_k, color_size);
-
-            solve_elasticity_springs_kernel<dynamics_block_size><<<color_size, dynamics_block_size>>>
-                (dx, q_prev, q, mass_inv, static_diags, q_inertia,
-                obj_data, vertices_obj,
-                edges, geo->edge_lengths.data().get(),
-                geo->edge_lookup.data().get(),
-                geo->dir_edges.data().get(), f, Jx_diag,
-                color_group_begin, damping, h,
-                color_size);
-
-            apply_truncation_ts_kernel<<<(color_size + block - 1) / block, block>>>(
-                q, dx, nullptr, 1000.f, color_group_begin, color_size);
+                    q_saved, obj_data, vertices_obj, color_group_begin, vf_ground_k, color_size);
+            apply_force_color_kernel<<<(color_size + block - 1) / block, block>>>(
+                q, q_prev, static_diags, f, Jx_diag, mask, 1000.f, color_group_begin, color_size);
         }
-
     }
-
-    n = params.nb_all_cloth_edges;
-    // update substep end
-
-    n = params.nb_all_cloth_vertices;
-
+    contact.ccd_truncation_traverse_bvh(q_prev, q);
+    // thrust::fill(thrust::cuda::par_nosync, contact.truncation_t.begin(), contact.truncation_t.end(), 1.f);
+    n = active_vertices_size;
+    cudaMemcpyAsync(v_prev, v, n * sizeof(float3), cudaMemcpyDeviceToDevice);
     step_end_kernel<<<(n + block - 1) / block, block>>>(
-        v, q, q_prev, mask, h, max_vel, n);
-
+        v, q, truncation_t,
+        q_prev, mask, h, max_vel, n);
+    // contact.check_truncation_traverse_bvh(q_prev, q);
 }

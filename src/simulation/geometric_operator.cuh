@@ -63,7 +63,7 @@ static __device__ bool find_edge(int v0, int v1, const int2* lookup, const int2*
     return false;
 }
 
-inline __global__ void prepare_keys_and_values(
+static __global__ void prepare_keys_and_values(
     int2* __restrict__ d_edges,
     unsigned long long* __restrict__ d_keys,
     int* __restrict__ d_vals,
@@ -85,7 +85,7 @@ inline __global__ void prepare_keys_and_values(
     d_vals[i + num_edges] = (int)i;
 }
 
-inline __global__ void unpack_dir_edges(
+static __global__ void unpack_dir_edges(
     const unsigned long long* __restrict__ d_keys,
     const int* __restrict__ d_vals,
     int2* __restrict__ d_dir_edges,
@@ -98,7 +98,7 @@ inline __global__ void unpack_dir_edges(
     d_dir_edges[idx] = make_int2(target, edge_id);
 }
 
-inline __global__ void compute_lookup(
+static __global__ void compute_lookup(
     const unsigned long long* __restrict__ d_sorted_keys,
     int num_dir_edges,
     int nb_all_v,

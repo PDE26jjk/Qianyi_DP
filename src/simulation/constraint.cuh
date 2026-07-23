@@ -232,8 +232,8 @@ static __global__ void compute_normal_constraint_IPC_energy(
     float E_prime = -k * diff * (2.0f * log_term + 1.0f - 1.0f / d_ratio);
     float E_double_prime = -k * (2.0f * log_term + 3.0f - 2.0f / d_ratio - 1.0f / (d_ratio * d_ratio));
 
-    float lambda_1 = fmaxf(0.0f, E_double_prime); // 法向刚度截断 (通常为正)
-    float lambda_2 = fmaxf(0.0f, E_prime / d);    // 切向刚度截断 (E_prime < 0，因此这里必被截断为 0)
+    float lambda_1 = fmaxf(0.0f, E_double_prime); //  Normal stiffness clamping (usually positive)
+    float lambda_2 = fmaxf(0.0f, E_prime / d);    // Tangential stiffness clamping (E_prime < 0, so it must be clamped to 0)
 
     Mat3 uuT = Mat3::outer_product(u, u);
 

@@ -96,6 +96,7 @@ void Geometry::init(const GeoDataInput& geo) {
     pos_interpolation_new.resize(params.nb_all_vertices);
     debug_colors.resize(params.nb_all_vertices);
     velocities.assign(params.nb_all_vertices, make_float3(0.0f, 0.0f, 0.0f));
+    vel_prev.assign(params.nb_all_vertices, make_float3(0.0f, 0.0f, 0.0f));
     forces.assign(params.nb_all_vertices, make_float3(0.0f, 0.0f, 0.0f));
     vertices_mask.assign(params.nb_all_vertices, static_cast<char>(0));
     mass_inv.resize(params.nb_all_vertices);
@@ -136,6 +137,7 @@ void Geometry::init(const GeoDataInput& geo) {
     init_pin();
     init_picker();
     init_sewing();
+    CUDA_CHECK(cudaDeviceSynchronize());
 }
 
 // void* Geometry::get_device_temp_memory() {
@@ -160,12 +162,12 @@ static __global__ void transform_to_world(
 void Geometry::init_vertex_data() {
     // generate_vertex_object;
     vertices_obj.resize(params.nb_all_vertices);
-    thrust::upper_bound(thrust::device,
+    thrust::upper_bound(thrust::cuda::par_nosync,
         vertex_index_offsets.begin(), vertex_index_offsets.end(),
         thrust::make_counting_iterator(0), thrust::make_counting_iterator(params.nb_all_vertices),
         vertices_obj.begin()
         );
-    thrust::transform(
+    thrust::transform(thrust::cuda::par_nosync,
         vertices_obj.begin(),
         vertices_obj.end(),
         vertices_obj.begin(),
@@ -183,7 +185,7 @@ void Geometry::init_vertex_data() {
 
     // generate_matrices_inv
     world_matrices_inv.resize(world_matrices.size());
-    thrust::transform(world_matrices.begin(), world_matrices.end(), world_matrices_inv.begin(),
+    thrust::transform(thrust::cuda::par_nosync, world_matrices.begin(), world_matrices.end(), world_matrices_inv.begin(),
         [] __device__ (const Mat4 mat) {
             return mat.inverse();
         });
@@ -198,111 +200,6 @@ void Geometry::init_edge_data() {
     edges_to_csr(nb_all_v, num_edges, edges.data().get(),
         dir_edges.data().get(), edge_lookup.data().get());
 
-    // -------------------------------------------------------
-    // 步骤 1: 准备排序键 (Keys) 和 值 (Values)
-    // -------------------------------------------------------
-    // Keys: 存储打包后的 (Source << 32 | Target)
-    // Values: 存储 EdgeID (对应 Python 的 np.arange)
-    // thrust::device_vector<unsigned long long> sort_keys(num_dir_edges);
-    // thrust::device_vector<int> sort_values(num_dir_edges); // 存 EdgeID
-    //
-    // // 使用 transform 填充数据
-    // // 线程 i 处理一条输入边，同时生成“正向”和“反向”两条数据
-    // thrust::for_each(thrust::device,
-    //     thrust::make_counting_iterator<size_t>(0),
-    //     thrust::make_counting_iterator<size_t>(num_edges),
-    //     [
-    //         in_ptr = thrust::raw_pointer_cast(edges.data()),
-    //         keys_ptr = thrust::raw_pointer_cast(sort_keys.data()),
-    //         vals_ptr = thrust::raw_pointer_cast(sort_values.data()),
-    //         num_edges
-    //     ] __device__ (size_t i) {
-    //         int2 e = in_ptr[i];
-    //         if ( e.x > e.y ) {
-    //             e = make_int2(e.y, e.x);
-    //             in_ptr[i] = e;
-    //         }
-    //         int u = e.x;
-    //         int v = e.y;
-    //
-    //         // 正向边: u -> v, ID = i
-    //         // Key 高位是 u (Primary sort), 低位是 v (Secondary sort)
-    //         keys_ptr[i] = ((unsigned long long)u << 32) | (unsigned int)v;
-    //         vals_ptr[i] = (int)i;
-    //
-    //         // 反向边: v -> u, ID = i
-    //         keys_ptr[i + num_edges] = ((unsigned long long)v << 32) | (unsigned int)u;
-    //         vals_ptr[i + num_edges] = (int)i;
-    //     }
-    //     );
-    //
-    // // -------------------------------------------------------
-    // // 步骤 2: 排序 (完全等价于 np.lexsort)
-    // // -------------------------------------------------------
-    // thrust::stable_sort_by_key(thrust::device, sort_keys.begin(), sort_keys.end(), sort_values.begin());
-    //
-    // // -------------------------------------------------------
-    // // 步骤 3: 生成 dir_edges (解包)
-    // // -------------------------------------------------------
-    // // Python 返回的是 dir_edges[:, 1:]，即 [Target, EdgeID]
-    // // 我们的 sort_keys 低 32 位正是 Target，sort_values 正是 EdgeID
-    // dir_edges.resize(num_dir_edges);
-    //
-    // thrust::transform(
-    //     thrust::make_zip_iterator(thrust::make_tuple(sort_keys.begin(), sort_values.begin())),
-    //     thrust::make_zip_iterator(thrust::make_tuple(sort_keys.end(), sort_values.end())),
-    //     dir_edges.begin(),
-    //     [] __device__ (const thrust::tuple<unsigned long long, int>& t) {
-    //         // 解包：Target 在低32位
-    //         int target = (int)(thrust::get<0>(t) & 0xFFFFFFFF);
-    //         int edge_id = thrust::get<1>(t);
-    //         return make_int2(target, edge_id);
-    //     }
-    //     );
-    //
-    // // -------------------------------------------------------
-    // // 步骤 4: 生成 Lookup Table (CSR 格式)
-    // // -------------------------------------------------------
-    // // 我们需要 Source 数组来计算 offset。Source 就在 sort_keys 的高32位。
-    //
-    // // 提取 Source 序列 (为了 lower_bound)
-    // // 注意：这里不用显式分配大数组，用 transform_iterator 包装即可，节省显存
-    // auto source_iter_begin = thrust::make_transform_iterator(
-    //     sort_keys.begin(),
-    //     [] __host__ __device__ (unsigned long long key) { return (int)(key >> 32); }
-    //     );
-    // auto source_iter_end = source_iter_begin + (int)num_dir_edges;
-    //
-    // // 准备查询序列 [0, 1, ..., nb_all_v - 1]
-    // thrust::device_vector<int> query_vertices(nb_all_v);
-    // thrust::sequence(thrust::device, query_vertices.begin(), query_vertices.end());
-    //
-    // // 计算 Offsets (Lower Bound) 和 Ends (Upper Bound)
-    // thrust::device_vector<int> offsets(nb_all_v);
-    // thrust::device_vector<int> counts(nb_all_v); // 暂存 counts，最后合并
-    //
-    // thrust::lower_bound(thrust::device,
-    //     source_iter_begin, source_iter_end,
-    //     query_vertices.begin(), query_vertices.end(),
-    //     offsets.begin()
-    //     );
-    //
-    // thrust::upper_bound(thrust::device,
-    //     source_iter_begin, source_iter_end,
-    //     query_vertices.begin(), query_vertices.end(),
-    //     counts.begin() // 这里先存 end index，下一步做减法
-    //     );
-    //
-    // // 合并结果到 lookup_table: .x = offset, .y = count
-    // edge_lookup.resize(nb_all_v);
-    // thrust::transform(
-    //     offsets.begin(), offsets.end(),
-    //     counts.begin(), // 此时里面存的是 upper_bound 的结果
-    //     edge_lookup.begin(),
-    //     [] __device__ (int start, int end) {
-    //         return make_int2(start, end - start);
-    //     }
-    //     );
     calc_edge_length();
 }
 
@@ -327,7 +224,7 @@ __global__ void mean_kernel(
     }
 }
 void Geometry::calc_edge_length() {
-    thrust::for_each_n(thrust::device, thrust::make_counting_iterator(0), params.nb_all_edges,
+    thrust::for_each_n(thrust::cuda::par_nosync, thrust::make_counting_iterator(0), params.nb_all_edges,
         [
             vertices2D = thrust::raw_pointer_cast(pos_2D.data()),
             vertices3D = thrust::raw_pointer_cast(pos_world.data()),
@@ -342,7 +239,7 @@ void Geometry::calc_edge_length() {
                 edge_lengths[edge_index] = norm(vertices3D[e_i.x] - vertices3D[e_i.y]);
         });
 
-    params.cloth_edge_mean_length = thrust::reduce(edge_lengths.begin(),
+    params.cloth_edge_mean_length = thrust::reduce(thrust::device, edge_lengths.begin(),
         edge_lengths.begin() + params.nb_all_cloth_edges, 0.0, thrust::plus<double>()) / params.nb_all_cloth_edges;
     int num_objects = params.nb_all_objects;
     thrust::device_vector<int>& d_offsets = edge_index_offsets;
@@ -375,7 +272,8 @@ void Geometry::average_mass_by_cloth() {
         thrust::raw_pointer_cast(d_offsets.data()),
         thrust::raw_pointer_cast(d_offsets.data()) + 1);
 
-    thrust::for_each_n(thrust::device, thrust::make_counting_iterator(0), params.nb_all_cloth_vertices,
+    thrust::for_each_n(thrust::cuda::par_nosync,
+        thrust::make_counting_iterator(0), params.nb_all_cloth_vertices,
         [
             d_offsets = thrust::raw_pointer_cast(d_offsets.data()),
             mass_sums = thrust::raw_pointer_cast(d_mass_sums.data()),
@@ -396,7 +294,7 @@ void Geometry::init_triangle_data() {
     masses.assign(params.nb_all_vertices, 0.f);
     triangle_indices.resize(params.nb_all_triangles);
     areas.resize(params.nb_all_triangles);
-    thrust::for_each_n(thrust::device, thrust::make_counting_iterator(0), params.nb_all_triangles,
+    thrust::for_each_n(thrust::cuda::par_nosync, thrust::make_counting_iterator(0), params.nb_all_triangles,
         [
             vertices = thrust::raw_pointer_cast(pos_2D.data()), // float3
             normals = thrust::raw_pointer_cast(normals_input.data()), // float3
@@ -512,7 +410,8 @@ void Geometry::init_triangle_data() {
             }
         });
 
-    thrust::for_each_n(thrust::device, thrust::make_counting_iterator(0), params.nb_all_edges,
+    thrust::for_each_n(thrust::cuda::par_nosync,
+        thrust::make_counting_iterator(0), params.nb_all_edges,
         [
             triangles = thrust::raw_pointer_cast(triangles.data()), // int3
             edges = thrust::raw_pointer_cast(edges.data()), // int2
@@ -587,17 +486,19 @@ void Geometry::upload_local_vertices(int obj_index, const std::vector<float>& ve
     need_update_interpolation_vertices_this_frame = true;
 }
 __global__ void forward_step(
-    const float3* __restrict__ pos,
     const float3* __restrict__ vel,
+    const float3* __restrict__ vel_prev,
     const float* __restrict__ inv_mass,
     const float3* __restrict__ external_force,
     const char* __restrict__ mask,
+    float3* __restrict__ pos,
     float3* __restrict__ inertia_out,
     float3* __restrict__ dx,
     float* __restrict__ static_diags,
     float dt,
     float mask_stiff,
     float3 gravity,
+    bool warm_start,
     int num_vertices
 ) {
     int i = threadIdx.x + blockIdx.x * blockDim.x;
@@ -605,10 +506,10 @@ __global__ void forward_step(
 
     float3 p = pos[i];
     float3 v = vel[i];
-    float3 f_ext = gravity;
+    float3 accel_ext = gravity;
     float im = inv_mass[i];
     if ( external_force ) {
-        f_ext += external_force[i] * im;
+        accel_ext += external_force[i] * im;
     }
     if ( mask[i] ) {
         inertia_out[i] = p;
@@ -618,9 +519,19 @@ __global__ void forward_step(
         inertia_out[i] = p;
     }
     else {
-        float force_factor = dt * dt;
-        inertia_out[i] = p + v * dt + f_ext * force_factor;
-        static_diags[i] += 1.f / (im * force_factor);
+        float dt2 = dt * dt;
+        inertia_out[i] = p + v * dt + accel_ext * dt2;
+        static_diags[i] += 1.f / (im * dt2);
+        if (warm_start) { // Warm starting from VBD paper. 
+            float3 accel_prev = (v - vel_prev[i]) / dt;
+            float a_factor = 0;
+            float a_ext_len_sq = len_sq(accel_ext);
+            if ( a_ext_len_sq > 1e-16f ) {
+                a_factor = dot(accel_prev, accel_ext) * rsqrtf(a_ext_len_sq);
+                a_factor = clamp(a_factor, 0.0f, 1.0f);
+            }
+            pos[i] = p + v * dt + accel_ext * (a_factor * dt2);
+        }
     }
 
     if ( dx ) {
@@ -630,6 +541,7 @@ __global__ void forward_step(
         //     dx[i] = v * dt;
         dx[i] = inertia_out[i] - p;
     }
+
 }
 static __global__ void fill_inv_mass_kernel(
     float* __restrict__ invMass,
@@ -717,6 +629,27 @@ __global__ void compute_normals_kernel(
     atomicAddFloat3(&edge_normals[tri_edges.y], n);
     atomicAddFloat3(&edge_normals[tri_edges.z], n);
 }
+__global__ void compute_normals_single_edge_kernel(
+    const int2* __restrict__ edges,
+    const int2* __restrict__ e2t,
+    const float3* __restrict__ pos_world,
+    float3* __restrict__ edge_normals,
+    int num_edges
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if ( tid >= num_edges ) return;
+
+    int2 tris = e2t[tid];
+    if ( tris.x != -1 && tris.y != -1 ) return;
+    int2 e = edges[tid];
+    float3 e_ = pos_world[e.y] - pos_world[e.x];
+    if ( tris.x >= 0 ) {
+        edge_normals[tid] = cross(e_, edge_normals[tid]);
+    }
+    else {
+        edge_normals[tid] = cross(edge_normals[tid], e_);
+    }
+}
 
 __global__ void normalize_vectors_kernel(float3* __restrict__ vectors, int N) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -749,6 +682,12 @@ void Geometry::compute_normals() {
     normalize_vectors_kernel<<<(vertex_num + block - 1) / block, block>>>(
         thrust::raw_pointer_cast(vertex_normals.data()), vertex_num);
     int edge_num = params.nb_all_edges;
+    compute_normals_single_edge_kernel<<<(edge_num + block - 1) / block, block>>>(
+        thrust::raw_pointer_cast(edges.data()),
+        thrust::raw_pointer_cast(e2t.data()),
+        thrust::raw_pointer_cast(pos_world.data()),
+        thrust::raw_pointer_cast(edge_normals.data()),
+        edge_num);
     normalize_vectors_kernel<<<(edge_num + block - 1) / block, block>>>(
         thrust::raw_pointer_cast(edge_normals.data()), edge_num);
 }
@@ -852,7 +791,7 @@ void Geometry::update_for_step(float h, float time_factor) {
 }
 static __global__ void update_local_pos_kernel(
     float3* __restrict__ vertices,
-    float3* __restrict__ vertices_world,
+    const float3* __restrict__ vertices_world,
     const int* proxy,
     const int* __restrict__ vertices_obj,
     const Mat4* __restrict__ world_matrices_inv,
@@ -949,7 +888,7 @@ void Geometry::color_graph() {
     node_colors.assign(params.nb_all_vertices, -1);
     int2* d_valid_edges = thrust::raw_pointer_cast(valid_edges.data());
     cudaMemcpyAsync(d_valid_edges, edges.data().get(), num_edges * sizeof(int2), cudaMemcpyDeviceToDevice);
-    auto end = thrust::copy_if(thrust::device, edge_opposite_points.begin(), edge_opposite_points.end(),
+    auto end = thrust::copy_if(thrust::device, edge_opposite_points.begin(), edge_opposite_points.begin() + num_edges,
         valid_edges.begin() + num_edges, [] __device__ (int2 e) {
             return e.x != -1 && e.y != -1;
         });
@@ -977,9 +916,7 @@ void Geometry::color_graph() {
     h_colors_index_offsets.resize(colors_index_offsets.size());
     cudaMemcpy(h_colors_index_offsets.data(), colors_index_offsets.data().get(), colors_index_offsets.size() * sizeof(int),
         cudaMemcpyDeviceToHost);
-    // for (int i = 0; i < num_colors; ++i) {
-    //     h_colors_index_offsets[i] = h_colors_index_offsets[i+1] - h_colors_index_offsets[i];
-    // }
+
 }
 __global__ void bending_fill_keys_and_values(
     const int2* __restrict__ edges,

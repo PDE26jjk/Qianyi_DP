@@ -6,7 +6,7 @@
 #include <array>
 #include <vulkan/vulkan.h>
 #include <filesystem>
-// ================== 平台宏定义 ==================
+
 #ifdef _WIN32
     #include <windows.h>
     #include <vulkan/vulkan_win32.h>

@@ -90,8 +90,12 @@ _SFDH_ float norm(const float3& a) {
     return sqrtf(dot(a, a));
 }
 _SFDH_ float3 normalized(const float3& a) {
-    float n = norm(a);
-    return n > 1e-8f ? a / n : make_float3(0.0f, 0.0f, 0.0f);
+    float n = dot(a, a);
+#ifdef __CUDACC__
+    return n > 1e-16f ? a * rsqrtf(n) : make_float3(0.0f, 0.0f, 0.0f);
+#else
+    return n > 1e-16f ? a / sqrtf(n) : make_float3(0.0f, 0.0f, 0.0f);
+#endif
 }
 
 _SFDH_ float len_sq(const float3& a) { return dot(a, a); }
@@ -265,6 +269,48 @@ struct Mat3 {
         res.r[2].z = (r[0].x * r[1].y - r[0].y * r[1].x) * invD;
 
         return res;
+    }
+
+    // Same as A.inverse() * b;
+    __device__ __host__ float3 solve_symmetric(const float3& b) const {
+        const float min_abs_d = 1e-14f;
+
+        float a00 = r[0].x, a10 = r[1].x, a20 = r[2].x;
+        float a11 = r[1].y, a21 = r[2].y;
+        float a22 = r[2].z;
+
+        // LDL^T: A = L D L^T
+        float d0 = a00;
+        // |d0| ≥ min_abs_d
+        d0 = copysignf(fmaxf(fabsf(d0), min_abs_d), d0);   
+        float inv_d0 = 1.0f / d0;
+        float l10 = a10 * inv_d0;
+        float l20 = a20 * inv_d0;
+
+        float d1 = a11 - l10 * l10 * d0;
+        d1 = copysignf(fmaxf(fabsf(d1), min_abs_d), d1);
+        float inv_d1 = 1.0f / d1;
+        float l21 = (a21 - l10 * l20 * d0) * inv_d1;
+
+        float d2 = a22 - l20 * l20 * d0 - l21 * l21 * d1;
+        d2 = copysignf(fmaxf(fabsf(d2), min_abs_d), d2);
+
+        // L z = b
+        float z0 = b.x;
+        float z1 = b.y - l10 * z0;
+        float z2 = b.z - l20 * z0 - l21 * z1;
+
+        // D y = z
+        float y0 = z0 * inv_d0;
+        float y1 = z1 * inv_d1;
+        float y2 = z2 / d2;
+
+        // L^T x = y
+        float x2 = y2;
+        float x1 = y1 - l21 * x2;
+        float x0 = y0 - l10 * x1 - l20 * x2;
+
+        return make_float3(x0, x1, x2);
     }
     __device__ __host__ static Mat3 outer_product(const float3& a, const float3& b) {
         return {

@@ -51,7 +51,7 @@ void SolverXPBD::init() {
     auto* geo = simulator->get_geo();
 
     delta.resize(params.nb_all_vertices);
-
+    lambdas.resize(max(params.nb_all_edges, params.nb_all_cloth_triangles * 3));
 }
 __global__ void xpbd_forward_step(
     const float3* __restrict__ pos,
@@ -152,6 +152,7 @@ __global__ void xpbd_solve_springs_kernel(
     atomicAddFloat3(&delta[v1], w1 * delta_lambda * grad1);
 }
 __global__ void xpbd_solve_triangle_fem_kernel(
+    float* __restrict__ lambdas,                   // accumulated multipliers
     float3* __restrict__ delta,                    // position correction accumulator
     const float3* __restrict__ pos,                // current predicted positions
     const float3* __restrict__ vel,                // current velocities (needed if damping > 0)
@@ -236,16 +237,19 @@ __global__ void xpbd_solve_triangle_fem_kernel(
             w1 * m00 * m00 +                    // |g1|^2 = m00^2
             w2 * m01 * m01;                     // |g2|^2 = m01^2
         if ( denom > 0.0f ) {
-            float dlambda = -Cu;
+            float lambda = 0.0f;
+            if ( lambdas ) lambda = lambdas[tid * 3 + 0];   // u constraint
+            float grad_dot_v = 0.f;
             if ( gamma > 0.0f ) {
-                const float grad_dot_v = dt * (dot(g0, v0_vec) + dot(g1, v1_vec) + dot(g2, v2_vec));
-                dlambda = -(Cu + gamma * grad_dot_v);
+                grad_dot_v = dt * (dot(g0, v0_vec) + dot(g1, v1_vec) + dot(g2, v2_vec));
             }
-            dlambda /= (1.0f + gamma) * denom + alpha;
+            float delta_lambda = -(Cu + alpha * lambda + gamma * grad_dot_v)
+                / ((1.0f + gamma) * denom + alpha);
+            if ( lambdas ) lambdas[tid * 3 + 0] += delta_lambda;
 
-            dx0 += dlambda * g0;
-            dx1 += dlambda * g1;
-            dx2 += dlambda * g2;
+            dx0 += delta_lambda * g0;
+            dx1 += delta_lambda * g1;
+            dx2 += delta_lambda * g2;
         }
     }
 
@@ -263,16 +267,19 @@ __global__ void xpbd_solve_triangle_fem_kernel(
             w1 * m10 * m10 +
             w2 * m11 * m11;
         if ( denom > 0.0f ) {
-            float dlambda = -Cv;
+            float lambda = 0.0f;
+            if ( lambdas ) lambda = lambdas[tid * 3 + 1];   // v constraint
+            float grad_dot_v = 0.0f;
             if ( gamma > 0.0f ) {
-                const float grad_dot_v = dt * (dot(g0, v0_vec) + dot(g1, v1_vec) + dot(g2, v2_vec));
-                dlambda = -(Cv + gamma * grad_dot_v);
+                grad_dot_v = dt * (dot(g0, v0_vec) + dot(g1, v1_vec) + dot(g2, v2_vec));
             }
-            dlambda /= (1.0f + gamma) * denom + alpha;
+            float delta_lambda = -(Cv + alpha * lambda + gamma * grad_dot_v)
+                / ((1.0f + gamma) * denom + alpha);
+            if ( lambdas ) lambdas[tid * 3 + 1] += delta_lambda;
 
-            dx0 += dlambda * g0;
-            dx1 += dlambda * g1;
-            dx2 += dlambda * g2;
+            dx0 += delta_lambda * g0;
+            dx1 += delta_lambda * g1;
+            dx2 += delta_lambda * g2;
         }
     }
 
@@ -293,16 +300,19 @@ __global__ void xpbd_solve_triangle_fem_kernel(
             w1 * dot(g1, g1) +
             w2 * dot(g2, g2);
         if ( denom > 0.0f ) {
-            float dlambda = -Cs;
+            float lambda = 0.0f;
+            if ( lambdas ) lambda = lambdas[tid * 3 + 2];   // shear constraint
+            float grad_dot_v = 0.0f;
             if ( gamma > 0.0f ) {
-                const float grad_dot_v = dt * (dot(g0, v0_vec) + dot(g1, v1_vec) + dot(g2, v2_vec));
-                dlambda = -(Cs + gamma * grad_dot_v);
+                grad_dot_v = dt * (dot(g0, v0_vec) + dot(g1, v1_vec) + dot(g2, v2_vec));
             }
-            dlambda /= (1.0f + gamma) * denom + alpha;
+            float delta_lambda = -(Cs + alpha * lambda + gamma * grad_dot_v)
+                / ((1.0f + gamma) * denom + alpha);
+            if ( lambdas ) lambdas[tid * 3 + 2] = lambda + delta_lambda;
 
-            dx0 += dlambda * g0;
-            dx1 += dlambda * g1;
-            dx2 += dlambda * g2;
+            dx0 += delta_lambda * g0;
+            dx1 += delta_lambda * g1;
+            dx2 += delta_lambda * g2;
         }
     }
 
@@ -313,6 +323,7 @@ __global__ void xpbd_solve_triangle_fem_kernel(
 }
 
 __global__ void xpbd_solve_vf_contacts_kernel(
+    const float3* __restrict__ pos_prev,                
     const float3* __restrict__ pos,                // current predicted positions
     const float3* __restrict__ vel,                // current velocities
     const float* __restrict__ inv_mass,            // inverse mass per vertex
@@ -328,6 +339,7 @@ __global__ void xpbd_solve_vf_contacts_kernel(
     const bool ground,                             // enable ground plane at z = thickness
     const float ground_f,
     float3* __restrict__ delta,                    // position correction accumulator
+    // const int active_vertices_size,                       
     const int num_vertices                         // total vertices to process
 ) {
     int vid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -341,9 +353,10 @@ __global__ void xpbd_solve_vf_contacts_kernel(
     const float3 normal_v = vertex_normals[vid];
     const int layer0 = obj_data[vertices_obj[vid]].collision_layer;
 
+    // float3 dx0_dyn = x0 - pos_prev[vid];
     float3 dx0 = make_float3(0.0f, 0.0f, 0.0f);
     bool is_collided = false;
-
+    // bool is_active = vid < active_vertices_size && w0 > 0.0f;
     // --- Ground contact ---
     if ( ground && ground_f > 0.f && w0 > 0.0f ) {
         const float d_ground = x0.z - thickness0;
@@ -390,32 +403,12 @@ __global__ void xpbd_solve_vf_contacts_kernel(
 
         const float3 x1 = pos[i1], x2 = pos[i2], x3 = pos[i3];
 
-        // float3 normal = cross(x2 - x1, x3 - x1);
-        // float normal_len = norm(normal);
-        // if ( normal_len < 1e-8f ) continue;
-        // normal = normal / normal_len;
-        //
-        // int layer1 = obj_data[vertices_obj[i1]].collision_layer;
-        // if ( layer1 == layer0 ) {
-        //     normal = normal * sign;
-        // }
-        // else if ( layer0 < layer1 ) {
-        //     if ( dot(normal, normal_v) > 0.0f ) normal = -normal;
-        // }
-        //
-        // float dist = dot(x0 - x1, normal);
-        // float thickness = thickness0 + obj_data[vertices_obj[i1]].thickness;
-        // if ( dist > thickness ) continue;
-        //
-        // float3 closest_pt = x0 - dist * normal;
-        // float u, v, w;
-        // barycentric(x1, x2, x3, closest_pt, u, v, w);
-        // if ( u < 0.0f || v < 0.0f || w < 0.0f ) continue;
         float3 normal;
         float u, v, w, pen;
+        float thickness = thickness0 + obj_data[vertices_obj[i1]].thickness;
         if ( !compute_point_triangle_contact(
             x0, x1, x2, x3,
-            thickness0 + obj_data[vertices_obj[i1]].thickness,
+            thickness,
             layer0 - obj_data[vertices_obj[i1]].collision_layer,
             sign, normal_v,
             normal, u, v, w, pen)
@@ -435,6 +428,7 @@ __global__ void xpbd_solve_vf_contacts_kernel(
         if ( denom_n <= 0.0f ) continue;
 
         float alpha = 1.f / (stiffness * dt * dt);
+        // float alpha = 0.f;
         float dlambda_n = -C_n / (denom_n + alpha);
 
         float3 dx1 = dlambda_n * grad1_n;
@@ -524,47 +518,6 @@ __global__ void xpbd_solve_ee_contacts_kernel(
         const int2 edge2 = edges[eid2];
         const int ic = edge2.x, id = edge2.y;
         const float3 q0 = pos[ic], q1 = pos[id];
-
-        // float s, t;
-        // float3 ab;
-        // segment_segment_closest_robust(p0, p1, q0, q1, s, t, ab);
-        // if ( s <= 0.0f || s >= 1.0f || t <= 0.0f || t >= 1.0f ) continue;
-        //
-        // ab = -ab;
-        // float dist = norm(ab);
-        // float3 normal;
-        // if ( dist < 1e-16f ) {
-        //     normal = edge_normal0;
-        //     ab = normal;
-        // }
-        // else {
-        //     normal = ab / dist;
-        // }
-        //
-        // // Original direction logic (exactly as in compute_ee_force)
-        // int layer1 = obj_data[vertices_obj[ic]].collision_layer;
-        // if ( layer1 == layer0 ) {
-        //     float sign_new = (dot(ab, edge_normal0) < 0.0f) ? 1.0f : -1.0f;
-        //     sign *= sign_new;
-        //     if ( sign < 0.0f ) {
-        //         dist = -dist;
-        //         normal = -normal;
-        //     }
-        // }
-        // else {
-        //     bool reverse = false;
-        //     if ( layer0 < layer1 ) {
-        //         reverse = (dot(normal, edge_normal0) > 0.0f);
-        //     }
-        //     else {
-        //         const float3 edge_normal1 = edge_normals[eid2];
-        //         reverse = (dot(normal, edge_normal1) < 0.0f);
-        //     }
-        //     if ( reverse ) {
-        //         normal = -normal;
-        //         dist = -dist;
-        //     }
-        // }
 
         float thickness = thickness0 + obj_data[vertices_obj[ic]].thickness;
         // if ( dist > thickness ) continue;
@@ -698,6 +651,10 @@ void SolverXPBD::step(float h) {
     float* mass_inv = geo->mass_inv.data().get();
     auto* obj_data = geo->obj_data.data().get();
     int* vertices_obj = geo->vertices_obj.data().get();
+    int dynamics_iters = max(1, (int)get_global_parameter("xpbd_dynamics_iters", 1));
+    int use_lambdas = (int)geo->get_global_parameter("xpbd_use_lambdas", 1);
+
+    float* lambdas = (use_lambdas && dynamics_iters > 1) ? this->lambdas.data().get() : nullptr;
 
     xpbd_forward_step<<<(n + block - 1) / block, block>>>(
         q, v, mass_inv,
@@ -719,48 +676,57 @@ void SolverXPBD::step(float h) {
     float relaxation = max(0.f, geo->get_global_parameter("xpbd_relaxation", 0.9f));
     int constitutive_model_planar = (int)geo->get_global_parameter("constitutive_model_planar", 0);
 
+    auto& contact = geo->get_contact();
     for ( int i = 0; i < iters; i++ ) {
-        if ( constitutive_model_planar == 0 ) {
-            n = params.nb_all_cloth_edges;
-            xpbd_solve_springs_kernel<<<(n + block - 1) / block, block>>>(nullptr, dx,
-                q, v, mass_inv, edges,
-                geo->edge_lengths.data().get(),
-                obj_data, vertices_obj,
-                damping, h, n);
+        if ( lambdas )
+            cudaMemsetAsync(lambdas, 0, this->lambdas.size() * sizeof(float));
+        for ( int j = 0; j < dynamics_iters; j++ ) {
+            if ( constitutive_model_planar == 0 ) {
+                n = params.nb_all_cloth_edges;
+                xpbd_solve_springs_kernel<<<(n + block - 1) / block, block>>>(lambdas, dx,
+                    q, v, mass_inv, edges,
+                    geo->edge_lengths.data().get(),
+                    obj_data, vertices_obj,
+                    damping, h, n);
+            }
+            else if ( constitutive_model_planar == 1 ) {
+                n = params.nb_all_cloth_triangles;
+                xpbd_solve_triangle_fem_kernel<<<(n + block - 1) / block, block>>>(
+                    lambdas, dx,
+                    q, v, mass_inv, tris,
+                    geo->Dms.data().get(),
+                    obj_data, vertices_obj,
+                    damping, relaxation, h, n);
+            }
         }
-        else if ( constitutive_model_planar == 1 ) {
-            n = params.nb_all_cloth_triangles;
-            xpbd_solve_triangle_fem_kernel<<<(n + block - 1) / block, block>>>(dx,
-                q, v, mass_inv, tris,
-                geo->Dms.data().get(),
-                obj_data, vertices_obj,
-                damping, relaxation, h, n);
-        }
+        // contact.ccd_truncation_traverse_bvh(q_prev, q);
         // geo->accumulate_sewing_force();
         applay_delta_xpbd<<<(n + block - 1) / block, block>>>(
             q, dx, mask, max_dx, n);
         // contact
-        n = params.nb_all_vertices;
-        auto& contact = geo->get_contact();
-        xpbd_solve_vf_contacts_kernel<<<(n + block - 1) / block, block>>>(
-            q, v, mass_inv,
-            contact.broad_phase_vf.data().get(), broad_phase_size,
-            tris, geo->vertex_normals.data().get(),
-            obj_data, vertices_obj, h, vf_force_k, relaxation,
-            geo->ground, vf_ground_k, dx, n);
+        {
+            n = params.nb_all_vertices;
+            xpbd_solve_vf_contacts_kernel<<<(n + block - 1) / block, block>>>(
+                q_prev, q, v, mass_inv,
+                contact.broad_phase_vf.data().get(), broad_phase_size,
+                tris, geo->vertex_normals.data().get(),
+                obj_data, vertices_obj, h, vf_force_k, relaxation,
+                geo->ground, vf_ground_k, dx, n);
 
-        n = params.nb_all_edges;
-        if ( ee_force_k > 1e-12f )
-            xpbd_solve_ee_contacts_kernel<<<(n + block - 1) / block, block>>>(
-                q, v, mass_inv,
-                contact.broad_phase_ee.data().get(), broad_phase_size,
-                edges, geo->edge_normals.data().get(),
-                obj_data, vertices_obj, h, 1.f / ee_force_k, relaxation,
-                dx, n);
+            n = params.nb_all_edges;
+            if ( ee_force_k > 1e-12f )
+                xpbd_solve_ee_contacts_kernel<<<(n + block - 1) / block, block>>>(
+                    q, v, mass_inv,
+                    contact.broad_phase_ee.data().get(), broad_phase_size,
+                    edges, geo->edge_normals.data().get(),
+                    obj_data, vertices_obj, h, 1.f / ee_force_k, relaxation,
+                    dx, n);
 
-        n = params.nb_all_cloth_vertices;
-        applay_delta_xpbd<<<(n + block - 1) / block, block>>>(
-            q, dx, mask, max_dx, n);
+            n = params.nb_all_cloth_vertices;
+            applay_delta_xpbd<<<(n + block - 1) / block, block>>>(
+                q, dx, mask, max_dx, n);
+        }
+
     }
     // update substep end
 

@@ -1,4 +1,4 @@
-﻿#include "contact/collision.cuh"
+﻿// #include "contact/collision.cuh"
 
 #include "solver_base.cuh"
 #include "common/cuda_utils.h"
@@ -12,6 +12,7 @@
 #include "contact/contact.cuh"
 #include "contact/lbvh.cuh"
 #include "contact/collision_detection.cuh"
+#include "cuda_tools/cub_tools.cuh"
 
 void Contact::init() {
     auto& params = geo->params;
@@ -59,10 +60,12 @@ void Contact::init() {
 
     point_sorted_indices.resize(params.nb_all_vertices * 2);
     edge_sorted_indices.resize(params.nb_all_edges);
+    edge_sorted_rank.resize(params.nb_all_edges);
 
     broad_phase_vf.resize(broad_phase_size * params.nb_all_vertices);
     broad_phase_ee.resize(broad_phase_size * params.nb_all_edges);
     broad_phase_ef.resize(broad_phase_size * params.nb_all_edges);
+    truncation_t.resize(params.nb_all_vertices);
     tri_bvh = lbvh3d::BVH3D();
     edge_bvh = lbvh3d::BVH3D();
     lbvh3d::initialize(max(params.nb_all_triangles, params.nb_all_edges));
@@ -161,12 +164,14 @@ void Contact::collision_detect_broad_phase(const float3* pos, const float3* offs
 }
 void Contact::collision_detect() {
     compute_inertial_offset();
+    CUDA_CHECK(cudaDeviceSynchronize());
     if ( geo->simulator->frame % 20 == 0 ) {
         rebuild_bvh();
     }
     else {
         refit_bvh();
     }
+    CUDA_CHECK(cudaDeviceSynchronize());
     // broad phase
     collision_detect_broad_phase(geo->pos_world.data().get(), geo->inertial_offset.data().get());
 }
@@ -203,11 +208,85 @@ void Contact::compute_inertial_offset() {
         geo->gravity, geo->ground,
         geo->simulator->dt, num_vertices);
 }
+
+__global__ void refit_face_offset_bvh_kernel(
+    const float3* pos_prev, const float3* pos_target,
+    const int3* faces,
+    const int2* __restrict__ nodes,
+    const unsigned int* __restrict__ parent,
+    unsigned int* __restrict__ child_count,
+    lbvh3d::AABB3D* __restrict__ aabbs,
+    const ObjectDataInput* __restrict__ obj_data,
+    const int* vertices_obj,
+    unsigned int n
+) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if ( i >= n ) return;
+
+    unsigned int prim_idx = nodes[i].x - 1;
+    int3 f = faces[prim_idx];
+    float3 v0 = pos_prev[f.x], v1 = pos_prev[f.y], v2 = pos_prev[f.z];
+    aabbs[i].min = fmin3(v0, fmin3(v1, v2));
+    aabbs[i].max = fmax3(v0, fmax3(v1, v2));
+    v0 = pos_target[f.x];
+    v1 = pos_target[f.y];
+    v2 = pos_target[f.z];
+    aabbs[i].min = fmin3(aabbs[i].min, fmin3(v0, fmin3(v1, v2)));
+    aabbs[i].max = fmax3(aabbs[i].max, fmax3(v0, fmax3(v1, v2)));
+    float thickness = obj_data[vertices_obj[f.x]].thickness;
+    aabbs[i].min = aabbs[i].min - thickness;
+    aabbs[i].max = aabbs[i].max + thickness;
+
+    lbvh3d::bottom_up_refit(i, nodes, parent, child_count, aabbs);
+}
+
+__global__ void refit_edge_offset_bvh_kernel(
+    const float3* pos_prev, const float3* pos_target,
+    const int2* edges,
+    const int2* __restrict__ nodes,
+    const unsigned int* __restrict__ parent,
+    unsigned int* __restrict__ child_count,
+    lbvh3d::AABB3D* __restrict__ aabbs,
+    const ObjectDataInput* __restrict__ obj_data,
+    const int* vertices_obj,
+    unsigned int n
+) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if ( i >= n ) return;
+
+    // Compute leaf AABB from edge primitive
+    unsigned int prim_idx = nodes[i].x - 1;
+    int2 e = edges[prim_idx];
+    float3 v0 = pos_prev[e.x], v1 = pos_prev[e.y];
+    aabbs[i].min = fmin3(v0, v1);
+    aabbs[i].max = fmax3(v0, v1);
+    v0 = pos_target[e.x];
+    v1 = pos_target[e.y];
+    aabbs[i].min = fmin3(v1, fmin3(v0, aabbs[i].min));
+    aabbs[i].max = fmax3(v1, fmax3(v0, aabbs[i].max));
+    float thickness = obj_data[vertices_obj[e.x]].thickness * 1.5f + 1e-5f;
+    aabbs[i].min = aabbs[i].min - thickness;
+    aabbs[i].max = aabbs[i].max + thickness;
+
+    lbvh3d::bottom_up_refit(i, nodes, parent, child_count, aabbs);
+}
+__global__ void compute_rank_kernel(const unsigned int* indices_sorted, unsigned int* rank, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if ( i < n ) {
+        rank[indices_sorted[i]] = i;
+    }
+}
 void Contact::rebuild_bvh() {
     lbvh3d::build_face_bvh(geo->pos_world, geo->triangle_indices, tri_bvh, geo->inertial_offset.data().get());
     lbvh3d::build_edge_bvh(geo->pos_world, geo->edges, edge_bvh, geo->inertial_offset.data().get());
     cudaMemcpyAsync(edge_sorted_indices.data().get(), lbvh3d::get_sorted_indices(),
         sizeof(unsigned int) * edge_sorted_indices.size(), cudaMemcpyDeviceToDevice);
+    int block = 256;
+    int n = geo->params.nb_all_edges;
+    compute_rank_kernel<<<(n + block - 1) / block,block>>>(
+        edge_sorted_indices.data().get(), edge_sorted_rank.data().get(),
+        n
+        );
     lbvh3d::compute_and_sort_by_morton_codes(geo->pos_world.data().get(),
         geo->pos_world.size(), point_sorted_indices.data().get());
 }
@@ -269,26 +348,6 @@ __global__ void compute_vf_force(
         int i1 = tri.x, i2 = tri.y, i3 = tri.z;
         float3 x1 = pos[i1], x2 = pos[i2], x3 = pos[i3];
 
-        // float3 normal = cross(x2 - x1, x3 - x1);
-        // float normal_len = norm(normal);
-        // if ( normal_len < 1e-8f ) continue;
-        // normal = normal / normal_len;
-        // int layer1 = obj_data[vertices_obj[i1]].collision_layer;
-        // if ( layer1 == layer0 ) {
-        //     normal = normal * sign;
-        // }
-        // else if ( layer0 < layer1 ) {
-        //     if ( dot(normal, normal_v) > 0.0f ) normal = -normal;
-        // }
-        //
-        // float dist = dot(x0 - x1, normal);
-        // float thickness = thickness0 + obj_data[vertices_obj[i1]].thickness;
-        // if ( dist > thickness ) continue;
-        //
-        // float3 closest_pt = x0 - dist * normal;
-        // float u, v, w;
-        // barycentric(x1, x2, x3, closest_pt, u, v, w);
-        // if ( u < 0.0f || v < 0.0f || w < 0.0f ) continue;
         float3 normal;
         float thickness = thickness0 + obj_data[vertices_obj[i1]].thickness;
         float u, v, w, pen;
@@ -387,51 +446,6 @@ static __global__ void compute_ee_force(
         int2 e = edges[eid2];
         float3 q0 = pos[e.x], q1 = pos[e.y];
 
-        // float s, t;
-        // float3 ab;
-        // segment_segment_closest_robust(p0, p1, v0, v1, s, t, ab);
-        // ab = -ab;
-        //
-        // if ( s <= 0.0f || s >= 1.0f || t <= 0.0f || t >= 1.0f ) {
-        //     continue;
-        // }
-        // // float3 ab = closest_B - closest_A;
-        // float dist = norm(ab);
-        // float3 normal;
-        // if ( dist < 1e-16f ) {
-        //     normal = edge_normal0;
-        //     ab = normal;
-        // }
-        // else {
-        //     normal = ab / -dist;
-        // }
-        //
-        // // layer
-        // int layer1 = obj_data[vertices_obj[e.x]].collision_layer;
-        // if ( layer1 == layer0 ) {
-        //     // float sign_new = dot(ab, cross(v1 - p0, E)) < 0.0f ? 1.0f : -1.0f;
-        //     float sign_new = dot(ab, edge_normal0) < 0.0f ? 1.0f : -1.0f;
-        //     sign *= sign_new;
-        //     if ( sign < 0.0f ) {
-        //         dist = -dist;
-        //         normal = -normal;
-        //     }
-        // }
-        // else {
-        //     bool reverse = false;
-        //     if ( layer0 < layer1 ) {
-        //         reverse = dot(normal, edge_normal0) > 0.0f;
-        //     }
-        //     else {
-        //         float3 edge_normal1 = edge_normals[eid2];
-        //         reverse = dot(normal, edge_normal1) < 0.0f;
-        //     }
-        //     if ( reverse ) {
-        //         normal = -normal;
-        //         dist = -dist;
-        //     }
-        // }
-        //
         float thickness = thickness0 + obj_data[vertices_obj[e.x]].thickness;
         // if ( dist > thickness ) continue;
         float s, t;
@@ -565,7 +579,7 @@ __global__ void solve_untangling_kernel(
         float d1 = dot(face_normal, v0 - x0);
         float d2 = dot(face_normal, v1 - x0);
 
-        if ( d1 * d2 >= 0.0f ) continue;  // 同侧
+        if ( d1 * d2 >= 0.0f ) continue;
 
         float abs_d1 = fabsf(d1);
         float abs_d2 = fabsf(d2);
@@ -696,588 +710,610 @@ void Contact::accumulate_contact_force(float3* forces, Mat3* Jx_diag) {
         broad_phase_size, num_edges
         );
 }
+__device__ bool ef_intersect(float3 v0, float3 v1, float3 x0, float3 x1, float3 x2) {
+    float3 face_normal = cross(x1 - x0, x2 - x0);
+    float normal_len = norm(face_normal);
 
-// void Contact::contact_handle() {
-//     int block = 256;
-//     int n = (int)point_hash_table_size;
-//     clear_hash_table<<<(n + block - 1) / block, block>>>(
-//         point_hash_table.data().get(), n);
-//     n = params.nb_all_cloth_vertices;
-//     // 1. collect pp
-//     float cell_size = params.cloth_edge_mean_length * 1.414f;
-//     // const float cell_size = 5.f * 0.001f;
-//     insert_points_to_grid<<<(n + block - 1) / block, block>>>(
-//         vertices_world.data().get(),
-//         point_hash_table.data().get(),
-//         cell_size, point_hash_table_size,
-//         n);
-//
-//     const float dist = 5.f * 0.001f;
-//     pp_result_size.assign(1, 0);
-//     collect_pp<<<(n + block - 1) / block, block>>>(
-//         pp_collision_result.data().get(),
-//         pp_result_size.data().get(),
-//         // sort_key_temp.data().get(),
-//         // sort_value_temp.data().get(),
-//         // sort_result_size.data().get(),
-//         vertices_world.data().get(),
-//         point_hash_table.data().get(),
-//         dist * dist, n,
-//         max_pp_result_size,
-//         point_hash_table_size,
-//         cell_size);
-//     // 2. graph coloring
-//     int result_size;
-//     cudaMemcpy(&result_size, sort_result_size.data().get(), sizeof(int), cudaMemcpyDeviceToHost);
-//     result_size = min(result_size, max_pp_result_size);
-// }
-//
+    if ( normal_len < 1e-16f ) return false;
+    face_normal = face_normal / normal_len;
 
-// void Contact::collision_LCP_postprocess(float3* points_y) {
-//     START_TIMER;
-//     int block = 256;
-//     int n = (int)point_hash_table_size;
-//     clear_hash_table<<<(n + block - 1) / block, block>>>(
-//         point_hash_table.data().get(), n);
-//     int cloth_vertex_size = params.nb_all_cloth_vertices;
-//     n = cloth_vertex_size;
-//     // 1. collect pp
-//     float max_dist = params.cloth_edge_mean_length;
-//
-//     float3* points_x = vertices_old.data().get();
-//     collision_collect_near_pairs(points_x, max_dist, true, false, true, true);
-//     // tp_result_size_h = 0;
-//     RECORD_TIME("collision_collect_near_pairs");
-//
-//
-//     debug_colors.assign(cloth_vertex_size, make_float3(0.5f, 0.5f, 0.5f));
-//     int num_constraints = tp_result_size_h + ee_result_size_h;
-//     if ( num_constraints > 0 ) {
-//         int all_vertex_size = params.nb_all_vertices;
-//         float3* points_collision = temp_vertices_f3.data().get();
-//         cudaMemcpyAsync(points_collision, points_y, all_vertex_size * sizeof(float3), cudaMemcpyDeviceToDevice);
-//         // std::cout <<  result_size << " triangles" << std::endl; 
-//         // compute_collision_penalty_force_triangle_point_plane<<<(result_size + block - 1) / block, block>>>(
-//         //     // Jx.data().get(),
-//         //     Jx_diag.data().get(),
-//         //     forces.data().get(),
-//         //     tp_collision_result.data().get(),
-//         //     points_y, triangle_indices.data().get(),
-//         //     params.nb_all_cloth_vertices,
-//         //     result_size);
-//         if ( tp_result_size_h > 0 )
-//             collision_tp_to_constraints<<<(tp_result_size_h + block - 1) / block, block>>>(
-//                 collision_constraints.data().get(),
-//                 tp_collision_result.data().get(),
-//                 triangle_indices.data().get(),
-//                 tp_result_size_h);
-//         if ( ee_result_size_h > 0 )
-//             collision_ee_to_constraints<<<(ee_result_size_h + block - 1) / block, block>>>(
-//                 collision_constraints.data().get(),
-//                 ee_collision_result.data().get(),
-//                 edges.data().get(),
-//                 tp_result_size_h,
-//                 ee_result_size_h);
-//         // coloring
-//         // 1. 构建邻接关系并着色 (对应 Vivace 算法)
-//         int num_colors = color_constraints(num_constraints);
-//         std::cout << "palette_size: " << num_colors << std::endl;
-//         RECORD_TIME("color_constraints");
-//         n = params.nb_all_vertices;
-//         // fill_inv_mass<<<(n + block - 1) / block, block>>>(
-//         //     mass_inv.data().get(),
-//         //     vertices_obj.data().get(),
-//         //     object_types.data().get(),
-//         //     masses.data().get(),
-//         //     vertices_mask.data().get(), n);
-//         // #define CHECK(v,type) thrust::host_vector<type> _##v = v;\
-//         // std::vector<type> __##v(_##v.begin(), _##v.end())
-//         // CHECK(mass_inv, float);
-//         // #undef CHECK
-//         // solve LCP using PGS
-//         collision_tp_to_normal_constraints<<<(tp_result_size_h + block - 1) / block, block>>>(
-//             normal_constraints.data().get(),
-//             debug_colors.data().get(),
-//             tp_collision_result.data().get(),
-//             constraint_colors.data().get(),
-//             triangle_indices.data().get(),
-//             mass_inv.data().get(),
-//             tp_result_size_h);
-//         collision_ee_to_normal_constraints<<<(ee_result_size_h + block - 1) / block, block>>>(
-//             normal_constraints.data().get(),
-//             debug_colors.data().get(),
-//             ee_collision_result.data().get(),
-//             constraint_colors.data().get(),
-//             edges.data().get(),
-//             mass_inv.data().get(),
-//             tp_result_size_h,
-//             ee_result_size_h);
-//         // 2. 将约束按颜色进行排序/分组
-//         // 这样在 GPU 上读取时是连续的，利用内存合并访问（Coalesced Memory Access）
-//         thrust::sort_by_key(thrust::device, constraint_colors.begin(),
-//             constraint_colors.begin() + num_constraints, normal_constraints.begin());
-//
-//         CUDA_CHECK(cudaDeviceSynchronize());
-//         int* lookup = point_hash_table_lookup.data().get();
-//         record_color_offsets<<<(num_constraints + block - 1) / block, block>>>(
-//             lookup, normal_constraints.data().get(), num_constraints);
-//         CUDA_CHECK(cudaDeviceSynchronize());
-//
-//         cudaMemcpy(constraint_color_offsets.data(), lookup, (num_colors + 2) * sizeof(int), cudaMemcpyDeviceToHost);
-//
-//         int* d_needs_more_iters = sort_result_size.data().get();
-//         int h_needs_more_iters;
-//         // 3. Multi-Color PGS 求解主循环
-//         int num_iterations = 100;
-//         RECORD_TIME("sort constraints");
-//         if ( current_graph_exec != nullptr ) {
-//             cudaGraphExecDestroy(current_graph_exec);
-//             cudaGraphDestroy(current_graph);
-//         }
-//         cudaStreamBeginCapture(capture_stream, cudaStreamCaptureModeGlobal);
-//         cudaMemsetAsync(d_needs_more_iters, 0, sizeof(int), capture_stream);
-//         // 把单次 PGS 迭代 (包含所有颜色的 Kernel 发射) 录制下来
-//         int c = num_colors == MAX_COLORS ? -1 : 0;
-//         for ( ; c < num_colors; ++c ) {
-//             int start_idx = constraint_color_offsets[c + 1];
-//             int end_idx = constraint_color_offsets[c + 2];
-//             if ( start_idx < 0 ) continue;
-//             if ( end_idx <= start_idx ) end_idx = num_colors;
-//             int num_constraints_in_color = end_idx - start_idx;
-//             solvePGS_UnifiedColorBatchKernel<<<(num_constraints_in_color + block - 1) / block, block,0,capture_stream>>>(
-//                 normal_constraints.data().get(), d_needs_more_iters,
-//                 points_collision, constraint_colors.data().get(), mass_inv.data().get(), start_idx,
-//                 num_constraints_in_color);
-//         }
-//
-//         cudaStreamEndCapture(capture_stream, &current_graph);
-//         cudaGraphInstantiate(&current_graph_exec, current_graph, NULL, NULL, 0);
-//         for ( int iter = 0; iter < num_iterations; ++iter ) {
-//             // 按颜色逐个批次启动 GPU Kernel
-//             // int c = num_colors == MAX_COLORS ? -1 : 0;
-//             // for ( ; c < num_colors; ++c ) {
-//             //     int start_idx = constraint_color_offsets[c + 1];
-//             //     int end_idx = constraint_color_offsets[c + 2];
-//             //     if ( start_idx < 0 ) continue;
-//             //     if ( end_idx <= start_idx ) end_idx = num_colors;
-//             //     int num_constraints_in_color = end_idx - start_idx;
-//             //
-//             //     // int gridSize = (num_constraints_in_color + blockSize - 1) / blockSize;
-//             //
-//             //     // 启动 Kernel，仅处理当前颜色的约束
-//             //     solvePGS_UnifiedColorBatchKernel
-//             //         <<<(num_constraints_in_color + block - 1) / block, block>>>(
-//             //             normal_constraints.data().get(), d_needs_more_iters,
-//             //             points_collision, constraint_colors.data().get(), mass_inv.data().get(), start_idx,
-//             //             num_constraints_in_color);
-//             //
-//             // }
-//             cudaGraphLaunch(current_graph_exec, nullptr);
-//             if ( iter % 10 == 0 ) {
-//                 cudaMemcpy(&h_needs_more_iters, d_needs_more_iters, sizeof(int), cudaMemcpyDeviceToHost);
-//                 std::cout << "constraints: " << h_needs_more_iters << std::endl;
-//                 if ( h_needs_more_iters == 0 ) {
-//                     break;
-//                 }
-//             }
-//         }
-//         RECORD_TIME("Multi-Color PGS");
-//         update_end_collision<<<(n + block - 1) / block, block>>>(
-//             points_y,
-//             velocities.data().get(),
-//             points_x,
-//             points_collision,
-//             vertices_mask.data().get(),
-//             dt, n);
-//     }
-// }
-// void Contact::collision_LCP_postprocess_unified(float3* points_y) {
-//     START_TIMER;
-//     int block = 256;
-//     int n = (int)point_hash_table_size;
-//     clear_hash_table<<<(n + block - 1) / block, block>>>(
-//         point_hash_table.data().get(), n);
-//     int cloth_vertex_size = params.nb_all_cloth_vertices;
-//     n = cloth_vertex_size;
-//
-//     // float3* points_x = vertices_old.data().get();
-//
-//     debug_colors.assign(cloth_vertex_size, make_float3(0.5f, 0.5f, 0.5f));
-//     int num_constraints = tp_result_size_h + ee_result_size_h;
-//     if ( num_constraints == 0 ) return;
-//     int all_vertex_size = params.nb_all_vertices;
-//     // float3* points_collision = temp_vertices_f3.data().get();
-//     // cudaMemcpyAsync(points_collision, points_y, all_vertex_size * sizeof(float3), cudaMemcpyDeviceToDevice);
-//     float3* points_collision = points_y;
-//     // coloring
-//     // 1. 构建邻接关系并着色 (对应 Vivace 算法)
-//     int num_colors = color_constraints(num_constraints);
-//     std::cout << "palette_size: " << num_colors << std::endl;
-//     RECORD_TIME("color_constraints");
-//     n = params.nb_all_vertices;
-//     // solve LCP using PGS
-//     // 2. 将约束按颜色进行排序/分组
-//     // 这样在 GPU 上读取时是连续的，利用内存合并访问（Coalesced Memory Access）
-//     thrust::sort_by_key(thrust::device, constraint_colors.begin(),
-//         constraint_colors.begin() + num_constraints, normal_constraints.begin());
-//
-//     CUDA_CHECK(cudaDeviceSynchronize());
-//     int* lookup = point_hash_table_lookup.data().get();
-//     record_color_offsets<<<(num_constraints + block - 1) / block, block>>>(
-//         lookup, normal_constraints.data().get(), num_constraints);
-//     CUDA_CHECK(cudaDeviceSynchronize());
-//
-//     cudaMemcpy(constraint_color_offsets.data(), lookup, (num_colors + 2) * sizeof(int), cudaMemcpyDeviceToHost);
-//
-//     int* d_needs_more_iters = sort_result_size.data().get();
-//     int h_needs_more_iters;
-//     // 3. Multi-Color PGS 求解主循环
-//     int num_iterations = 10;
-//     RECORD_TIME("sort constraints");
-//     if ( current_graph_exec != nullptr ) {
-//         cudaGraphExecDestroy(current_graph_exec);
-//         cudaGraphDestroy(current_graph);
-//     }
-//     cudaStreamBeginCapture(capture_stream, cudaStreamCaptureModeGlobal);
-//     cudaMemsetAsync(d_needs_more_iters, 0, sizeof(int), capture_stream);
-//     int c = num_colors == MAX_COLORS ? -1 : 0;
-//     for ( ; c < num_colors; ++c ) {
-//         int start_idx = constraint_color_offsets[c + 1];
-//         int end_idx = constraint_color_offsets[c + 2];
-//         if ( start_idx < 0 ) continue;
-//         if ( end_idx <= start_idx ) end_idx = num_colors;
-//         int num_constraints_in_color = end_idx - start_idx;
-//         solvePGS_UnifiedColorBatchKernel<<<(num_constraints_in_color + block - 1) / block, block,0,capture_stream>>>(
-//             normal_constraints.data().get(), d_needs_more_iters,
-//             points_collision, constraint_colors.data().get(), mass_inv.data().get(), start_idx,
-//             num_constraints_in_color);
-//     }
-//
-//     cudaStreamEndCapture(capture_stream, &current_graph);
-//     cudaGraphInstantiate(&current_graph_exec, current_graph, NULL, NULL, 0);
-//     for ( int iter = 0; iter < num_iterations; ++iter ) {
-//         cudaGraphLaunch(current_graph_exec, nullptr);
-//         if ( iter % 10 == 0 ) {
-//             cudaMemcpy(&h_needs_more_iters, d_needs_more_iters, sizeof(int), cudaMemcpyDeviceToHost);
-//             std::cout << "constraints: " << h_needs_more_iters << std::endl;
-//             if ( h_needs_more_iters == 0 ) {
-//                 break;
-//             }
-//         }
-//     }
-//     RECORD_TIME("Multi-Color PGS");
-//     // update_end_collision<<<(n + block - 1) / block, block>>>(
-//     //     points_y,
-//     //     velocities.data().get(),
-//     //     points_x,
-//     //     points_collision,
-//     //     vertices_mask.data().get(),
-//     //     dt, n);
-// }
-//
-// int Geometry::color_constraints(int num_constraints) {
-//     int blockSize = 256;
-//     int gridSize = (num_constraints + blockSize - 1) / blockSize;
-//     int* d_constraint_colors = this->constraint_colors.data().get();
-//     // 初始化着色数组为 -1
-//     cudaMemsetAsync(d_constraint_colors, -1, num_constraints * sizeof(int));
-//
-//     int num_vertices = params.nb_all_vertices;
-//     // 分配黑板：记录每个顶点每种颜色被谁占用了
-//     int* d_vertex_color_claimer = this->vertex_color_claimer.data().get();
-//     cudaMemsetAsync(d_vertex_color_claimer, -1, num_vertices * MAX_COLORS * sizeof(int));
-//
-//     int* d_uncolored_count = this->uncolored_count.data().get();
-//     uint64_t* d_vertex_forbidden_masks = this->vertex_forbidden_masks.data().get();
-//
-//     int h_uncolored_count = num_constraints;
-//     // int last_uncolored_count = h_uncolored_count;
-//     int iteration = 0;
-//     // int h_current_palette_size = 4;
-//
-//     // CollisionConstraint* d_constraints = this->collision_constraints.data().get();
-//     auto* d_constraints = this->normal_constraints.data().get();
-//
-//     auto d_current_palette_size = alloc_pool();
-//     auto d_iteration = alloc_pool();
-//     auto d_last_uncolored_count = alloc_pool();
-//     cudaMemsetAsync(d_last_uncolored_count.ptr, num_constraints, sizeof(int));
-//     cudaMemsetAsync(d_iteration.ptr, 0, sizeof(int));
-//     // 一开始给出少量颜色，增加冲突几率但节约颜色
-//     int h_current_palette_size = 4;
-//     cudaMemcpyAsync(d_current_palette_size.ptr, &h_current_palette_size, sizeof(int), cudaMemcpyHostToDevice);
-//
-//     // if ( current_graph_exec != nullptr ) {
-//     //     cudaGraphExecDestroy(current_graph_exec);
-//     //     cudaGraphDestroy(current_graph);
-//     // }
-//     cudaGraph_t graph = nullptr;
-//     cudaGraphExec_t graph_exec = nullptr;
-//     cudaStreamBeginCapture(capture_stream, cudaStreamCaptureModeGlobal);
-//
-//     for ( int i = 0; i < 20; i++ ) {
-//         cudaMemsetAsync(d_vertex_forbidden_masks, 0, num_vertices * sizeof(uint64_t), capture_stream);
-//         cudaMemsetAsync(d_vertex_color_claimer, -1, num_vertices * MAX_COLORS * sizeof(int), capture_stream);
-//         // cudaMemsetAsync(d_uncolored_count, 0, sizeof(int));
-//         // 步骤 1：去抢占颜色
-//         k_mark_forbidden_bits<<<gridSize, blockSize,0,capture_stream>>>(
-//             d_vertex_forbidden_masks, d_uncolored_count, d_constraints, d_constraint_colors,
-//             num_constraints);
-//         k_claim_color_bitmask<<<gridSize, blockSize,0,capture_stream>>>(
-//             d_vertex_color_claimer, d_constraints, d_constraint_colors, d_vertex_forbidden_masks,
-//             d_current_palette_size.ptr, d_iteration.ptr, num_constraints);
-//
-//         // 步骤 2：验证是否成功
-//         k_verify_colors<<<gridSize, blockSize,0,capture_stream>>>(
-//             d_constraint_colors, d_uncolored_count, d_constraints,
-//             d_vertex_color_claimer, num_constraints);
-//         k_update_colors<<<1, 1,0,capture_stream>>>(
-//             d_current_palette_size.ptr,
-//             d_uncolored_count,
-//             d_last_uncolored_count.ptr,
-//             d_iteration.ptr);
-//     }
-//     cudaStreamEndCapture(capture_stream, &graph);
-//     cudaGraphInstantiate(&graph_exec, graph, NULL, NULL, 0);
-//     // d_current_palette_size.ptr
-//     while ( iteration < 10 ) {
-//         cudaGraphLaunch(graph_exec, nullptr);
-//         /*cudaMemsetAsync(d_vertex_forbidden_masks, 0, num_vertices * sizeof(uint64_t));
-//         cudaMemsetAsync(d_vertex_color_claimer, -1, num_vertices * MAX_COLORS * sizeof(int));
-//         // cudaMemsetAsync(d_uncolored_count, 0, sizeof(int));
-//         // 步骤 1：去抢占颜色
-//         k_mark_forbidden_bits<<<gridSize, blockSize>>>(
-//             d_vertex_forbidden_masks, d_uncolored_count, d_constraints, d_constraint_colors,
-//             num_constraints);
-//         k_claim_color_bitmask<<<gridSize, blockSize>>>(
-//             d_vertex_color_claimer, d_constraints, d_constraint_colors, d_vertex_forbidden_masks,
-//             d_current_palette_size.ptr, d_iteration.ptr, num_constraints);
-//
-//         // 步骤 2：验证是否成功
-//         k_verify_colors<<<gridSize, blockSize>>>(
-//             d_constraint_colors, d_uncolored_count, d_constraints,
-//             d_vertex_color_claimer, num_constraints);
-//         k_update_colors<<<1, 1>>>(
-//             d_current_palette_size.ptr,
-//             d_uncolored_count,
-//             d_last_uncolored_count.ptr,
-//             d_iteration.ptr);*/
-//         // if ( iteration % 3 == 0 ) {
-//         cudaMemcpy(&h_uncolored_count, d_uncolored_count, sizeof(int), cudaMemcpyDeviceToHost);
-//         if ( h_uncolored_count == 0 ) break;
-//         // }
-//         iteration++;
-//
-//         // 如果还有没涂上的，慢慢增加可选颜色的种类
-//         // cudaMemcpy(&h_uncolored_count, d_uncolored_count, sizeof(int), cudaMemcpyDeviceToHost);
-//         // if ( last_uncolored_count == h_uncolored_count && h_uncolored_count > 0 ) {
-//         //     if ( current_palette_size < MAX_COLORS )
-//         //         current_palette_size++;
-//         // }
-//         // last_uncolored_count = h_uncolored_count;
-//         // std::cout << "uncolored_count: " << h_uncolored_count << std::endl;
-//     }
-//     // k_print_colors<<<gridSize, blockSize>>>(d_constraint_colors, d_constraints, num_constraints);
-//     cudaGraphDestroy(graph);
-//     cudaGraphExecDestroy(graph_exec);
-//     cudaMemcpy(&h_current_palette_size, d_current_palette_size.ptr,
-//         sizeof(int), cudaMemcpyDeviceToHost);
-//     return h_current_palette_size;
-//
-// }
-//
-// void Contact::collision_collect_near_pairs(float3* points, float max_dist,
-//     bool update_hash, bool collect_pp, bool collect_tp, bool collect_ee) {
-//     START_TIMER;
-//     int block = 256;
-//     // int n = (int)point_hash_table_size;
-//     // clear_hash_table<<<(n + block - 1) / block, block>>>(
-//     //     point_hash_table.data().get(), n);
-//     int vertex_size = params.nb_all_cloth_vertices;
-//     int n = vertex_size;
-//     float cell_size = max_dist * 2.f;
-//     auto constraint_size_p = alloc_pool();
-//     if ( collect_tp || collect_ee || collect_pp )
-//         cudaMemsetAsync(constraint_size_p.ptr, 0, sizeof(int));
-//     // float max_dist_edge = params.cloth_edge_mean_length * 2.f;
-//     if ( update_hash ) {
-//         auto point_hashes_size_p = alloc_pool();
-//         auto edge_hashes_size_p = alloc_pool();
-//         cudaMemsetAsync(point_hashes_size_p.ptr, 0, sizeof(int));
-//         record_point_hash<false, false><<<(n + block - 1) / block, block>>>(
-//             point_hashes.data().get(),
-//             sort_key_temp.data().get(),
-//             point_hashes_size_p.ptr,
-//             nullptr,
-//             points,
-//             vertex_proxy.data().get(),
-//             cell_size,
-//             max_dist,
-//             max_point_hashes_size,
-//             point_hash_table_size,
-//             n);
-//
-//         CUDA_CHECK(cudaMemcpy(&point_hashes_size_h, point_hashes_size_p.ptr, sizeof(int), cudaMemcpyDeviceToHost));
-//         point_hashes_size_h = min(point_hashes_size_h, max_point_hashes_size);
-//         RECORD_TIME("record_point_hash");
-//         thrust::sort_by_key(thrust::device, sort_key_temp.begin(), sort_key_temp.begin() + point_hashes_size_h,
-//             point_hashes.begin());
-//
-//         RECORD_TIME("sort_by_key");
-//         // build hash_table lookup
-//         cudaMemsetAsync(point_hash_table_lookup.data().get(), -1, sizeof(int) * (point_hash_table_size + 1));
-//         record_hash_table_lookup<<<(point_hashes_size_h + block - 1) / block, block>>>(
-//             point_hash_table_lookup.data().get(),
-//             point_hashes.data().get(),
-//             point_hash_table_size, point_hashes_size_h);
-//         // edges
-//         if ( collect_ee ) {
-//             n = params.nb_all_cloth_edges;
-//             CUDA_CHECK(cudaMemsetAsync(edge_hashes_size_p.ptr, 0, sizeof(int)));
-//             record_edge_hashes<<<(n + block - 1) / block, block>>>(
-//                 edge_hashes.data().get(),
-//                 sort_key_temp.data().get(),
-//                 edge_hashes_size_p.ptr,
-//                 edges.data().get(),
-//                 points,
-//                 cell_size,
-//                 max_edge_hashes_size,
-//                 edge_hash_table_size,
-//                 n);
-//             CUDA_CHECK(cudaMemcpy(&edge_hashes_size_h, edge_hashes_size_p.ptr, sizeof(int), cudaMemcpyDeviceToHost));
-//             edge_hashes_size_h = min(edge_hashes_size_h, max_edge_hashes_size);
-//             RECORD_TIME("record_edge_hash");
-//             thrust::sort_by_key(thrust::device,
-//                 sort_key_temp.begin(), sort_key_temp.begin() + edge_hashes_size_h, edge_hashes.begin());
-//             RECORD_TIME("sort_by_key");
-//             // build hash_table lookup
-//             cudaMemsetAsync(edge_hash_table_lookup.data().get(), -1, sizeof(int) * (edge_hash_table_size + 1));
-//             record_hash_table_lookup<<<(edge_hashes_size_h + block - 1) / block, block>>>(
-//                 edge_hash_table_lookup.data().get(),
-//                 edge_hashes.data().get(),
-//                 edge_hash_table_size, edge_hashes_size_h);
-//         }
-//     }
-//     tp_result_size_h = pp_result_size_h = ee_result_size_h = 0;
-//     if ( collect_pp ) {
-//         cudaMemsetAsync(pp_result_size.data().get(), 0, sizeof(int));
-//         n = params.nb_all_cloth_vertices;
-//         // debug_colors.assign(vertex_size, make_float3(0.5f, 0.5f, 0.5f));
-//         // collect_pp_sorted<<<(n + block - 1) / block, block>>>(
-//         //     pp_collision_result.data().get(),
-//         //     pp_result_size.data().get(),
-//         //     debug_colors.data().get(),
-//         //     point_hashes.data().get(),
-//         //     points,
-//         //     edge_lookup.data().get(),
-//         //     dir_edges.data().get(),
-//         //     point_hash_table_lookup.data().get(),
-//         //     vertex_proxy.data().get(),
-//         //     vertices_mask.data().get(),
-//         //     cell_size,
-//         //     max_dist,
-//         //     point_hash_table_size,
-//         //     point_hashes_size_h,
-//         //     max_pp_result_size,
-//         //     n);
-//         points_query_points_by_point_hash<<<(n + block - 1) / block, block>>>(
-//             normal_constraints.data().get(),
-//             pp_result_size.data().get(),
-//             nullptr,
-//             point_hashes.data().get(),
-//             points,
-//             edge_lookup.data().get(),
-//             dir_edges.data().get(),
-//             point_hash_table_lookup.data().get(),
-//             vertex_proxy.data().get(),
-//             vertices_mask.data().get(),
-//             cell_size,
-//             max_dist,
-//             point_hash_table_size,
-//             point_hashes_size_h,
-//             max_collision_constraints_size,
-//             n);
-//         cudaMemcpy(&pp_result_size_h, pp_result_size.data().get(), sizeof(int), cudaMemcpyDeviceToHost);
-//         // pp_result_size_h = min(pp_result_size_h, max_pp_result_size);
-//         pp_result_size_h = min(pp_result_size_h, max_collision_constraints_size);
-//         std::cout << "pp_result_size_h = " << pp_result_size_h << std::endl;
-//     }
-//     if ( collect_tp ) {
-//         n = params.nb_all_triangles;
-//         // cudaMemsetAsync(tp_result_size.data().get(), 0, sizeof(int));
-//         // triangles_query_points<<<(n + block - 1) / block, block>>>(
-//         //     tp_collision_result.data().get(),
-//         //     tp_result_size.data().get(),
-//         //     triangle_indices.data().get(),
-//         //     points,
-//         //     vertices_old.data().get(),
-//         //     point_hashes.data().get(),
-//         //     point_hash_table_lookup.data().get(),
-//         //     vertices_mask.data().get(), cell_size,
-//         //     max_dist * max_dist, point_hash_table_size,
-//         //     point_hashes_size_h, max_tp_result_size,
-//         //     params.nb_all_cloth_vertices, n);
-//         // cudaMemcpy(&tp_result_size_h, tp_result_size.data().get(), sizeof(int), cudaMemcpyDeviceToHost);
-//         // tp_result_size_h = min(tp_result_size_h, max_tp_result_size);
-//         debug_colors.assign(params.nb_all_cloth_edges, make_float3(0.5f, 0.5f, 0.5f));
-//         triangles_query_points_by_point_hash<<<(n + block - 1) / block, block>>>(
-//             normal_constraints.data().get(),
-//             nullptr,
-//             constraint_size_p.ptr,
-//             triangle_indices.data().get(),
-//             points,
-//             // vertices_old.data().get(),
-//             point_hashes.data().get(),
-//             point_hash_table_lookup.data().get(),
-//             vertices_mask.data().get(), cell_size,
-//             max_dist * max_dist, point_hash_table_size,
-//             point_hashes_size_h, max_collision_constraints_size,
-//             params.nb_all_cloth_vertices, n);
-//         cudaMemcpy(&tp_result_size_h, constraint_size_p.ptr, sizeof(int), cudaMemcpyDeviceToHost);
-//         tp_result_size_h = min(tp_result_size_h, max_collision_constraints_size);
-//         RECORD_TIME("triangles_query_points");
-//         std::cout << "tp_result_size_h = " << tp_result_size_h << std::endl;
-//     }
-//     if ( collect_ee ) {
-//         n = params.nb_all_edges;
-//         // max_dist *= 0.5f;
-//         // cudaMemsetAsync(ee_result_size.data().get(), 0, sizeof(int));
-//         // edges_query_edges_via_point_hash<<<(n + block - 1) / block, block>>>(
-//         //     ee_collision_result.data().get(),
-//         //     ee_result_size.data().get(),
-//         //     edges.data().get(),
-//         //     points,
-//         //     // vertices_old.data().get(),
-//         //     point_hashes.data().get(),
-//         //     point_hash_table_lookup.data().get(),
-//         //     dir_edges.data().get(),
-//         //     edge_lookup.data().get(),
-//         //     vertices_mask.data().get(), cell_size,
-//         //     max_dist * max_dist, max_dist * 0.5, point_hash_table_size,
-//         //     point_hashes_size_h, max_ee_result_size,
-//         //     params.nb_all_cloth_vertices, n);
-//         // cudaMemcpy(&ee_result_size_h, ee_result_size.data().get(), sizeof(int), cudaMemcpyDeviceToHost);
-//         // ee_result_size_h = min(ee_result_size_h, max_ee_result_size);
-//         // RECORD_TIME("edges_query_edges_via_point_hash");
-//         block = 64;
-//         detect_edge_edge_constraints<<<(n + block - 1) / block, block>>>(
-//             normal_constraints.data().get(),
-//             constraint_size_p.ptr,
-//             edges.data().get(),
-//             points,
-//             edge_hashes.data().get(),
-//             edge_hash_table_lookup.data().get(),
-//             vertices_mask.data().get(),
-//             cell_size, max_dist,
-//             max_collision_constraints_size,
-//             edge_hash_table_size,
-//             edge_hashes_size_h,
-//             params.nb_all_cloth_vertices,
-//             n);
-//         cudaMemcpy(&ee_result_size_h, constraint_size_p.ptr, sizeof(int), cudaMemcpyDeviceToHost);
-//         RECORD_TIME("detect_edge_edge_constraints");
-//         ee_result_size_h = min(ee_result_size_h, max_collision_constraints_size);
-//         ee_result_size_h -= tp_result_size_h;
-//         std::cout << "ee_result_size_h = " << ee_result_size_h << std::endl;
-//     }
-// }
+    float d1 = dot(face_normal, v0 - x0);
+    float d2 = dot(face_normal, v1 - x0);
+
+    if ( d1 * d2 >= 0.0f ) return false;
+
+    float abs_d1 = fabsf(d1);
+    float abs_d2 = fabsf(d2);
+    float3 hit_point = (v0 * abs_d2 + v1 * abs_d1) / (abs_d2 + abs_d1);
+    float u, v, w;
+    barycentric(x0, x1, x2, hit_point, u, v, w);
+    if ( u < 0.f || v < 0.f || w < 0.f ) return false;
+    return true;
+}
+
+
+void Contact::ccd_truncation_traverse_bvh(const float3* pos_prev, const float3* pos_target) {
+    thrust::fill(thrust::cuda::par_nosync,
+        truncation_t.begin(), truncation_t.end(), 1.f);
+    float gamma_min = max(-1.f, geo->get_global_parameter("gamma_min", 1e-9f));
+    if (gamma_min == -1.f) return;
+    
+    auto& params = geo->params;
+    int block = 256;
+    int n = params.nb_all_edges;
+    unsigned int num_nodes = 2 * n - 1;
+    auto child_count = (unsigned int*)get_device_temp_memory(nullptr, num_nodes * sizeof(unsigned int));
+    cudaMemsetAsync(child_count, 0, num_nodes * sizeof(unsigned int));
+    refit_edge_offset_bvh_kernel<<<(n + block - 1) / block, block>>>(
+        pos_prev, pos_target,
+        thrust::raw_pointer_cast(geo->edges.data()),
+        thrust::raw_pointer_cast(edge_bvh.nodes.data()),
+        thrust::raw_pointer_cast(edge_bvh.parent.data()),
+        child_count,
+        thrust::raw_pointer_cast(edge_bvh.aabbs.data()),
+        thrust::raw_pointer_cast(geo->obj_data.data()),
+        thrust::raw_pointer_cast(geo->vertices_obj.data()),
+        n);
+    n = params.nb_all_triangles;
+    num_nodes = 2 * n - 1;
+    child_count = (unsigned int*)get_device_temp_memory(nullptr, num_nodes * sizeof(unsigned int));
+    cudaMemsetAsync(child_count, 0, num_nodes * sizeof(unsigned int));
+    refit_face_offset_bvh_kernel<<<(n + block - 1) / block, block>>>(
+        pos_prev, pos_target,
+        thrust::raw_pointer_cast(geo->triangle_indices.data()),
+        thrust::raw_pointer_cast(tri_bvh.nodes.data()),
+        thrust::raw_pointer_cast(tri_bvh.parent.data()),
+        child_count,
+        thrust::raw_pointer_cast(tri_bvh.aabbs.data()),
+        thrust::raw_pointer_cast(geo->obj_data.data()),
+        thrust::raw_pointer_cast(geo->vertices_obj.data()),
+        n);
+
+
+    n = params.nb_all_vertices;
+    float parallel_eps = max(0.f, geo->get_global_parameter("parallel_eps", 1e-6f));
+    float gamma_r = max(0.f, geo->get_global_parameter("gamma_r", 0.9f));
+
+    vf_collision_planar_truncation_bvh_kernel<<<(n + block - 1) / block, block>>>(
+        truncation_t.data().get(), point_sorted_indices.data().get(), n,
+        tri_bvh.nodes.data().get(), tri_bvh.aabbs.data().get(), tri_bvh.root_idx,
+        pos_prev, pos_target,
+        geo->vertex_normals.data().get(), geo->triangle_indices.data().get(),
+        geo->obj_data.data().get(), geo->vertices_obj.data().get(),
+        params.nb_all_cloth_vertices,
+        parallel_eps, gamma_r, gamma_min);
+    n = params.nb_all_edges;
+    ee_collision_planar_truncation_bvh_kernel<<<(n + block - 1) / block, block>>>(
+        truncation_t.data().get(), n, edge_bvh.nodes.data().get(),
+        edge_bvh.aabbs.data().get(), edge_bvh.root_idx,
+        pos_prev, pos_target,
+        geo->edge_normals.data().get(), geo->edges.data().get(),
+        geo->obj_data.data().get(), geo->vertices_obj.data().get(),
+        params.nb_all_cloth_vertices,
+        parallel_eps, gamma_r, gamma_min);
+    // CUDA_CHECK(cudaDeviceSynchronize());
+
+}
+__device__ __forceinline__ float planar_truncation_t_debug(
+    float3 p, float proj, float3 n, float3 d, float gamma_min, const char* vertex_name) {
+    if ( fabsf(proj) < 1e-16f ) {
+        printf("    %s proj=%e (parallel) -> t=1.0\n", vertex_name, proj);
+        return 1.0f;
+    }
+    float t_raw = dot(n, d - p) / proj;
+    float t;
+    if ( t_raw < 0.0f ) {
+        t = 1.0f;
+    }
+    else {
+        t = fmaxf(0.f, fminf(1.0f, t_raw - gamma_min));
+    }
+    printf("    %s : p=(%f %f %f) proj=%e | d=(%f %f %f) | n=(%f %f %f) | t_raw=%e t=%e\n",
+        vertex_name,
+        p.x, p.y, p.z, proj,
+        d.x, d.y, d.z,
+        n.x, n.y, n.z,
+        t_raw, t);
+    return t;
+}
+
+__device__ inline bool edge_edge_planar_truncation_debug(
+    float3 e0v0, float3 delta_e0v0,
+    float3 e0v1, float3 delta_e0v1,
+    float3 e1v0, float3 delta_e1v0,
+    float3 e1v1, float3 delta_e1v1,
+    float thickness,
+    int layer_diff,
+    float3 edge0_normal,
+    float3 edge1_normal,
+    float parallel_eps, float gamma_r, float gamma_min,
+    float& t_e0v0, float& t_e0v1, float& t_e1v0, float& t_e1v1) {
+    float s, t;
+    float3 dP;
+    segment_segment_closest_robust(e0v0, e0v1, e1v0, e1v1, s, t, dP);
+    float3 u0 = e0v1 - e0v0;
+    float3 v1 = e1v1 - e1v0;
+    float3 c1 = e0v0 + s * u0;          // point on edge 0
+    float3 c2 = e1v0 + t * v1;          // point on edge 1
+
+    float3 n_hat = dP;             // identical to c1-c2
+    float len_sq = dot(n_hat, n_hat);
+
+    float scaled_thickness = thickness * gamma_r;
+
+    printf("  closest: s=%e t=%e | c1=(%f %f %f) c2=(%f %f %f)\n",
+        s, t, c1.x, c1.y, c1.z, c2.x, c2.y, c2.z);
+
+    if ( len_sq < 1e-18f ) {
+        printf("  degenerate (len_sq=%e) -> skip\n", len_sq);
+        return false;
+    }
+
+    // layer check only if layer_diff != 0
+    if ( layer_diff != 0 ) {
+        float3 low_normal = (layer_diff < 0) ? edge0_normal : edge1_normal;
+        if ( dot(low_normal, n_hat) < 0.0f ) {
+            printf("  layer skip (dot=%e)\n", dot(low_normal, n_hat));
+            return false;
+        }
+    }
+
+    float3 n = n_hat * rsqrtf(len_sq);
+
+    float proj_e0v0 = dot(n, delta_e0v0);
+    float proj_e0v1 = dot(n, delta_e0v1);
+    float proj_e1v0 = dot(n, delta_e1v0);
+    float proj_e1v1 = dot(n, delta_e1v1);
+
+    float delta_e0 = fmaxf(fmaxf(-proj_e0v0, -proj_e0v1), 0.0f);
+    float delta_e1 = fmaxf(fmaxf(proj_e1v0, proj_e1v1), 0.0f);
+
+    float current_dist = sqrtf(len_sq);
+
+    printf("  proj: e0v0=%e e0v1=%e e1v0=%e e1v1=%e\n", proj_e0v0, proj_e0v1, proj_e1v0, proj_e1v1);
+    printf("  delta_e0=%e delta_e1=%e current_dist=%e\n", delta_e0, delta_e1, current_dist);
+
+
+    // early exit if the gap cannot be closed
+    // if ( delta_e0 + delta_e1 + thickness < current_dist ||  delta_e0 + delta_e1 == 0.0f ) {
+    if ( current_dist > thickness * 3.0f && delta_e0 + delta_e1 == 0.0f ) {
+        printf("  early exit (delta_e0 + delta_e1=%e, current_dist=%e)\n",
+            delta_e0 + delta_e1, current_dist);
+        return false;
+    }
+    float lmbd;
+    if ( delta_e0 + delta_e1 == 0.0f )
+        lmbd = 0.5f;
+    else
+        lmbd = delta_e1 / (delta_e0 + delta_e1);
+    lmbd = fmaxf(0.05f, fminf(0.95f, lmbd));
+    printf("  lmbd=%e\n", lmbd);
+
+    float3 d0 = c2 + lmbd * n_hat + (scaled_thickness * 0.5f) * n;
+    float3 d1 = c2 + lmbd * n_hat - (scaled_thickness * 0.5f) * n;
+
+    printf("  d0=(%f %f %f)  d1=(%f %f %f)\n", d0.x, d0.y, d0.z, d1.x, d1.y, d1.z);
+    // t_e0v0 = proj_e0v0 < -parallel_eps ?
+    //              planar_truncation_t_debug(e0v0, proj_e0v0, n, d0, gamma_min, "e0v0") : 1.f;
+    // t_e0v1 = proj_e0v1 < -parallel_eps ?
+    //              planar_truncation_t_debug(e0v1, proj_e0v1, n, d0, gamma_min, "e0v1") : 1.f;
+    // t_e1v0 = proj_e1v0 > parallel_eps ?
+    //              planar_truncation_t_debug(e1v0, proj_e1v0, n, d1, gamma_min, "e1v0") : 1.f;
+    // t_e1v1 = proj_e1v1 > parallel_eps ?
+    //              planar_truncation_t_debug(e1v1, proj_e1v1, n, d1, gamma_min, "e1v1") : 1.f;
+    t_e0v0 =
+        planar_truncation_t_debug(e0v0, proj_e0v0, n, d0, gamma_min, "e0v0");
+    t_e0v1 =
+        planar_truncation_t_debug(e0v1, proj_e0v1, n, d0, gamma_min, "e0v1");
+    t_e1v0 =
+        planar_truncation_t_debug(e1v0, proj_e1v0, n, d1, gamma_min, "e1v0");
+    t_e1v1 =
+        planar_truncation_t_debug(e1v1, proj_e1v1, n, d1, gamma_min, "e1v1");
+
+    bool any = (t_e0v0 < 1.0f) || (t_e0v1 < 1.0f) || (t_e1v0 < 1.0f) || (t_e1v1 < 1.0f);
+    printf("  results: t_e0v0=%e t_e0v1=%e t_e1v0=%e t_e1v1=%e  any=%d\n",
+        t_e0v0, t_e0v1, t_e1v0, t_e1v1, any);
+    return any;
+}
+
+__device__ inline bool vertex_triangle_planar_truncation_debug(
+    float3 v, float3 delta_v,
+    float3 t0, float3 delta_t0,
+    float3 t1, float3 delta_t1,
+    float3 t2, float3 delta_t2,
+    float thickness,
+    int layer_diff,
+    float3 vertex_normal,
+    float parallel_eps, float gamma_r, float gamma_min,
+    float& t_v, float& t_t0, float& t_t1, float& t_t2) {
+    float3 closest_pt;
+    float len_sq = point_triangle_sq_dist(v, t0, t1, t2, closest_pt);
+    if ( len_sq < 1e-18f ) {
+        printf("  vf degenerate (len_sq=%e) -> skip\n", len_sq);
+        return false;
+    }
+
+    float3 n_hat = v - closest_pt;
+    if ( layer_diff != 0 ) {
+        float3 low_normal;
+        if ( layer_diff < 0 ) {
+            low_normal = vertex_normal;
+        }
+        else {
+            low_normal = cross(t1 - t0, t2 - t0);
+        }
+        if ( dot(low_normal, n_hat) < 0.0f ) {
+            printf("  vf layer skip (dot=%e)\n", dot(low_normal, n_hat));
+            return false;
+        }
+    }
+
+    float3 n = n_hat * rsqrtf(len_sq);
+
+    float proj_v = dot(n, delta_v);
+    float proj_t0 = dot(n, delta_t0);
+    float proj_t1 = dot(n, delta_t1);
+    float proj_t2 = dot(n, delta_t2);
+
+    float delta_v_n = fmaxf(-proj_v, 0.0f);
+    float delta_t_n = fmaxf(fmaxf(proj_t0, proj_t1), fmaxf(proj_t2, 0.0f));
+
+    printf("  vf proj: v=%e t0=%e t1=%e t2=%e | delta_v_n=%e delta_t_n=%e\n",
+        proj_v, proj_t0, proj_t1, proj_t2, delta_v_n, delta_t_n);
+
+    float lmbd;
+    // if ( delta_v_n + delta_t_n == 0.0f )
+    if ( delta_v_n == 0.0f || delta_t_n == 0.0f )
+        lmbd = 0.5f;
+    else
+        lmbd = delta_t_n / (delta_v_n + delta_t_n);
+    lmbd = fmaxf(0.2f, fminf(0.8f, lmbd));
+    float current_dist = sqrtf(len_sq);
+    printf("  vf lmbd=%e | current_dist=%e\n", lmbd, current_dist);
+    thickness *= gamma_r;
+    float3 d = closest_pt + lmbd * n_hat + (thickness * 0.5f) * n;
+    printf("  vf d_plane=(%f %f %f)\n", d.x, d.y, d.z);
+
+    t_v = planar_truncation_t_debug(v, proj_v, n, d, gamma_min, "v");
+    d -= thickness * n;
+    t_t0 = planar_truncation_t_debug(t0, proj_t0, n, d, gamma_min, "t0");
+    t_t1 = planar_truncation_t_debug(t1, proj_t1, n, d, gamma_min, "t1");
+    t_t2 = planar_truncation_t_debug(t2, proj_t2, n, d, gamma_min, "t2");
+    if ( delta_v_n == 0.0f ) {
+        if ( dot(n, d - t0) < -1e-7f ) t_t0 = fminf(t_t0, 1e-6f);
+        if ( dot(n, d - t1) < -1e-7f ) t_t1 = fminf(t_t1, 1e-6f);
+        if ( dot(n, d - t2) < -1e-7f ) t_t2 = fminf(t_t2, 1e-6f);
+    }
+
+    bool any = (t_v < 1.0f) || (t_t0 < 1.0f) || (t_t1 < 1.0f) || (t_t2 < 1.0f);
+    printf("  vf results: t_v=%e t_t0=%e t_t1=%e t_t2=%e any=%d\n", t_v, t_t0, t_t1, t_t2, any);
+    return any;
+}
+
+static __global__ void check_ef_pairs_kernel(
+    float3* __restrict__ debug_colors,
+    float* __restrict__ truncation_t,
+    const unsigned int* __restrict__ sorted_indices,
+    const unsigned int* __restrict__ edge_ranks,
+    const AABB*__restrict__ edge_aabbs,
+    unsigned int num_queries,
+    const int2*__restrict__ nodes,
+    const AABB*__restrict__ aabbs,
+    const int2*__restrict__ edges,
+    const int3*__restrict__ tri_edges,
+    const float3* __restrict__ pos_prev,
+    const float3* __restrict__ pos_target,          // 已截断位置
+    const ObjectDataInput* __restrict__ obj_data,
+    const int* __restrict__ vertices_obj,
+    const int3* __restrict__ tri_indices,
+    unsigned int root_idx,
+    const float parallel_eps,
+    const float gamma_r,
+    const float gamma_min,
+    int* __restrict__ debug_lock
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if ( i >= num_queries ) return;
+    AABB q_aabb = edge_aabbs[i];
+    i = sorted_indices[i];
+    int2 edge = edges[i];
+    float3 v0 = pos_target[edge.x], v1 = pos_target[edge.y];
+    float3 v0_prev = pos_prev[edge.x], v1_prev = pos_prev[edge.y];
+    // @formatter:off
+    BVH_TRAVERSE_LOOP(q_aabb, 64,
+        int3 tri = tri_indices[prim_idx];
+        if (edge.x == tri.x || edge.x == tri.y || edge.x == tri.z ||
+            edge.y == tri.x || edge.y == tri.y || edge.y == tri.z) continue;
+        float3 x0 = pos_target[tri.x], x1 = pos_target[tri.y], x2 = pos_target[tri.z];
+        float3 x0_prev = pos_prev[tri.x], x1_prev = pos_prev[tri.y], x2_prev = pos_prev[tri.z];
+
+        if (ef_intersect(v0,v1,x0,x1,x2) &&
+            !ef_intersect(v0_prev,v1_prev,x0_prev,x1_prev,x2_prev)) {
+        debug_colors[edge.x] = make_float3(1.f, 1.f, 0.f);
+        debug_colors[edge.y] = make_float3(1.f, 1.f, 0.f);
+        debug_colors[ tri.x] = make_float3(1.f, 1.f, 0.f);
+        debug_colors[ tri.y] = make_float3(1.f, 1.f, 0.f);
+        debug_colors[ tri.z] = make_float3(1.f, 1.f, 0.f);
+
+        // 原子锁：仅打印一次
+        if (atomicCAS(debug_lock, 0, 1) == 0) {
+        debug_colors[edge.x] = make_float3(1.f, 0.f, 0.f);
+        debug_colors[edge.y] = make_float3(1.f, 0.f, 0.f);
+        printf("=== EF INTERSECTION DETECTED ===\n");
+        printf("Edge %d (v%d,v%d): curr=(%f %f %f) - (%f %f %f)\n",
+            i, edge.x, edge.y, v0.x, v0.y, v0.z, v1.x, v1.y, v1.z);
+        printf("Triangle %d (v%d,v%d,v%d): curr=(%f %f %f) (%f %f %f) (%f %f %f)\n",
+            prim_idx, tri.x, tri.y, tri.z, x0.x, x0.y, x0.z, x1.x, x1.y, x1.z, x2.x, x2.y, x2.z);
+
+        // 恢复原始目标位置
+        auto recover = [&](int vid, float3 prev) -> float3 {
+        float tr = truncation_t[vid];
+        if (tr > 1e-10f) {
+        return prev + (pos_target[vid] - prev) / tr;
+        } else {
+        return prev; // 位移为零
+        }
+        };
+
+        float3 e0v0_orig = recover(edge.x, pos_prev[edge.x]);
+        float3 e0v1_orig = recover(edge.y, pos_prev[edge.y]);
+        float3 t0_orig = recover(tri.x, pos_prev[tri.x]);
+        float3 t1_orig = recover(tri.y, pos_prev[tri.y]);
+        float3 t2_orig = recover(tri.z, pos_prev[tri.z]);
+
+        float3 delta_e0v0 = e0v0_orig - pos_prev[edge.x];
+        float3 delta_e0v1 = e0v1_orig - pos_prev[edge.y];
+        float3 delta_t0 = t0_orig - pos_prev[tri.x];
+        float3 delta_t1 = t1_orig - pos_prev[tri.y];
+        float3 delta_t2 = t2_orig - pos_prev[tri.z];
+
+        printf("Original targets (pre-trunc):\n");
+        printf("  e0v0: (%f %f %f) t=%e\n", e0v0_orig.x, e0v0_orig.y, e0v0_orig.z, truncation_t[edge.x]);
+        printf("  e0v1: (%f %f %f) t=%e\n", e0v1_orig.x, e0v1_orig.y, e0v1_orig.z, truncation_t[edge.y]);
+        printf("  tri0: (%f %f %f) t=%e\n", t0_orig.x, t0_orig.y, t0_orig.z, truncation_t[tri.x]);
+        printf("  tri1: (%f %f %f) t=%e\n", t1_orig.x, t1_orig.y, t1_orig.z, truncation_t[tri.y]);
+        printf("  tri2: (%f %f %f) t=%e\n", t2_orig.x, t2_orig.y, t2_orig.z, truncation_t[tri.z]);
+
+        // 只检查最接近的那条三角形边
+        int3 t2e = tri_edges[prim_idx];
+        int2 tri_edges_arr[3] = { edges[t2e.x], edges[t2e.y], edges[t2e.z] };
+        float min_dist_sq = FLT_MAX;
+        int closest_k = -1;
+        for (int k = 0; k < 3; k++) {
+        int vA = tri_edges_arr[k].x, vB = tri_edges_arr[k].y;
+        float dist_sq = segment_segment_dist_sq_robust(
+            pos_prev[edge.x], pos_prev[edge.y], pos_prev[vA], pos_prev[vB]);
+        if (dist_sq < min_dist_sq) {
+        min_dist_sq = dist_sq;
+        closest_k = k;
+        }
+        }
+
+            // 对最接近的边进行 debug 截断
+            int vA = tri_edges_arr[closest_k].x, vB = tri_edges_arr[closest_k].y;
+            int E;
+            if (closest_k == 0)
+                E = t2e.x;
+            else if (closest_k == 1)
+                E = t2e.y;
+            else
+                E = t2e.z;
+            printf("E %d vA: %d,vB: %d\n", E,vA,vB);
+            // if (edge_nodes[edge_ranks[E]].x-1 == E) {
+            //     printf("indices right\n");
+            // }else {
+            //     printf("indices not right!!!!!!\n");
+            // }
+            if (aabb_overlap_3d(q_aabb, edge_aabbs[edge_ranks[E]])) {
+                printf("AABB overlaps pass\n");
+            }else {
+                printf("AABB overlaps not pass!!!!!!\n");
+            }
+            
+            
+        float3 delta_A = (vA == tri.x) ? delta_t0 : ((vA == tri.y) ? delta_t1 : delta_t2);
+        float3 delta_B = (vB == tri.x) ? delta_t0 : ((vB == tri.y) ? delta_t1 : delta_t2);
+
+        // 厚度：取两个顶点厚度的最大值（简化）或和
+        float thick_edge0 = fmaxf(obj_data[vertices_obj[edge.x]].thickness,
+            obj_data[vertices_obj[edge.y]].thickness);
+        float thick_edge1 = fmaxf(obj_data[vertices_obj[vA]].thickness,
+            obj_data[vertices_obj[vB]].thickness);
+        float pair_thickness = thick_edge0 + thick_edge1;
+
+        float t_v0 = 1.f, t_v1 = 1.f, t_A = 1.f, t_B = 1.f;
+        bool tructed = edge_edge_planar_truncation_debug(
+            pos_prev[edge.x], delta_e0v0,
+            pos_prev[edge.y], delta_e0v1,
+            pos_prev[vA], delta_A,
+            pos_prev[vB], delta_B,
+            pair_thickness,
+            0,                            // layer_diff = 0
+            make_float3(0,0,0), make_float3(0,0,0),
+            parallel_eps, gamma_r, gamma_min,
+            t_v0, t_v1, t_A, t_B);
+
+
+        float new_t_ev0 = fminf(t_v0, truncation_t[edge.x]);
+        float new_t_ev1 = fminf(t_v1, truncation_t[edge.y]);
+        float new_t_A = fminf(t_A, truncation_t[vA]);
+        float new_t_B = fminf(t_B, truncation_t[vB]);
+
+        // 三角形第三个顶点（非 vA, vB）保持原截断因子
+        int third_vertex = -1;
+        for (int k = 0; k < 3; k++) {
+            if (tri_edges[k].x != vA || tri_edges[k].y != vB) {
+                // 找到那个不在这条边上的顶点
+                int cand = (tri.x != vA && tri.x != vB) ? tri.x :
+                (tri.y != vA && tri.y != vB) ? tri.y : tri.z;
+                third_vertex = cand;
+                break;
+            }
+        }
+        float new_t_third = truncation_t[third_vertex]; // 保持原值
+
+        // 计算新目标位置
+        float3 new_e0v0 = pos_prev[edge.x] + delta_e0v0 * fminf(new_t_ev0, 1.0f);
+        float3 new_e0v1 = pos_prev[edge.y] + delta_e0v1 * fminf(new_t_ev1, 1.0f);
+        float3 new_triA = pos_prev[vA] + delta_A * fminf(new_t_A, 1.0f);
+        float3 new_triB = pos_prev[vB] + delta_B * fminf(new_t_B, 1.0f);
+        // 第三个顶点：获取其原始位移
+        float3 delta_third = (third_vertex == tri.x) ? delta_t0 :
+        (third_vertex == tri.y) ? delta_t1 : delta_t2;
+        float3 new_triThird = pos_prev[third_vertex] + delta_third * fminf(new_t_third, 1.0f);
+
+        printf("\nAfter applying EE truncation factors:\n");
+        printf("  new edge: (%f %f %f) - (%f %f %f)\n",
+            new_e0v0.x, new_e0v0.y, new_e0v0.z, new_e0v1.x, new_e0v1.y, new_e0v1.z);
+        printf("  new tri:  (%f %f %f) (%f %f %f) (%f %f %f)\n",
+            new_triA.x, new_triA.y, new_triA.z,
+            new_triB.x, new_triB.y, new_triB.z,
+            new_triThird.x, new_triThird.y, new_triThird.z);
+
+        // 重新检测边-面相交
+        bool still_intersect = ef_intersect(new_e0v0, new_e0v1, new_triA, new_triB, new_triThird);
+        printf("Edge-face intersection after EE truncation: %s\n\n",
+            still_intersect ? "STILL INTERSECTING" : "ELIMINATED");
+        if (still_intersect) {
+            // ---------- 增加点‑面截断调试 ----------
+            float3 tri_normal = normalized( cross(pos_prev[tri.y] - pos_prev[tri.x],
+                           pos_prev[tri.z] - pos_prev[tri.x]));
+
+            float d0 = fabsf(dot(tri_normal, pos_prev[edge.x] - pos_prev[tri.x]));
+            float d1 = fabsf(dot(tri_normal, pos_prev[edge.y] - pos_prev[tri.x]));
+
+            float3 closest_pt_on_edge;
+            float3 delta_vf;
+            int edge_vid_for_vf;
+            if (d0 <= d1) {
+                closest_pt_on_edge = pos_prev[edge.x];
+                delta_vf = delta_e0v0;
+                edge_vid_for_vf = edge.x;
+            } else {
+                closest_pt_on_edge = pos_prev[edge.y];
+                delta_vf = delta_e0v1;
+                edge_vid_for_vf = edge.y;
+            }
+            float3 P0 = closest_pt_on_edge;
+            float3 P1 = closest_pt_on_edge + delta_vf;
+            float r_p = obj_data[vertices_obj[edge.x]].thickness;
+            AABB v_aabb = {
+                .min = fmin3(P0, P1) - r_p,
+                .max = fmax3(P0, P1) + r_p,
+            };
+            if (aabb_overlap_3d(v_aabb, aabbs[node_idx])) {
+                printf("vf AABB overlaps pass\n");
+            }else {
+                printf("vf AABB overlaps not pass!!!!!!\n");
+            }
+            float3 tri_cap_start, tri_cap_end;
+            float  tri_cap_radius;
+            float3 A0 = pos_prev[tri.x],B0 = pos_prev[tri.y],C0 = pos_prev[tri.z];
+            triangle_trajectory_capsule(A0, B0, C0,
+                A0 + delta_t0, B0 + delta_t1, C0 + delta_t2,
+                thick_edge1,
+                tri_cap_start, tri_cap_end, tri_cap_radius);
+
+            if ( capsule_capsule_intersects(P0, P1, r_p,
+                                             tri_cap_start, tri_cap_end, tri_cap_radius) )
+                printf("vf capsule overlaps pass\n");
+            else
+                printf("vf capsule overlaps not pass!!!!!!\n");
+
+            // 点‑面厚度：取边端点厚度与三角形厚度的和
+            float vf_thickness = r_p + thick_edge1;
+
+            float t_vf =1.f, t_tri0_vf=1.f, t_tri1_vf=1.f, t_tri2_vf=1.f;
+            printf("\n=== Debug VF truncation (point on edge vs triangle) ===\n");
+            bool vf_trunc = vertex_triangle_planar_truncation_debug(
+                P0, delta_vf,
+                A0, delta_t0,
+                B0, delta_t1,
+                C0, delta_t2,
+                vf_thickness,
+                0,                               // layer_diff = 0
+                make_float3(0,0,0),              // vertex_normal unused
+                parallel_eps, gamma_r, gamma_min,
+                t_vf, t_tri0_vf, t_tri1_vf, t_tri2_vf);
+
+            // 合并截断因子：对于每个顶点，取 min(边‑边截断, 点‑面截断, 全局)
+            float eff_t_v0, eff_t_v1;
+            if (edge_vid_for_vf == edge.x) {
+                eff_t_v0 = fminf(fminf(t_v0, t_vf), truncation_t[edge.x]);  
+                eff_t_v1 = fminf(t_v1, truncation_t[edge.y]);             
+            } else {
+                eff_t_v0 = fminf(t_v0, truncation_t[edge.x]);
+                eff_t_v1 = fminf(fminf(t_v1, t_vf), truncation_t[edge.y]);
+            }
+            float eff_t_tri0 = fminf( t_tri0_vf, truncation_t[tri.x]);
+            float eff_t_tri1 = fminf(t_tri1_vf, truncation_t[tri.y]);
+            float eff_t_tri2 = fminf(t_tri2_vf, truncation_t[tri.z]);
+
+            // 重新计算新位置
+            float3 new_e0v0_vf = pos_prev[edge.x] + delta_e0v0 * eff_t_v0;
+            float3 new_e0v1_vf = pos_prev[edge.y] + delta_e0v1 * eff_t_v1;
+            float3 new_t0_vf    = pos_prev[tri.x] + delta_t0 * eff_t_tri0;
+            float3 new_t1_vf    = pos_prev[tri.y] + delta_t1 * eff_t_tri1;
+            float3 new_t2_vf    = pos_prev[tri.z] + delta_t2 * eff_t_tri2;
+
+            bool still_vf = ef_intersect(new_e0v0_vf, new_e0v1_vf, new_t0_vf, new_t1_vf, new_t2_vf);
+            printf("Edge-face intersection after VF+EE truncation: %s\n\n",
+                   still_vf ? "STILL INTERSECTING" : "ELIMINATED");
+                        }
+                    }
+        }
+        );
+    // @formatter:on
+}
+
+static __global__ void apply_truncation_t0(
+    float3* __restrict__ pos_target,
+    const float* __restrict__ truncation_ts,
+    const float3* __restrict__ pos_prev,
+    const int n
+) {
+    for ( int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+          i += blockDim.x * gridDim.x ) {
+        if ( truncation_ts[i] == 0.f )
+            pos_target[i] = pos_prev[i];
+    }
+}
+void Contact::check_truncation_traverse_bvh(const float3* pos_prev, float3* pos_target) {
+    auto& params = geo->params;
+    int block = 256;
+    int n = params.nb_all_edges;
+    geo->debug_colors.assign(params.nb_all_cloth_vertices, make_float3(1.0f, 1.0f, 1.0f));
+    float parallel_eps = max(0.f, geo->get_global_parameter("parallel_eps", 1e-6f));
+    float gamma_r = max(0.f, geo->get_global_parameter("gamma_r", 0.9f));
+    float gamma_min = max(0.f, geo->get_global_parameter("gamma_min", 1e-9f));
+    auto debug_lock = (int*)get_device_temp_memory(nullptr, sizeof(int));
+    cudaMemsetAsync(debug_lock, 0, sizeof(int));
+    check_ef_pairs_kernel<<<(n + block - 1) / block, block>>>(
+        geo->debug_colors.data().get(),
+        truncation_t.data().get(),
+        edge_sorted_indices.data().get(),
+        edge_sorted_rank.data().get(),
+        thrust::raw_pointer_cast(edge_bvh.aabbs.data()),
+        n,
+        thrust::raw_pointer_cast(tri_bvh.nodes.data()),
+        thrust::raw_pointer_cast(tri_bvh.aabbs.data()),
+        thrust::raw_pointer_cast(geo->edges.data()),
+        thrust::raw_pointer_cast(geo->triangles.data()),
+        pos_prev, pos_target,
+        thrust::raw_pointer_cast(geo->obj_data.data()),
+        thrust::raw_pointer_cast(geo->vertices_obj.data()),
+        thrust::raw_pointer_cast(geo->triangle_indices.data()),
+        tri_bvh.root_idx, parallel_eps, gamma_r, gamma_min, debug_lock
+        );
+    // int h_debug_lock;
+    // cudaMemcpy(&h_debug_lock,debug_lock,sizeof(int),cudaMemcpyDeviceToHost);
+    // if(h_debug_lock) {
+    //     throw std::runtime_error("check_ef_pairs_kernel faild");
+    // }
+    // n = params.nb_all_cloth_vertices;
+    // apply_truncation_t0<<<(n + block - 1) / block, block>>>(
+    //     pos_target,
+    //     truncation_t.data().get(),
+    //     pos_prev, n
+    //     );
+}
