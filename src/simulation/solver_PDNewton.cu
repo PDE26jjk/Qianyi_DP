@@ -14,6 +14,7 @@ static __global__ void prepare_linear_step_kernel(
     float3* __restrict__ rhs,
     Mat3* __restrict__ Jx_diags,
     Mat3* __restrict__ M_inv,
+    const float3* __restrict__ f_elastic,
     const float*__restrict__ static_diags,
     const char*__restrict__ mask,
     const float3* __restrict__ pos_world,
@@ -38,6 +39,7 @@ static __global__ void prepare_linear_step_kernel(
         dx[tid] = pos_world[tid] - pos_prev[tid];
         rhs[tid] += (pos_world[tid] - pos_prev[tid]) * mask_stiff;
     }
+    rhs[tid] += f_elastic[tid];
 }
 static __global__ void step_begin_pd(
     float3* __restrict__ rhs,
@@ -291,6 +293,7 @@ void SolverPDNewton::step(float h) {
     float3* v = geo->velocities.data().get();
     float3* v_prev = geo->vel_prev.data().get();
     float3* f = geo->forces.data().get();
+    float3* f_elastic = geo->elastic_forces.data().get();
     float3* dx = this->dx.data().get();
     int2* edges = geo->edges.data().get();
     int3* tri_edges = geo->triangles.data().get();
@@ -310,17 +313,23 @@ void SolverPDNewton::step(float h) {
     cudaMemcpyAsync(static_diags, Jx_diag_pd, n * sizeof(float), cudaMemcpyDeviceToDevice);
     float mask_stiff = max(0.f, get_global_parameter("mask_stiff", 1e2f));
     forward_step<<<(n + block - 1) / block, block>>>(
-        v, v_prev, mass_inv, nullptr, mask,
-        q, q_inertia, dx, static_diags, h, mask_stiff, geo->gravity, true, n);
+        v, v_prev, mass_inv,
+        nullptr, f_elastic,
+        mask, q, nullptr, q_inertia, nullptr,
+        static_diags,
+        h, mask_stiff, geo->gravity, true, n);
+
     int iters = max(1, (int)get_global_parameter("pd_iters", 10));
     int linear_iters = max(1, (int)get_global_parameter("linear_iters", 10));
     int subspace_iters = max(0, (int)get_global_parameter("subspace_iters", 1));
     float max_force_scale = max(0.f, get_global_parameter("max_force_scale", 100.f));
+    auto& contact = geo->get_contact();
     for ( int i = 0; i < iters; i++ ) {
         n = params.nb_all_cloth_vertices;
         cudaMemsetAsync(f, 0, sizeof(float3) * n);
+        cudaMemsetAsync(f_elastic, 0, sizeof(float3) * n);
         cudaMemsetAsync(Jx_diag, 0, sizeof(Mat3) * n);
-        geo->get_contact().accumulate_contact_force(f, Jx_diag);
+        contact.accumulate_contact_force(f, Jx_diag);
         truncate_forces_kernel<<<(n + block - 1), block>>>(
             f, Jx_diag, static_diags, max_force_scale, n);
 
@@ -333,14 +342,14 @@ void SolverPDNewton::step(float h) {
         // geo->accumulate_sewing_force();
 
         accumulate_spring_forces<<<(n + block - 1) / block, block>>>(
-            nullptr, nullptr, f, nullptr, q, edges,
+            nullptr, nullptr, f_elastic, nullptr, q, edges,
             geo->edge_lengths.data().get(),
             geo->obj_data.data().get(), geo->vertices_obj.data().get(),
             n);
         n = params.nb_all_cloth_vertices;
 
         prepare_linear_step_kernel<<<(n + block - 1) / block, block>>>(
-            dx, f, Jx_diag, M_inv, static_diags, mask, q, q_prev, mask_stiff, n);
+            dx, f, Jx_diag, M_inv, f_elastic, static_diags, mask, q, q_prev, mask_stiff, n);
 
         if ( i < subspace_iters ) solve_subspace(dx, f);
 
@@ -358,8 +367,8 @@ void SolverPDNewton::step(float h) {
     float max_vel = max(0.f, get_global_parameter("max_vel", 1000));
     prepare_pc_step_kernel<<<(n + block - 1) / block, block>>>(
         q, dx, q_prev, mask, obj_data, vertices_obj, geo->ground, n);
-    geo->get_contact().refit_bvh(q_prev, dx);
-    geo->get_contact().collision_detect_broad_phase(q_prev, dx);
+    contact.refit_bvh(q_prev, dx);
+    contact.collision_detect_broad_phase(q_prev, dx);
     cudaMemcpyAsync(q_tr, q,
         sizeof(float3) * n, cudaMemcpyDeviceToDevice);
     for ( int i = 0; i < iters; i++ ) {
@@ -368,7 +377,7 @@ void SolverPDNewton::step(float h) {
         cudaMemcpyAsync(q_tr, q,
             sizeof(float3) * n, cudaMemcpyDeviceToDevice);
         cudaMemsetAsync(Jx_diag, 0, sizeof(Mat3) * n);
-        geo->get_contact().accumulate_contact_force(f, Jx_diag);
+        contact.accumulate_contact_force(f, Jx_diag);
 
         truncate_forces_kernel<<<(n + block - 1), block>>>(
             f, Jx_diag, static_diags, max_force_scale, n);

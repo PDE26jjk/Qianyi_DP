@@ -98,6 +98,7 @@ void Geometry::init(const GeoDataInput& geo) {
     velocities.assign(params.nb_all_vertices, make_float3(0.0f, 0.0f, 0.0f));
     vel_prev.assign(params.nb_all_vertices, make_float3(0.0f, 0.0f, 0.0f));
     forces.assign(params.nb_all_vertices, make_float3(0.0f, 0.0f, 0.0f));
+    elastic_forces.assign(params.nb_all_vertices, make_float3(0.0f, 0.0f, 0.0f));
     vertices_mask.assign(params.nb_all_vertices, static_cast<char>(0));
     mass_inv.resize(params.nb_all_vertices);
 
@@ -357,18 +358,24 @@ void Geometry::init_triangle_data() {
             e2t[e2_i].y = i;
 
             // Logic for e3's slot based on cross product
-            int v3 = v2;
-            float3 e3_vec = p2 - p1;
-            if ( v2 > v1 ) {
-                e3_vec = -e3_vec;
-                v3 = v1;
-            }
-
-            if ( dot(cross(p0 - vertices[v3], e3_vec), n_in) > 0.0f ) {
-                e2t[e3_i].y = i;
+            // int v3 = v2;
+            // float3 e3_vec = p2 - p1;
+            // if ( v2 > v1 ) {
+            //     e3_vec = -e3_vec;
+            //     v3 = v1;
+            // }
+            //
+            // if ( dot(cross(p0 - vertices[v3], e3_vec), n_in) > 0.0f ) {
+            //     e2t[e3_i].y = i;
+            // }
+            // else {
+            //     e2t[e3_i].x = i;
+            // }
+            if ( v1 < v2 ) {
+                e2t[e3_i].x = i;
             }
             else {
-                e2t[e3_i].x = i;
+                e2t[e3_i].y = i;
             }
 
             // 5. Calculate Material Space Matrix Dm (for cloth simulation)
@@ -485,13 +492,16 @@ void Geometry::upload_local_vertices(int obj_index, const std::vector<float>& ve
     CUDA_CHECK(cudaDeviceSynchronize());
     need_update_interpolation_vertices_this_frame = true;
 }
+
 __global__ void forward_step(
     const float3* __restrict__ vel,
     const float3* __restrict__ vel_prev,
     const float* __restrict__ inv_mass,
     const float3* __restrict__ external_force,
+    const float3* __restrict__ elastic_force,
     const char* __restrict__ mask,
     float3* __restrict__ pos,
+    float3* __restrict__ pos_preds,
     float3* __restrict__ inertia_out,
     float3* __restrict__ dx,
     float* __restrict__ static_diags,
@@ -515,24 +525,29 @@ __global__ void forward_step(
         inertia_out[i] = p;
         static_diags[i] += mask_stiff;
     }
+    float3 pos_pred = pos[i];
     if ( inv_mass[i] == 0.0f ) {
         inertia_out[i] = p;
     }
     else {
         float dt2 = dt * dt;
-        inertia_out[i] = p + v * dt + accel_ext * dt2;
+        float3 pos_v = p + v * dt;
+        inertia_out[i] = pos_v + accel_ext * dt2;
         static_diags[i] += 1.f / (im * dt2);
-        if (warm_start) { // Warm starting from VBD paper. 
+        if ( warm_start ) { // Warm starting from VBD paper. 
             float3 accel_prev = (v - vel_prev[i]) / dt;
             float a_factor = 0;
             float a_ext_len_sq = len_sq(accel_ext);
             if ( a_ext_len_sq > 1e-16f ) {
-                a_factor = dot(accel_prev, accel_ext) * rsqrtf(a_ext_len_sq);
+                a_factor = dot(accel_prev, accel_ext) / a_ext_len_sq;
                 a_factor = clamp(a_factor, 0.0f, 1.0f);
             }
-            pos[i] = p + v * dt + accel_ext * (a_factor * dt2);
+            pos[i] = pos_v + accel_ext * (a_factor * dt2);
         }
+        pos_pred = pos_v + (accel_ext + elastic_force[i] * im) * dt2;
     }
+    if ( pos_preds )
+        pos_preds[i] = pos_pred;
 
     if ( dx ) {
         // if (mask[i])
@@ -620,14 +635,15 @@ __global__ void compute_normals_kernel(
     float3 v1 = pos_world[tri_verts.y];
     float3 v2 = pos_world[tri_verts.z];
     float3 n = cross(v1 - v0, v2 - v0); // Length = 2 × Area
+    float3 n_normalized = normalized(n);
 
     atomicAddFloat3(&vertex_normals[tri_verts.x], n);
     atomicAddFloat3(&vertex_normals[tri_verts.y], n);
     atomicAddFloat3(&vertex_normals[tri_verts.z], n);
 
-    atomicAddFloat3(&edge_normals[tri_edges.x], n);
-    atomicAddFloat3(&edge_normals[tri_edges.y], n);
-    atomicAddFloat3(&edge_normals[tri_edges.z], n);
+    atomicAddFloat3(&edge_normals[tri_edges.x], n_normalized);
+    atomicAddFloat3(&edge_normals[tri_edges.y], n_normalized);
+    atomicAddFloat3(&edge_normals[tri_edges.z], n_normalized);
 }
 __global__ void compute_normals_single_edge_kernel(
     const int2* __restrict__ edges,
@@ -656,9 +672,9 @@ __global__ void normalize_vectors_kernel(float3* __restrict__ vectors, int N) {
     if ( idx >= N ) return;
 
     float3 v = vectors[idx];
-    float len = norm(v);
-    if ( len > 1e-8f ) {
-        vectors[idx] = v / len;
+    float len = len_sq(v);
+    if ( len > 1e-16f ) {
+        vectors[idx] = v * rsqrtf(len);
     }
     else {
         vectors[idx] = make_float3(0.0f, 0.0f, 1.0f);

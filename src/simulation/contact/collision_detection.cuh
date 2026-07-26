@@ -34,7 +34,7 @@ static __global__ void query_vf_pairs_simple_kernel(
     float max_dist_i = max(max_dist, radius * 1.5f);
     float max_dist_sq = max_dist_i * max_dist_i;
     bool is_active = i < active_vertices_size;
-    BVH_QUERY_LOOP(q_aabb, 64,
+    BVH_QUERY_LOOP(q_aabb, 64, 0,
         {
         int3 f = faces[prim_idx];
         if ( f.x == i || f.y == i || f.z == i ) continue;
@@ -85,7 +85,7 @@ static __global__ void query_ee_pairs_simple_kernel(
     q_aabb.max = q_aabb.max + radius;
     bool is_active = edge.x < active_vertices_size;
     // @formatter:off
-    BVH_QUERY_LOOP(q_aabb, 64,
+    BVH_QUERY_LOOP(q_aabb, 64,0,
         if ( prim_idx <= i ) continue;
         int2 e = edges[prim_idx];
         if (edge.x == e.x || edge.x == e.y || edge.y == e.x || edge.y == e.y) continue;
@@ -187,7 +187,7 @@ static __global__ void query_vf_pairs_capsule_kernel(
 
     bool is_active = i < active_vertices_size;
     // @formatter:off
-    BVH_QUERY_LOOP(q_aabb, 64, {
+    BVH_QUERY_LOOP(q_aabb, 64,0, {
         int3 f = faces[prim_idx];
         if ( f.x == i || f.y == i || f.z == i ) continue;
         if (!is_active && f.x >= active_vertices_size) continue;
@@ -262,7 +262,7 @@ static __global__ void query_ee_pairs_capsule_kernel(
     bool is_active = (edge.x < active_vertices_size);
 
     // @formatter:off
-    BVH_QUERY_LOOP(q_aabb, 64, {
+    BVH_QUERY_LOOP(q_aabb, 64,0, {
         if ( prim_idx <= i ) continue;
         int2 e = edges[prim_idx];
         if (!is_active && e.x >= active_vertices_size) continue;
@@ -286,23 +286,6 @@ static __global__ void query_ee_pairs_capsule_kernel(
             continue;
         // compute signed result: sign based on relative position to edge i's normal
         int sign = dot(cap1_start - cap2_start, N) < 0.0f ? 1 : -1;
-       //  if (i == 7) {
-       //      if (query_count == 0) {
-       //          printf("i=%d: A0=(%e,%e,%e), B0=(%e,%e,%e), "
-       //     "A1=(%e,%e,%e), B1=(%e,%e,%e)\n",
-       //     i, A0.x, A0.y, A0.z, B0.x, B0.y, B0.z,
-       //     A1.x, A1.y, A1.z, B1.x, B1.y, B1.z);
-       //
-       //          printf("N=(%e,%e,%e), r_e1_thick=%e\n", N.x, N.y, N.z, r_e1_thick);
-       //      }
-       //      printf("e1:%d (v%d,v%d), e2:%d (v%d,v%d), \n", i, edge.x, edge.y, prim_idx, e.x, e.y);
-       //      printf("prim_idx=%d: C0=(%e,%e,%e), D0=(%e,%e,%e), "
-       // "C1=(%e,%e,%e), D1=(%e,%e,%e)\n",
-       // prim_idx,
-       // C0.x, C0.y, C0.z, D0.x, D0.y, D0.z,
-       // C1.x, C1.y, C1.z, D1.x, D1.y, D1.z);
-       //
-       //  }
         query_result[++query_count] = prim_idx * sign;
     });
     // @formatter:on
@@ -333,7 +316,7 @@ static __global__ void query_ef_pairs_kernel(
     q_aabb.max = q_aabb.max + radius;
     int2 adj_tris = e2t[i];
 
-    BVH_QUERY_LOOP(q_aabb, 64,
+    BVH_QUERY_LOOP(q_aabb, 64, 0,
         if (prim_idx == adj_tris.x || prim_idx == adj_tris.y ) continue;
         query_result[++query_count] = prim_idx;
         );
@@ -387,6 +370,7 @@ __device__ inline bool compute_point_triangle_contact(
 
     float dist = dot(x0 - x1, tri_normal);
     float pen = combined_thickness - dist;
+    penetration = pen;
     if ( pen <= 0.0f )
         return false;
 
@@ -397,9 +381,199 @@ __device__ inline bool compute_point_triangle_contact(
         return false;
 
     normal = tri_normal;
-    penetration = pen;
     return true;
 }
+
+__device__ inline float compute_ee_min_signed_dist(
+    const float3& A0, const float3& B0,
+    const float3& C0, const float3& D0,
+    const float3& N) {
+    float3 e0 = B0 - A0;
+    float3 e1 = D0 - C0;
+    float3 n_ee = cross(e0, e1);
+    float len2 = dot(n_ee, n_ee);
+
+    // Non‑parallel case: the two edge lines define a unique perpendicular direction
+    if ( len2 > 1e-12f ) {
+        n_ee = n_ee * rsqrtf(len2);
+        if ( dot(n_ee, N) < 0.0f ) n_ee = -n_ee;
+        return dot(A0 - C0, n_ee);
+    }
+    // Parallel or degenerate case: the cross product is (nearly) zero.
+    else {
+        float s, t;
+        float3 ba;
+        segment_segment_closest_robust(A0, B0, C0, D0, s, t, ba);
+        return dot(ba, N);
+    }
+}
+__device__ inline void clip_segment_to_halfspace(
+    float h0, float h1,
+    float& t_min, float& t_max) {
+    if ( h0 > 0.0f && h1 > 0.0f ) {
+        t_max = -1.0f;
+    }
+    else if ( h0 <= 0.0f && h1 > 0.0f ) {
+        t_max = fminf(t_max, h0 / (h0 - h1));
+    }
+    else if ( h0 > 0.0f && h1 <= 0.0f ) {
+        t_min = fmaxf(t_min, h0 / (h0 - h1));
+    }
+}
+__device__ inline bool is_edge_wedge_outside(
+    const float3& A0, const float3& Dir,  // Edge 0 
+    const float3& C0, const float3& D0,  // Edge 1 
+    const float3& Na, const float3& Nb
+) {
+    if ( len_sq(Na + Nb) < 1e-16f ) { // dihedral angle near zero
+        return true; // always outside.
+    }
+
+    bool is_convex = dot(cross(Na, Nb), Dir) >= 0.0f;
+
+    float3 pC = C0 - A0;
+    float3 pD = D0 - A0;
+    float ha0 = dot(pC, Na), ha1 = dot(pD, Na);
+    float hb0 = dot(pC, Nb), hb1 = dot(pD, Nb);
+
+    float t_min = 0.0f;
+    float t_max = 1.0f;
+    float inside_fraction;
+    if ( is_convex ) {
+        clip_segment_to_halfspace(ha0, ha1, t_min, t_max);
+        clip_segment_to_halfspace(hb0, hb1, t_min, t_max);
+        inside_fraction = (t_max > t_min) ? (t_max - t_min) : 0.0f;
+    }
+    else {
+        clip_segment_to_halfspace(-ha0, -ha1, t_min, t_max);
+        clip_segment_to_halfspace(-hb0, -hb1, t_min, t_max);
+        float outside_fraction = (t_max > t_min) ? (t_max - t_min) : 0.0f;
+        inside_fraction = 1.0f - outside_fraction;
+    }
+    return inside_fraction <= 0.5f;
+}
+__device__ inline float3 orthogonal_vector(const float3& v) {
+    float x = fabsf(v.x), y = fabsf(v.y), z = fabsf(v.z);
+    float3 other = x < y ? (x < z ? make_float3(1, 0, 0) : make_float3(0, 0, 1))
+                       : (y < z ? make_float3(0, 1, 0) : make_float3(0, 0, 1));
+    return cross(v, other);
+}
+
+__device__ inline bool compute_edge_edge_wedge_contact(
+    const float3& A0, const float3& B0,  // Edge 0 
+    const float3& C0, const float3& D0,  // Edge 1 
+    float3 Na, float3 Nb,                // 按值传递，方便内部翻转
+    float tip_angle_cos,
+    float combined_thickness,
+    bool is_outside,
+    // Outputs:
+    float& out_penetration,
+    float3& out_normal,
+    float& out_s,                        // 碰撞点在 E0 上的参数 [0, 1]
+    float& out_t                         // 碰撞点在 E1 上的参数 [0, 1]
+) {
+    float3 dir0 = B0 - A0;
+    float len2 = dot(dir0, dir0);
+    if ( len2 < 1e-12f ) return false;
+    float3 D = dir0 * rsqrtf(len2);
+
+    int sign_result = is_outside ? 1 : -1;
+
+    if ( !is_outside ) {
+        Na = -Na;
+        Nb = -Nb;
+    }
+    tip_angle_cos = max(tip_angle_cos, dot(Na,Nb));
+    float3 Ne = Na + Nb;
+    float ne_len2 = dot(Ne, Ne);
+    if ( ne_len2 < 1e-6f ) Ne = cross(D, Na);
+    else Ne = Ne * rsqrtf(ne_len2);
+
+    float3 T = cross(D, Ne);
+    if ( dot(T, T) < 1e-8f ) T = normalized(orthogonal_vector(D));
+    else T = normalized(T);
+
+    // ==========================================
+    // 严格边-楔形体距离计算：寻找 E1 上最深穿透点
+    // ==========================================
+    float3 pC = C0 - A0;
+    float3 V = D0 - C0;
+    float v_dot_d = dot(V, D);
+    float3 V2d = V - v_dot_d * D;
+    float v2d_len2 = dot(V2d, V2d);
+
+    float t_cross = 0.5f;
+    if ( v2d_len2 > 1e-12f ) {
+        float3 pC2d = pC - dot(pC, D) * D;
+        t_cross = -dot(pC2d, V2d) / v2d_len2;
+        t_cross = fmaxf(0.0f, fminf(1.0f, t_cross));
+    }
+
+    float min_F = 1e38f;
+    float3 best_norm = Ne;
+    float best_t = 0.5f;
+
+    // 2. 优雅的 C++ Lambda 替代宏定义，利用 [&] 捕获外部变量
+    auto eval_wedge_point = [&](float t_val) {
+        float3 P = C0 + t_val * V;
+        float3 p_vec = P - A0;
+        float p_x = dot(p_vec, T);
+        float p_y = dot(p_vec, Ne);
+        float L2 = p_x * p_x + p_y * p_y;
+        float L = sqrtf(L2);
+
+        float cos_theta = (L > 1e-6f) ? (p_y / L) : 1.0f;
+        float dist;
+        float3 norm;
+
+        if ( cos_theta > tip_angle_cos ) {
+            dist = L;
+            if ( L > 1e-6f ) { norm = normalized(p_x * T + p_y * Ne); }
+            else { norm = Ne; }
+        }
+        else {
+            float d_a = dot(p_vec, Na);
+            float d_b = dot(p_vec, Nb);
+            if ( d_a > d_b ) {
+                dist = d_a;
+                norm = Na;
+            }
+            else {
+                dist = d_b;
+                norm = Nb;
+            }
+        }
+
+
+        // float F = dist * sign_result;
+        float F = dist;
+        if ( F < min_F ) {
+            min_F = F;
+            best_norm = norm;
+            best_t = t_val; // 记录产生最深穿透的 t
+        }
+    };
+
+    // 3. 评估三个极限候选点
+    eval_wedge_point(0.0f);        // 端点 C0
+    eval_wedge_point(1.0f);        // 端点 D0
+    eval_wedge_point(t_cross);     // 与 E0 最近驻点
+
+    // 4. 计算最终穿透深度
+    out_normal = -best_norm;
+    out_penetration = combined_thickness - min_F;
+    out_t = best_t;
+    if ( out_penetration <= 0.0f ) return false;
+
+    // 6. 计算 s: 将最优的碰撞点 P1 正交投影回 E0 线段上
+    float3 best_P1 = C0 + best_t * V;
+    float s_unclamped = dot(best_P1 - A0, dir0) / len2; // len2 之前已计算: dot(B0-A0, B0-A0)
+    out_s = clamp(s_unclamped, 0.0f, 1.0f);      // 截断到 [0,1] 保证重心权重稳定
+    if (s_unclamped <= 0.0f || s_unclamped >= 1.0f) return false;
+
+    return true;
+}
+
 
 /**
  * Evaluates edge-edge contact geometry.
@@ -428,7 +602,7 @@ __device__ inline bool compute_edge_edge_contact(
     float3& normal,
     float& penetration
 ) {
-    float3 ba;
+    float3 ba; // b->a = a-b
     segment_segment_closest_robust(p0, p1, q0, q1, s, t, ba);
 
     // Only interior contacts are valid
@@ -472,10 +646,10 @@ __device__ inline bool compute_edge_edge_contact(
     }
 
     float pen = combined_thickness - dist;
+    penetration = pen;
     if ( pen <= 0.0f )
         return false;
 
-    penetration = pen;
     return true;
 }
 __device__ __forceinline__ float3 robust_edge_pair_normal(

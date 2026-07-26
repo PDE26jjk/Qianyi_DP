@@ -251,5 +251,7 @@ CheckEdgeData Simulator::get_check_edge_data(int p0, int p1) const {
     if ( nearby_faces[0] > 0 ) {
         res.nearby_faces = std::vector<int>(nearby_faces.begin() + 1, nearby_faces.begin() + nearby_faces[0] + 1);
     }
+    cudaMemcpy(&res.normal, m_geo->edge_normals.data().get() + eid, sizeof(float3), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&res.tris, m_geo->e2t.data().get() + eid, sizeof(int2), cudaMemcpyDeviceToHost);
     return res;
 }

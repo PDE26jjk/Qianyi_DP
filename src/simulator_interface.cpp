@@ -263,6 +263,12 @@ py::tuple float3_to_tuple(float3 data) {
     res[2] = data.z;
     return res;
 }
+py::tuple int2_to_tuple(int2 data) {
+    py::tuple res(2);
+    res[0] = data.x;
+    res[1] = data.y;
+    return res;
+}
 py::dict SimulatorInterface::check_point_attributes(int index) {
     auto data = Simulator::instance().get_check_point_data(index);
     py::dict d;
@@ -276,6 +282,8 @@ py::dict SimulatorInterface::check_edge_attributes(int p0,int p1) {
     py::dict d;
     d["nearby_edges"] = data.nearby_edges;
     d["nearby_faces"] = data.nearby_faces;
+    d["normal"] = float3_to_tuple(data.normal);
+    d["tris"] = int2_to_tuple(data.tris);
     return d;
 }
 void SimulatorInterface::on_exit() {

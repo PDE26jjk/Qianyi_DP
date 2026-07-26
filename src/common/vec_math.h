@@ -282,7 +282,7 @@ struct Mat3 {
         // LDL^T: A = L D L^T
         float d0 = a00;
         // |d0| ≥ min_abs_d
-        d0 = copysignf(fmaxf(fabsf(d0), min_abs_d), d0);   
+        d0 = copysignf(fmaxf(fabsf(d0), min_abs_d), d0);
         float inv_d0 = 1.0f / d0;
         float l10 = a10 * inv_d0;
         float l20 = a20 * inv_d0;
@@ -520,6 +520,9 @@ float3 mul_homo(const Mat4 m, const float3 v) {
 _SFDH_ float clamp(float x, float a, float b) {
     return fminf(fmaxf(x, a), b);
     // return (x < a) ? a : ((x > b) ? b : x);
+}
+_SFDH_ float3 clamp(float3 x, float a, float b) {
+    return make_float3(clamp(x.x, a, b), clamp(x.y, a, b), clamp(x.z, a, b));
 }
 
 _SFDH_ float* as_float_ptr(float3& v) {

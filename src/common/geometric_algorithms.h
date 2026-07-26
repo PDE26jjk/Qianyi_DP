@@ -207,3 +207,24 @@ static void __device__ barycentric(const float3& A, const float3& B, const float
     v = (d00 * d21 - d01 * d20) / denom;
     w = 1.0f - u - v;
 }
+
+static __device__ bool ef_intersect(float3 v0, float3 v1, float3 x0, float3 x1, float3 x2) {
+    float3 face_normal = cross(x1 - x0, x2 - x0);
+    float normal_len = norm(face_normal);
+
+    if ( normal_len < 1e-16f ) return false;
+    face_normal = face_normal / normal_len;
+
+    float d1 = dot(face_normal, v0 - x0);
+    float d2 = dot(face_normal, v1 - x0);
+
+    if ( d1 * d2 >= 0.0f ) return false;
+
+    float abs_d1 = fabsf(d1);
+    float abs_d2 = fabsf(d2);
+    float3 hit_point = (v0 * abs_d2 + v1 * abs_d1) / (abs_d2 + abs_d1);
+    float u, v, w;
+    barycentric(x0, x1, x2, hit_point, u, v, w);
+    if ( u < 0.f || v < 0.f || w < 0.f ) return false;
+    return true;
+}

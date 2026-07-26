@@ -74,6 +74,7 @@ public:
     thrust::device_vector<float3> debug_colors;
 
     thrust::device_vector<float3> forces;
+    thrust::device_vector<float3> elastic_forces;
     thrust::device_vector<float> edge_lengths;
     thrust::device_vector<float> static_diags;
     thrust::device_vector<float3> velocities;
@@ -95,14 +96,14 @@ public:
     bool need_update_inv_mass;
 
     thrust::device_vector<float3> temp_vertices_f3;
-    
+
     // bending
     thrust::device_vector<float4> IBM_q;
     bool need_record_interpolation_this_frame;
     bool need_update_interpolation_vertices_this_frame;
     bool has_pin_attached;
     bool has_pick_triangles_this_frame;
-    
+
     float3 gravity;
     bool ground;
 
@@ -116,7 +117,7 @@ public:
     thrust::device_vector<int> H_red_offsets; // save by obj
     thrust::device_vector<int2> H2y;
     int H_red_total_sizes;
-    
+
     void init(const GeoDataInput& geo);
     void compute_normals();
     void update_for_frame();
@@ -185,14 +186,14 @@ public:
     thrust::device_vector<int> colors_index_offsets;
     std::vector<int> h_colors_index_offsets;
     thrust::device_vector<int> color_groups;
-    
+
     // build adjacency data for vbd, vertices -> constraints
     void build_adj_data();
     thrust::device_vector<int2> v_adj_bending;
     thrust::device_vector<int> v_adj_bending_offsets;
     thrust::device_vector<int2> v_adj_tris;
     thrust::device_vector<int> v_adj_tris_offsets;
-    
+
     // picker
     std::mutex pick_mutex;
     std::mutex picker_mutex;
@@ -207,9 +208,10 @@ public:
     thrust::device_vector<thrust::pair<int, float3>> pick_triangles;
     thrust::device_vector<Mat3> pick_triangle_offsets;
 
-    Contact& get_contact(){return m_contact;}
+    Contact& get_contact() { return m_contact; }
     thrust::device_vector<float3> inertial_offset;
     float step_h;
+
 private:
     Contact m_contact;
     size_t temp_mem_size;
@@ -220,8 +222,10 @@ __global__ void forward_step(
     const float3* __restrict__ vel_prev,
     const float* __restrict__ inv_mass,
     const float3* __restrict__ external_force,
+    const float3* __restrict__ elastic_force,
     const char* __restrict__ mask,
     float3* __restrict__ pos,
+    float3* __restrict__ pos_preds,
     float3* __restrict__ inertia_out,
     float3* __restrict__ dx,
     float* __restrict__ static_diags,

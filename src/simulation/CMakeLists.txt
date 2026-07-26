@@ -18,6 +18,7 @@ target_sources(
     ${COLOR_GRAPH}
     contact/lbvh.cu
     # collision_Wu2021.cu
+    collision_debug.cuh
     collision.cu
     geometry.cuh
     geometry.cu

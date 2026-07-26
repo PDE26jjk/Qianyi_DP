@@ -371,7 +371,7 @@ void Geometry::accumulate_sewing_force() {
         int n = params.nb_all_stitches;
         float sewing_k = max(0.f, get_global_parameter("sewing_k",2e3));
         compute_stitch_constraint<<<(n + block - 1) / block, block>>>(
-            nullptr, nullptr, forces.data().get(),
+            nullptr, nullptr, elastic_forces.data().get(),
             nullptr,
             pos_world.data().get(), vertices_obj.data().get(), obj_data.data().get(),
             vertices_mask.data().get(), stitches.data().get(), min_dist, sewing_k, n);

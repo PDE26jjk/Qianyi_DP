@@ -914,7 +914,7 @@ static __global__ void record_color_offsets(
 //         .max = qp + radius,
 //     };
 //     float max_dist_sq = max_dist * max_dist;
-//     BVH_QUERY_LOOP(q_aabb, 64,
+//     BVH_QUERY_LOOP(q_aabb, 64,0,
 //         int3 f = faces[prim_idx];
 //         if ( f.x == i || f.y == i || f.z == i ) continue; // itself
 //         float3 v0 = vertices[f.x];
@@ -980,7 +980,7 @@ static __global__ void query_ee_pairs_kernel(
         .max = fmax3(p0, p1) + radius
     };
     float max_dist_sq = max_dist * max_dist;
-    BVH_QUERY_LOOP(q_aabb, 64,
+    BVH_QUERY_LOOP(q_aabb, 64,0,
         if ( prim_idx <= i ) continue; // itself
         int2 e = edges[prim_idx];
         if (edge.x == e.x || edge.x == e.y || edge.y == e.x || edge.y == e.y) continue;
@@ -1042,7 +1042,7 @@ static __global__ void query_aabb_pairs_kernel(
     q_aabb.min = q_aabb.min - radius;
     q_aabb.max = q_aabb.max + radius;
 
-    BVH_QUERY_LOOP(q_aabb, 64,
+    BVH_QUERY_LOOP(q_aabb, 64,0,
         query_result[++query_count] = prim_idx;
         );
 

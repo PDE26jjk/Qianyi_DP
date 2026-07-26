@@ -88,9 +88,9 @@ __global__ void query_nearest_face_kernel(
 } // namespace lbvh3d
 
 typedef lbvh3d::AABB3D AABB;
-#define BVH_QUERY_LOOP(Q_AABB, STACK_SIZE, ...) \
+#define BVH_QUERY_LOOP(Q_AABB, STACK_SIZE, KEPT_COUNT, ...) \
     int* query_result = &query_results[i * result_size];\
-    int query_count = 0; \
+    int query_count = KEPT_COUNT; \
     unsigned int stack[STACK_SIZE]; \
     int sp = 0; \
     stack[sp++] = root_idx; \

@@ -13,7 +13,8 @@ static __global__ void step_end_kernel(
     float3* __restrict__ vertices_world,
     float3* __restrict__ velocities,
     const float3* __restrict__ pos_ine,
-    const float3* __restrict__ forces,
+    const float3* __restrict__ other_forces,
+    const float3* __restrict__ elastic_forces,
     const char* __restrict__ vertices_mask,
     const float* __restrict__ mass_inv,
     const ObjectDataInput* __restrict__ obj_data,
@@ -29,7 +30,7 @@ static __global__ void step_end_kernel(
         if ( !vertices_mask[i] ) {
             auto x_old = vertices_world[i];
             float mi = mass_inv[i];
-            float3 x = pos_ine[i] + forces[i] * mi * h * h;
+            float3 x = pos_ine[i] + (other_forces[i] + elastic_forces[i]) * mi * h * h;
             float3 v = (x - x_old) / h;
             if ( ground ) {
                 float min_z = obj_data[vertices_obj[i]].thickness;
@@ -90,6 +91,7 @@ void SolverExplicit::step(float h) {
     float3* q_inertia = geo->pos_inertia.data().get();
     float3* v = geo->velocities.data().get();
     float3* f = geo->forces.data().get();
+    float3* f_elastic = geo->elastic_forces.data().get();
     int2* edges = geo->edges.data().get();
     int3* tri_edges = geo->triangles.data().get();
     int3* tris = geo->triangle_indices.data().get();
@@ -119,11 +121,12 @@ void SolverExplicit::step(float h) {
     // }
     cudaMemsetAsync(static_diags, 0, params.nb_all_vertices * sizeof(float));
     cudaMemsetAsync(f, 0, params.nb_all_cloth_vertices * sizeof(float3));
+    cudaMemsetAsync(f_elastic, 0, params.nb_all_cloth_vertices * sizeof(float3));
 
     forward_step<<<(n + block - 1) / block, block>>>(
-        nullptr, v, mass_inv,
-        nullptr,
-        mask, q_inertia, nullptr,q,
+        v, nullptr, mass_inv,
+        nullptr,f_elastic,
+        mask, q_inertia, nullptr, q, nullptr,
         static_diags,
         h, 1e2, geo->gravity,false, n);
     // n = pp_result_size_h;
@@ -148,7 +151,7 @@ void SolverExplicit::step(float h) {
 
     n = params.nb_all_cloth_edges;
     accumulate_spring_forces<<<(n + block - 1) / block, block>>>(nullptr, nullptr,
-        f, nullptr, q, edges,
+        f_elastic, nullptr, q, edges,
         geo->edge_lengths.data().get(),
         geo->obj_data.data().get(), geo->vertices_obj.data().get(),
         n);
@@ -205,7 +208,7 @@ void SolverExplicit::step(float h) {
     bool ground = geo->ground;
     float ground_f = max(0.f, (get_global_parameter("ground_f", 1e3)));
     step_end_kernel<<<(n + block - 1) / block, block>>>(
-        q, v, q_inertia, f, mask, mass_inv, obj_data, vertices_obj, h, max_vel, ground, ground_f, n);
+        q, v, q_inertia, f,f_elastic, mask, mass_inv, obj_data, vertices_obj, h, max_vel, ground, ground_f, n);
 
     // if ( substep % LCP_substeps == 0 ) {
     //     collision_LCP_postprocess_unified(vertices_world.data().get());

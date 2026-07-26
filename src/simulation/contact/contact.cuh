@@ -2,12 +2,15 @@
 #include <thrust/device_vector.h>
 #include "collision_type.cuh"
 #include "lbvh.cuh"
+#include "simulation/solver_VBD.cuh"
 
 constexpr unsigned int broad_phase_size = 16;
+struct ContactState;
 struct Contact {
-    
+
     Geometry* geo;
-    
+    bool do_collision_detect_broad_phase_before_step;
+
     Contact(Geometry* geo): geo(geo) {}
     void init();
     void collision_detect_broad_phase(const float3* pos, const float3* offset);
@@ -17,8 +20,11 @@ struct Contact {
     void refit_bvh();
     void refit_bvh(const float3* pos, const float3* offset);
     void accumulate_contact_force(float3* forces, Mat3* Jx_diag);
+    void refit_bvh_with_target(const float3* pos_prev, const float3* pos_target);
     void ccd_truncation_traverse_bvh(const float3* pos_prev, const float3* pos_target);
     void check_truncation_traverse_bvh(const float3* pos_prev, float3* pos_target);
+
+    void collision_detect_broad_phase_stated(const float3* pos, const float3* pos_target, ContactState* vf_states, ContactState* ee_states, float query_radius);
     // // contact
     // uint32_t point_hash_table_size;
     // uint32_t edge_hash_table_size;
@@ -67,7 +73,7 @@ struct Contact {
 
 
     float alpha_hard;
-    float point_radius = 0.00025f;
+    float point_radius = 0.0025f;
     float max_dist = 0.0005f;
     lbvh3d::BVH3D tri_bvh;
     lbvh3d::BVH3D edge_bvh;
@@ -75,10 +81,10 @@ struct Contact {
     thrust::device_vector<unsigned int> point_sorted_indices;
     thrust::device_vector<unsigned int> edge_sorted_indices;
     thrust::device_vector<unsigned int> edge_sorted_rank;
-    
+
     thrust::device_vector<int> broad_phase_ee;
     thrust::device_vector<int> broad_phase_ef;
     thrust::device_vector<int> broad_phase_vf;
-    
+
     thrust::device_vector<float> truncation_t;
 };

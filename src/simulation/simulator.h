@@ -81,6 +81,8 @@ struct CheckPointData {
 struct CheckEdgeData {
     std::vector<int> nearby_edges;
     std::vector<int> nearby_faces;
+    float3 normal;
+    int2 tris;
 };
 class Simulator {
 private:
