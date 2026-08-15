@@ -76,6 +76,10 @@ struct SimulatorParams {
 struct CheckPointData {
     float mass;
     float3 force;
+    float3 force_elastic;
+    float3 pos_prev;
+    float3 pos_world;
+    float3 pos_pred;
     std::vector<int> nearby_faces;
 };
 struct CheckEdgeData {
@@ -83,6 +87,12 @@ struct CheckEdgeData {
     std::vector<int> nearby_faces;
     float3 normal;
     int2 tris;
+};
+struct CheckEdgeCollisionData {
+    std::vector<int> nearby_edges;
+    std::vector<int> valid;
+    std::vector<float3> forces;
+    std::vector<float2> st;
 };
 class Simulator {
 private:
@@ -126,6 +136,7 @@ public:
 
     CheckPointData get_check_point_data(int index) const;
     CheckEdgeData get_check_edge_data(int p0, int p1) const;
+    CheckEdgeCollisionData get_check_edge_collision_data(int p0, int p1) const;
 
     float dt;
     int frame;

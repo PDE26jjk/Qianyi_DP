@@ -9,9 +9,9 @@
 #include "simulation/geometry.cuh"
 
 
-void SolverPCG::init(int diag_size, int edge_size, bool use_preconditioner_) {
+void SolverPCG::init(int diag_size, int edge_size,bool Jx_nondiag_identity_only, bool use_preconditioner_) {
     use_preconditioner = use_preconditioner_;
-    LinearSolver::init(diag_size, edge_size);
+    LinearSolver::init(diag_size, edge_size, Jx_nondiag_identity_only);
     Ad.resize(diag_size);
     d.resize(diag_size);
     r.resize(diag_size);

@@ -64,7 +64,12 @@ static __device__ void get_theta_dpk(
 
 
 //T. Kim and D. Eberle, "Dynamic deformables: implementation and production practicalities (now with code!)," in ACM SIGGRAPH 2022 Courses  (Chapter 10)
-static __global__ void compute_dihedral_bending_Fizt(
+// Discrete Shells model, The energy density is proportional to one-half of the square of the difference between the dihedral angle and its rest dihedral angle.
+// The algorithm uses the Hessian matrix of energy with only the outer product term. (Gauss-Newton method)
+// When the fabric undergoes severe bending, intense folding, or inversion due to large-scale self-penetration, the value of ∂E/∂θ becomes very large.
+// At this point, the geometric stiffness term ∂E/∂θ ∇²θ, which discarded, actually dominates the total stiffness.
+// Discarding it will cause the curvature information obtained by the solver to be severely distorted, and the number of Newton iteration steps will increase exponentially.
+static __global__ void compute_dihedral_bending_GN(
     Mat3* Jx,
     Mat3* Jx_diag,
     Mat3* Jx_bend_cross,
@@ -72,6 +77,7 @@ static __global__ void compute_dihedral_bending_Fizt(
     const float3* __restrict__ vertices,
     const int2* __restrict__ edges,
     const int2* __restrict__ e2t,
+    const float* __restrict__ rest_thetas,
     const int3* __restrict__ triangles,
     const int2* __restrict__ edge_opposite_points,
     int num_edges, float kb
@@ -81,8 +87,6 @@ static __global__ void compute_dihedral_bending_Fizt(
 
     int2 p_op = edge_opposite_points[i];
     if ( p_op.x == -1 || p_op.y == -1 ) return; // No need to calculate bending force at the boundary.
-    // int2 t_adj = e2t[i];
-    // if ( t_adj.x == -1 || t_adj.y == -1 ) return; 
 
     int2 e_i = edges[i];
     int p1_idx = e_i.x, p2_idx = e_i.y;
@@ -93,7 +97,7 @@ static __global__ void compute_dihedral_bending_Fizt(
     get_theta_dpk(vertices[p0_idx], vertices[p1_idx], vertices[p2_idx], vertices[p3_idx],
         theta_dp0, theta_dp1, theta_dp2, theta_dp3, theta);
 
-    float coef = -kb;
+    float coef = kb;
     if ( Jx_diag != nullptr ) {
         atomicAddMat3(&Jx_diag[p0_idx], Mat3::outer_product(theta_dp0, theta_dp0) * coef);
         atomicAddMat3(&Jx_diag[p1_idx], Mat3::outer_product(theta_dp1, theta_dp1) * coef);
@@ -131,7 +135,7 @@ static __global__ void compute_dihedral_bending_Fizt(
             atomicAddMat3(&Jx_bend_cross[i], f0d3);
         }
     }
-    coef *= theta;
+    coef *= -(theta - rest_thetas[i]);
     if ( forces != nullptr ) {
         atomicAddFloat3(&forces[p0_idx], theta_dp0 * coef);
         atomicAddFloat3(&forces[p1_idx], theta_dp1 * coef);
@@ -181,13 +185,16 @@ static __global__ void precompute_IBM_Q(
     // Q[i] = Mat4::outer_product(q,q) * k;
 }
 
-// M. Bergou, M. Wardetzky, D. Harmon, D. Zorin, and E. Grinspun, "A quadratic bending model for inextensible surfaces"
+
+// M. Wardetzky, M. Bergou, D. Harmon, D. Zorin, and E. Grinspun, "Discrete quadratic curvature energies" , Computer Aided Geometric Design, vol. 24, no. 8, pp. 499–518, Nov. 2007, doi: 10.1016/j.cagd.2007.07.006.
+// Discrete Willmore Energy of isometric bending model (IBM), assume the edge lengths remain unchanged.
+// It is valid only when the rest dihedral angle is straight angle.
 static __global__ void compute_quadratic_Bending_IBM(
     Mat3* __restrict__ Jx,
     Mat3* __restrict__ Jx_diag,
     Mat3* __restrict__ Jx_bend_cross,
     float3* __restrict__ forces,
-    float* __restrict__ enerys,
+    float* __restrict__ energys,
     const float4* __restrict__ IBM_q,
     const float3* __restrict__ vertices,
     const int2* __restrict__ edges,
@@ -207,8 +214,8 @@ static __global__ void compute_quadratic_Bending_IBM(
     float3 x0 = vertices[p0_idx], x1 = vertices[p1_idx], x2 = vertices[p2_idx], x3 = vertices[p3_idx];
     float4 q = IBM_q[i];
     float3 qtX = x0 * q.x + x1 * q.y + x2 * q.z + x3 * q.w;
-    if ( enerys ) {
-        atomicAdd(&enerys[p0_idx],0.5f * kb * len_sq(qtX));
+    if ( energys ) {
+        atomicAdd(&energys[p0_idx], 0.5f * kb * len_sq(qtX));
     }
     qtX = qtX * kb;
 
@@ -218,6 +225,8 @@ static __global__ void compute_quadratic_Bending_IBM(
         atomicAddFloat3(&forces[p2_idx], -qtX * q.z);
         atomicAddFloat3(&forces[p3_idx], -qtX * q.w);
     }
+
+    // These should be precomputed and are written here for completeness.
     kb = -kb;
     if ( Jx_diag ) {
         atomicAddMat3(&Jx_diag[p0_idx], Mat3::identity(q.x * q.x * kb));

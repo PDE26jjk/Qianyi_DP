@@ -474,8 +474,8 @@ void SolverPDNewton::solve_subspace(float3* dx, const float3* rhs) {
     prolongate_kernel<<<(num_vertices + block - 1) / block, block>>>(
         dx, dy, basis_indices, basis_weights, num_vertices);
 }
-void SolverSubspace::init(int diag_size, int edge_size) {
-    SolverPCG::init(diag_size, edge_size, false);
+void SolverSubspace::init(int diag_size, int edge_size, bool) {
+    SolverPCG::init(diag_size, edge_size, false, false);
 }
 // #include <cusolverDn.h>
 void SolverSubspace::A_mult_x(float3* dst, const float3* src) {

@@ -100,6 +100,9 @@ static __global__ void solve_diag(
 static __global__ void step_end_linear(
     float3* __restrict__ pos_world,
     float3* __restrict__ dx,
+    const float3* __restrict__ pos_target,
+    const float3* __restrict__ pos_prev,
+    float max_displacement,
     const char* __restrict__ mask,
     const int n
 ) {
@@ -112,7 +115,8 @@ static __global__ void step_end_linear(
                 // printf("step_end_linear ERROR!!! %f \n", len_sq(x));
             }
             else {
-                pos_world[i] = x;
+                pos_world[i] = clamp_to_trajectory_envelope(
+                    pos_prev[i], pos_target[i], x, max_displacement);
             }
         }
         dx[i] = make_float3(0.0f, 0.f, 0.f);
@@ -167,7 +171,7 @@ static __global__ void step_end_kernel(
                 if ( x.z <= min_z ) {
                     x.z = min_z;
                     v.z = 0.f;
-                    v = v * expf(-h * ground_f);
+                    // v = v * expf(-h * ground_f);
                     pos_world[i] = x;
                 }
             }
@@ -214,27 +218,30 @@ void SolverPDNewton::init() {
     }
     auto& params = *simulator->get_geo_params();
     auto* geo = simulator->get_geo();
-    linear->init(params.nb_all_cloth_vertices, params.nb_all_cloth_edges);
+    linear->init(params.nb_all_cloth_vertices, params.nb_all_cloth_edges, true);
 
     dx.resize(params.nb_all_vertices);
 
     geo->init_subspace();
     Jx_diag_pd.assign(params.nb_all_vertices, 0.f);
-    Jx_nondiag_pd.assign(params.nb_all_edges, 0.f);
+    // Jx_nondiag_pd.assign(params.nb_all_edges, 0.f);
+    linear->Jx_nondiag_identity.assign(params.nb_all_vertices, 0.f);
+    linear->Jx_bend_cross_identity.assign(params.nb_all_edges, 0.f);
     int block = 256;
     int n = params.nb_all_cloth_edges;
     pd_precompute_spring_forces<<<(n + block - 1) / block, block>>>(
-        Jx_diag_pd.data().get(), Jx_nondiag_pd.data().get(),
+        Jx_diag_pd.data().get(),
+        linear->Jx_nondiag_identity.data().get(),
         geo->edges.data().get(),
         geo->obj_data.data().get(), geo->vertices_obj.data().get(),
         n);
-    geo->precompute_subspace_H(Jx_diag_pd.data().get(), Jx_nondiag_pd.data().get());
+    geo->precompute_subspace_H(Jx_diag_pd.data().get(), linear->Jx_nondiag_identity.data().get());
     subspace_rhs.resize(geo->basis_size);
     subspace_dy.resize(geo->basis_size);
     if ( subspace_solver == nullptr ) {
         subspace_solver = new SolverSubspace(simulator);
     }
-    subspace_solver->init(geo->basis_size, 0);
+    subspace_solver->init(geo->basis_size, 0, false);
 
 }
 
@@ -287,6 +294,7 @@ void SolverPDNewton::step(float h) {
     int blocksPerGrid = (n + block - 1) / block;
 
     float3* q = geo->pos_world.data().get();
+    float3* q_pred = geo->pos_pred.data().get();
     const float3* q_prev = geo->pos_step_prev.data().get();
     float3* q_inertia = geo->pos_inertia.data().get();
     float3* q_tr = geo->pos_inertia.data().get();
@@ -304,26 +312,29 @@ void SolverPDNewton::step(float h) {
     auto* obj_data = geo->obj_data.data().get();
     int* vertices_obj = geo->vertices_obj.data().get();
     const float* Jx_diag_pd = this->Jx_diag_pd.data().get();
-    const float* Jx_nondiag_pd = this->Jx_nondiag_pd.data().get();
+    // const float* Jx_nondiag_pd = this->Jx_nondiag_pd.data().get();
     Mat3* Jx_diag = linear->Jx_diag.data().get();
     Mat3* M_inv = linear->M_inv.data().get();
-    Mat3* Jx_nondiag = linear->Jx_nondiag.data().get();
-    Mat3* Jx_bend_cross = linear->Jx_bend_cross.data().get();
+    // Mat3* Jx_nondiag = linear->Jx_nondiag.data().get();
+    // Mat3* Jx_bend_cross = linear->Jx_bend_cross.data().get();
     float* static_diags = geo->static_diags.data().get();
     cudaMemcpyAsync(static_diags, Jx_diag_pd, n * sizeof(float), cudaMemcpyDeviceToDevice);
     float mask_stiff = max(0.f, get_global_parameter("mask_stiff", 1e2f));
+    auto& contact = geo->get_contact();
+    float query_radius = max(0.f, get_global_parameter("query_radius", 0.001f));
     forward_step<<<(n + block - 1) / block, block>>>(
         v, v_prev, mass_inv,
         nullptr, f_elastic,
-        mask, q, nullptr, q_inertia, nullptr,
+        mask, q, q_pred, q_inertia, nullptr,
         static_diags,
         h, mask_stiff, geo->gravity, true, n);
+    contact.refit_bvh_with_target(q_prev, q_pred);
+    contact.collision_detect_broad_phase(q_prev, q_pred, query_radius, true);
 
     int iters = max(1, (int)get_global_parameter("pd_iters", 10));
     int linear_iters = max(1, (int)get_global_parameter("linear_iters", 10));
     int subspace_iters = max(0, (int)get_global_parameter("subspace_iters", 1));
     float max_force_scale = max(0.f, get_global_parameter("max_force_scale", 100.f));
-    auto& contact = geo->get_contact();
     for ( int i = 0; i < iters; i++ ) {
         n = params.nb_all_cloth_vertices;
         cudaMemsetAsync(f, 0, sizeof(float3) * n);
@@ -335,9 +346,9 @@ void SolverPDNewton::step(float h) {
 
         step_begin_pd<<<(n + block - 1) / block, block>>>(f, q_inertia, q, mass, h, n);
         n = params.nb_all_cloth_edges;
-        preprocessing_nondiag<<<(n + block - 1) / block, block>>>(
-            Jx_nondiag, Jx_nondiag_pd, n);
-        cudaMemsetAsync(Jx_bend_cross, 0, sizeof(Mat3) * n);
+        // preprocessing_nondiag<<<(n + block - 1) / block, block>>>(
+        //     Jx_nondiag, Jx_nondiag_pd, n);
+        // cudaMemsetAsync(Jx_bend_cross, 0, sizeof(Mat3) * n);
         // compute_constraint();
         // geo->accumulate_sewing_force();
 
@@ -355,7 +366,7 @@ void SolverPDNewton::step(float h) {
 
         linear->solve(dx, f, linear_iters);
         step_end_linear<<<(n + block - 1) / block, block>>>(
-            q, dx, mask, n);
+            q, dx, q_pred, q_prev, query_radius, mask, n);
         // CUDA_CHECK(cudaDeviceSynchronize());
     }
     // try to do penetration correction
@@ -365,30 +376,30 @@ void SolverPDNewton::step(float h) {
     float ground_f = max(0.f, (get_global_parameter("ground_f", 1e3)));
     n = params.nb_all_vertices;
     float max_vel = max(0.f, get_global_parameter("max_vel", 1000));
-    prepare_pc_step_kernel<<<(n + block - 1) / block, block>>>(
-        q, dx, q_prev, mask, obj_data, vertices_obj, geo->ground, n);
-    contact.refit_bvh(q_prev, dx);
-    contact.collision_detect_broad_phase(q_prev, dx);
-    cudaMemcpyAsync(q_tr, q,
-        sizeof(float3) * n, cudaMemcpyDeviceToDevice);
-    for ( int i = 0; i < iters; i++ ) {
-        n = params.nb_all_cloth_vertices;
-        step_begin_pc<<<(n + block - 1) / block, block>>>(f, static_diags, q_tr, q, mass, h, n);
-        cudaMemcpyAsync(q_tr, q,
-            sizeof(float3) * n, cudaMemcpyDeviceToDevice);
-        cudaMemsetAsync(Jx_diag, 0, sizeof(Mat3) * n);
-        contact.accumulate_contact_force(f, Jx_diag);
-
-        truncate_forces_kernel<<<(n + block - 1), block>>>(
-            f, Jx_diag, static_diags, max_force_scale, n);
-
-        solve_diag<<<(n + block - 1) / block, block>>>(
-            dx, f, Jx_diag, static_diags, mask, q, q_prev, mask_stiff, n);
-
-        step_end_linear<<<(n + block - 1) / block, block>>>(
-            q, dx, mask, n);
-        // CUDA_CHECK(cudaDeviceSynchronize());
-    }
+    // prepare_pc_step_kernel<<<(n + block - 1) / block, block>>>(
+    // q, dx, q_prev, mask, obj_data, vertices_obj, geo->ground, n);
+    // contact.refit_bvh(q_prev, dx);
+    // contact.collision_detect_broad_phase(q_prev, dx);
+    // cudaMemcpyAsync(q_tr, q,
+    //     sizeof(float3) * n, cudaMemcpyDeviceToDevice);
+    // for ( int i = 0; i < iters; i++ ) {
+    //     n = params.nb_all_cloth_vertices;
+    //     step_begin_pc<<<(n + block - 1) / block, block>>>(f, static_diags, q_tr, q, mass, h, n);
+    //     cudaMemcpyAsync(q_tr, q,
+    //         sizeof(float3) * n, cudaMemcpyDeviceToDevice);
+    //     cudaMemsetAsync(Jx_diag, 0, sizeof(Mat3) * n);
+    //     contact.accumulate_contact_force(f, Jx_diag);
+    //
+    //     truncate_forces_kernel<<<(n + block - 1), block>>>(
+    //         f, Jx_diag, static_diags, max_force_scale, n);
+    //
+    //     solve_diag<<<(n + block - 1) / block, block>>>(
+    //         dx, f, Jx_diag, static_diags, mask, q, q_prev, mask_stiff, n);
+    //
+    //     step_end_linear<<<(n + block - 1) / block, block>>>(
+    //         q, dx, mask, n);
+    //     // CUDA_CHECK(cudaDeviceSynchronize());
+    // }
     n = params.nb_all_vertices;
     cudaMemcpyAsync(v_prev, v, n * sizeof(float3), cudaMemcpyDeviceToDevice);
     step_end_kernel<<<(n + block - 1) / block, block>>>(

@@ -66,7 +66,7 @@ void SimulatorInterface::input_data(py::dict input) {
     std::vector<Mat4> world_matrixs(nb_all_o);
 
     int nb_all_cloth_v{ nb_all_v }, nb_all_cloth_e{ nb_all_e }, nb_all_cloth_f{ nb_all_f },
-    nb_all_cloth_o{ nb_all_o };
+        nb_all_cloth_o{ nb_all_o };
     nb_all_v = nb_all_e = nb_all_f = 0;
     std::vector<int> vertex_index_offsets(nb_all_o + 1);
     std::vector<int> edge_index_offsets(nb_all_o + 1);
@@ -133,12 +133,12 @@ void SimulatorInterface::input_data(py::dict input) {
     vertex_index_offsets[nb_all_o] = nb_all_v / 3;
     edge_index_offsets[nb_all_o] = nb_all_e / 2;
     triangle_index_offsets[nb_all_o] = nb_all_f / 3;
-    
+
     // local normal of cloth, should be (0,0,1)
     for ( size_t j = 2; j < nb_all_cloth_f; j += 3 ) {
         normals[j] = 1.f;
     }
-    
+
     int nb_all_s{};
     auto sewings_dict = input["sewings"].cast<py::list>();
 
@@ -256,34 +256,59 @@ void SimulatorInterface::set_parameters(const std::unordered_map<std::string, fl
         Simulator::instance().set_parameter(fst, snd);
     }
 }
-py::tuple float3_to_tuple(float3 data) {
+
+template<typename V3>
+py::tuple vec3_to_tuple(const V3 data) {
     py::tuple res(3);
     res[0] = data.x;
     res[1] = data.y;
     res[2] = data.z;
     return res;
 }
-py::tuple int2_to_tuple(int2 data) {
+
+template<typename V2>
+py::tuple vec2_to_tuple(const V2 data) {
     py::tuple res(2);
     res[0] = data.x;
     res[1] = data.y;
+    return res;
+}
+template<typename V, typename Func>
+py::list vec_to_list(std::vector<V> data, Func trans_func) {
+    py::list res(data.size());
+    for ( size_t i = 0; i < data.size(); ++i ) {
+        res[i] = trans_func(data[i]);
+    }
     return res;
 }
 py::dict SimulatorInterface::check_point_attributes(int index) {
     auto data = Simulator::instance().get_check_point_data(index);
     py::dict d;
     d["mass"] = data.mass;
-    d["force"] = float3_to_tuple(data.force);
+    d["force"] = vec3_to_tuple(data.force);
+    d["force_elastic"] = vec3_to_tuple(data.force_elastic);
+    d["pos_pred"] = vec3_to_tuple(data.pos_pred);
+    d["pos_world"] = vec3_to_tuple(data.pos_world);
+    d["pos_prev"] = vec3_to_tuple(data.pos_prev);
     d["nearby_faces"] = data.nearby_faces;
     return d;
 }
-py::dict SimulatorInterface::check_edge_attributes(int p0,int p1) {
-    auto data = Simulator::instance().get_check_edge_data(p0,p1);
+py::dict SimulatorInterface::check_edge_attributes(int p0, int p1) {
+    auto data = Simulator::instance().get_check_edge_data(p0, p1);
     py::dict d;
     d["nearby_edges"] = data.nearby_edges;
     d["nearby_faces"] = data.nearby_faces;
-    d["normal"] = float3_to_tuple(data.normal);
-    d["tris"] = int2_to_tuple(data.tris);
+    d["normal"] = vec3_to_tuple(data.normal);
+    d["tris"] = vec2_to_tuple(data.tris);
+    return d;
+}
+py::dict SimulatorInterface::check_edge_collision_data(int p0, int p1) {
+    auto data = Simulator::instance().get_check_edge_collision_data(p0, p1);
+    py::dict d;
+    d["nearby_edges"] = data.nearby_edges;
+    d["valid"] = data.valid;
+    d["forces"] = vec_to_list(data.forces, vec3_to_tuple<float3>);
+    d["st"] = vec_to_list(data.st, vec2_to_tuple<float2>);
     return d;
 }
 void SimulatorInterface::on_exit() {

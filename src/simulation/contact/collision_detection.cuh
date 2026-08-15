@@ -166,8 +166,8 @@ static __global__ void query_vf_pairs_capsule_kernel(
     const int3* __restrict__ faces,
     const ObjectDataInput* __restrict__ obj_data,
     const int* __restrict__ vertices_obj,
-    const float min_radius,
-    const float3* __restrict__ inertial_offset,
+    const float query_radius,
+    const float3* __restrict__ pos_target,
     int* __restrict__ query_results,
     const int active_vertices_size,
     int result_size
@@ -177,9 +177,9 @@ static __global__ void query_vf_pairs_capsule_kernel(
     if ( sorted_indices ) i = sorted_indices[i];
 
     float3 P0 = pos[i];
-    float3 P1 = P0 + inertial_offset[i];
+    float3 P1 = pos_target[i];
     const auto& od = &obj_data[vertices_obj[i]];
-    float r_p = fmaxf(min_radius, od->thickness);
+    float r_p = query_radius + od->thickness;
     AABB q_aabb = {
         .min = fmin3(P0, P1) - r_p,
         .max = fmax3(P0, P1) + r_p,
@@ -192,12 +192,12 @@ static __global__ void query_vf_pairs_capsule_kernel(
         if ( f.x == i || f.y == i || f.z == i ) continue;
         if (!is_active && f.x >= active_vertices_size) continue;
 
-        float3 A0 = pos[f.x], A1 = A0 + inertial_offset[f.x];
-        float3 B0 = pos[f.y], B1 = B0 + inertial_offset[f.y];
-        float3 C0 = pos[f.z], C1 = C0 + inertial_offset[f.z];
+        float3 A0 = pos[f.x], A1 = pos_target[f.x];
+        float3 B0 = pos[f.y], B1 = pos_target[f.y];
+        float3 C0 = pos[f.z], C1 = pos_target[f.z];
 
         const auto& od_f = &obj_data[vertices_obj[f.x]];
-        float r_tri = fmaxf(min_radius,  od_f->thickness);
+        float r_tri = query_radius + od_f->thickness;
 
         float3 tri_cap_start, tri_cap_end;
         float  tri_cap_radius;
@@ -216,9 +216,13 @@ static __global__ void query_vf_pairs_capsule_kernel(
 
 }
 
+static __device__ int debug_e_id;
+static __device__ int debug_v_id;
+
 static __global__ void query_ee_pairs_capsule_kernel(
     const float3* __restrict__ pos,
-    const unsigned int* __restrict__ sorted_indices,
+    const float3* __restrict__ pos_2d,
+    const unsigned int* __restrict__ sorted_ranks,
     unsigned int num_queries,
     const int2* __restrict__ nodes,
     const AABB* __restrict__ aabbs,
@@ -226,8 +230,8 @@ static __global__ void query_ee_pairs_capsule_kernel(
     const int2* __restrict__ edges,
     const ObjectDataInput* __restrict__ obj_data,
     const int* __restrict__ vertices_obj,
-    const float min_radius,
-    const float3* __restrict__ inertial_offset,
+    const float query_radius,
+    const float3* __restrict__ pos_target,
     const float3* __restrict__ edge_normals,
     const int active_vertices_size,
     int* __restrict__ query_results,
@@ -240,13 +244,15 @@ static __global__ void query_ee_pairs_capsule_kernel(
     int2 edge = edges[i];
     float3 A0 = pos[edge.x];
     float3 B0 = pos[edge.y];
-    float3 A1 = A0 + inertial_offset[edge.x];
-    float3 B1 = B0 + inertial_offset[edge.y];
+    float3 A1 = pos_target[edge.x];
+    float3 B1 = pos_target[edge.y];
     float3 N = edge_normals[i];
 
     // thickness for edge i
-    const auto& od_i = obj_data[vertices_obj[edge.x]];
-    float r_e1_thick = fmaxf(min_radius, od_i.thickness);
+
+    int edge_obj = vertices_obj[edge.x];
+    const auto& od_i = obj_data[edge_obj];
+    float r_e1_thick = query_radius + od_i.thickness;
 
     // Query edge trajectory capsule
     float3 cap1_start, cap1_end;
@@ -260,21 +266,37 @@ static __global__ void query_ee_pairs_capsule_kernel(
     q_aabb.max = fmax3(fmax3(A0, B0), fmax3(A1, B1)) + r_e1_thick;
 
     bool is_active = (edge.x < active_vertices_size);
+    float granularity = od_i.granularity;
+    float min_dist_2d = fmaxf(granularity * 1.5f, od_i.thickness * 1.1f);
+    float3 E = B0 - A0;
 
+    // sort by edge length, store long ones in short
+    unsigned int e_ranks = sorted_ranks[i];
     // @formatter:off
     BVH_QUERY_LOOP(q_aabb, 64,0, {
-        if ( prim_idx <= i ) continue;
+        if ( sorted_ranks[prim_idx] <= e_ranks ) continue;
         int2 e = edges[prim_idx];
-        if (!is_active && e.x >= active_vertices_size) continue;
+        bool is_e_active = e.x < active_vertices_size;
+        if (!is_active && !is_e_active) continue;
         if (edge.x == e.x || edge.x == e.y || edge.y == e.x || edge.y == e.y) continue;
-
+        int e_obj = vertices_obj[e.x];
+        const auto& od_e2 = obj_data[e_obj];
+        
+        // Ensure that edge pairs of the same object are separated by at least one edge.
+        if (is_active && edge_obj == e_obj) {
+            float dist_2d_sq = segment_endpoint_min_distance_sq_2d(pos_2d[edge.x],pos_2d[edge.y],pos_2d[e.x],pos_2d[e.y]);
+            if (i == debug_e_id) {
+                printf("e2: %d,dist_2d: %e,min_dist_2d: %e\n",prim_idx,sqrtf(dist_2d_sq),min_dist_2d);
+            }
+            if (dist_2d_sq < min_dist_2d * min_dist_2d) continue;
+        }
+        
         float3 C0 = pos[e.x];
         float3 D0 = pos[e.y];
-        float3 C1 = C0 + inertial_offset[e.x];
-        float3 D1 = D0 + inertial_offset[e.y];
+        float3 C1 = pos_target[e.x];
+        float3 D1 = pos_target[e.y];
 
-        const auto& od_e2 = obj_data[vertices_obj[e.x]];
-        float r_e2_thick = fmaxf(min_radius, od_e2.thickness);
+        float r_e2_thick = query_radius + od_e2.thickness;
 
         float3 cap2_start, cap2_end;
         float  cap2_radius;
@@ -285,39 +307,41 @@ static __global__ void query_ee_pairs_capsule_kernel(
                                         cap2_start, cap2_end, cap2_radius))
             continue;
         // compute signed result: sign based on relative position to edge i's normal
-        int sign = dot(cap1_start - cap2_start, N) < 0.0f ? 1 : -1;
+        // int sign = dot(cap1_start - cap2_start, N) < 0.0f ? 1 : -1;
+        int sign = dot(C0 - A0, cross(D0 - A0, E)) < 0.0f ? 1 : -1; // signed area
         query_result[++query_count] = prim_idx * sign;
     });
     // @formatter:on
 }
 static __global__ void query_ef_pairs_kernel(
     const AABB*__restrict__ edge_aabbs,
-    const unsigned int* __restrict__ sorted_indices,
+    const int2*__restrict__ edge_nodes,
     unsigned int num_queries,
     const int2*__restrict__ nodes,
     const AABB*__restrict__ aabbs,
     const int2*__restrict__ edges,
     const ObjectDataInput* __restrict__ obj_data,
     const int* __restrict__ vertices_obj,
-    const int2* __restrict__ e2t,
+    const int3* __restrict__ tris,
     unsigned int root_idx,
-    float min_radius,
+    float query_radius,
     int*__restrict__ query_results,
     int result_size
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if ( i >= num_queries ) return;
     AABB q_aabb = edge_aabbs[i];
-    if ( sorted_indices ) i = sorted_indices[i];
+    i = edge_nodes[i].x - 1;
     int2 edge = edges[i];
     const auto& od = &obj_data[vertices_obj[edge.x]];
-    float radius = max(min_radius, max(od->granularity, od->thickness)) * 0.2f;
+    float radius = max(query_radius, max(od->granularity, od->thickness)) * 0.2f;
     q_aabb.min = q_aabb.min - radius;
     q_aabb.max = q_aabb.max + radius;
-    int2 adj_tris = e2t[i];
 
     BVH_QUERY_LOOP(q_aabb, 64, 0,
-        if (prim_idx == adj_tris.x || prim_idx == adj_tris.y ) continue;
+        int3 tri = tris[prim_idx];
+        if (edge.x == tri.x || edge.x == tri.y || edge.x == tri.z ||
+            edge.y == tri.x || edge.y == tri.y || edge.y == tri.z) continue;
         query_result[++query_count] = prim_idx;
         );
 }
@@ -483,7 +507,7 @@ __device__ inline bool compute_edge_edge_wedge_contact(
         Na = -Na;
         Nb = -Nb;
     }
-    tip_angle_cos = max(tip_angle_cos, dot(Na,Nb));
+    tip_angle_cos = max(tip_angle_cos, dot(Na, Nb));
     float3 Ne = Na + Nb;
     float ne_len2 = dot(Ne, Ne);
     if ( ne_len2 < 1e-6f ) Ne = cross(D, Na);
@@ -569,7 +593,7 @@ __device__ inline bool compute_edge_edge_wedge_contact(
     float3 best_P1 = C0 + best_t * V;
     float s_unclamped = dot(best_P1 - A0, dir0) / len2; // len2 之前已计算: dot(B0-A0, B0-A0)
     out_s = clamp(s_unclamped, 0.0f, 1.0f);      // 截断到 [0,1] 保证重心权重稳定
-    if (s_unclamped <= 0.0f || s_unclamped >= 1.0f) return false;
+    if ( s_unclamped <= 0.0f || s_unclamped >= 1.0f ) return false;
 
     return true;
 }
@@ -578,8 +602,8 @@ __device__ inline bool compute_edge_edge_wedge_contact(
 /**
  * Evaluates edge-edge contact geometry.
  *
- * @param p0, p1               endpoints of the first edge
- * @param q0, q1               endpoints of the second edge
+ * @param A, B               endpoints of the first edge
+ * @param C, D               endpoints of the second edge
  * @param combined_thickness   sum of the thickness values of the two edges (precomputed)
  * @param layer_diff           layer0 - layer1 (0: same, negative: edge0's layer < edge1's, positive: edge0's layer > edge1's)
  * @param contact_side_sign    sign stored during broad phase (+1 or -1), used only when layers are equal
@@ -591,8 +615,8 @@ __device__ inline bool compute_edge_edge_wedge_contact(
  * @return                     true if the contact lies strictly inside both segments and penetration > 0
  */
 __device__ inline bool compute_edge_edge_contact(
-    const float3 p0, const float3 p1,
-    const float3 q0, const float3 q1,
+    const float3 A, const float3 B,
+    const float3 C, const float3 D,
     const float combined_thickness,
     const int layer_diff,
     const float contact_side_sign,
@@ -603,7 +627,7 @@ __device__ inline bool compute_edge_edge_contact(
     float& penetration
 ) {
     float3 ba; // b->a = a-b
-    segment_segment_closest_robust(p0, p1, q0, q1, s, t, ba);
+    segment_segment_closest_robust(A, B, C, D, s, t, ba);
 
     // Only interior contacts are valid
     if ( s <= 0.0f || s >= 1.0f || t <= 0.0f || t >= 1.0f )
@@ -623,27 +647,33 @@ __device__ inline bool compute_edge_edge_contact(
     // Direction correction based on layer difference and broad-phase sign
     if ( layer_diff == 0 ) {
         // Same layer: use the sign stored during broad phase
-        float sign_new = (dot(ba, edge_normal0) < 0.0f) ? 1.0f : -1.0f;
+        // float sign_new = (dot(ba, edge_normal0) < 0.0f) ? 1.0f : -1.0f;
+        float sign_new = dot(C - A, cross(D - A, B - A)) < 0.0f ? 1 : -1;
         sign_new *= contact_side_sign;
         if ( sign_new < 0.0f ) {
             normal = -normal;
             dist = -dist;
         }
     }
-    else if ( layer_diff < 0 ) {
-        // edge0's layer is smaller
-        if ( dot(normal, edge_normal0) > 0.0f ) {
-            normal = -normal;
-            dist = -dist;
-        }
+    else {
+        // Select normal according to layers.
+        normal = layer_diff < 0 ? -edge_normal0 : edge_normal1;
+        dist = dot(ba, normal);
     }
-    else { // layer_diff > 0
-        // edge0's layer is larger
-        if ( dot(normal, edge_normal1) < 0.0f ) {
-            normal = -normal;
-            dist = -dist;
-        }
-    }
+    // if ( layer_diff < 0 ) {
+    //     // edge0's layer is smaller
+    //     if ( dot(normal, edge_normal0) > 0.0f ) {
+    //         normal = -normal;
+    //         dist = -dist;
+    //     }
+    // }
+    // else { // layer_diff > 0
+    //     // edge0's layer is larger
+    //     if ( dot(normal, edge_normal1) < 0.0f ) {
+    //         normal = -normal;
+    //         dist = -dist;
+    //     }
+    // }
 
     float pen = combined_thickness - dist;
     penetration = pen;

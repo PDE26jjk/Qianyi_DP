@@ -83,6 +83,7 @@ void Geometry::init(const GeoDataInput& geo) {
     check_cuda(cudaDeviceSynchronize());
 
     pos_world.resize(params.nb_all_vertices);
+    pos_pred.resize(params.nb_all_vertices);
     pos_inertia.resize(params.nb_all_vertices);
     edge_lengths.resize(params.nb_all_edges);
     static_diags.resize(params.nb_all_vertices);
@@ -550,10 +551,6 @@ __global__ void forward_step(
         pos_preds[i] = pos_pred;
 
     if ( dx ) {
-        // if (mask[i])
-        //     dx[i] = {0.f,0.f,0.f};
-        // else
-        //     dx[i] = v * dt;
         dx[i] = inertia_out[i] - p;
     }
 

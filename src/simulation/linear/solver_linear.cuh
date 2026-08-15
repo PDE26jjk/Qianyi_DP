@@ -13,9 +13,10 @@ struct LinearSolver {
     LinearSolver& operator=(const LinearSolver& other) = delete;
     LinearSolver& operator=(LinearSolver&& other) noexcept = delete;
     virtual ~LinearSolver() = default;
-    virtual void solve(float3* dx, const float3* rhs, int max_iters = 1000) = 0;
+    
     LinearSolver(Simulator* simulator): simulator(simulator) {}
-    virtual void init(int diag_size, int edge_size);
+    virtual void solve(float3* dx, const float3* rhs, int max_iters = 1000) = 0;
+    virtual void init(int diag_size, int edge_size, bool Jx_nondiag_identity_only);
     void vector_field_dot(const float3* a, const float3* b, float* result);
     float vector_field_dot_sync(const float3* a, const float3* b);
 
@@ -29,9 +30,13 @@ struct LinearSolver {
     // for bending opposite point pairs
     thrust::device_vector<Mat3> Jx_bend_cross;
 
+    thrust::device_vector<float> Jx_nondiag_identity;
+    thrust::device_vector<float> Jx_bend_cross_identity;
+
 protected:
     int m_edge_size;
     int m_diag_size;
+    bool Jx_nondiag_identity_only;
     virtual void A_mult_x(
         float3* __restrict__ dst,
         const float3* __restrict__ src);
@@ -39,22 +44,23 @@ protected:
     // size: 1
     thrust::device_vector<float> d_sum_result;
     thrust::device_vector<float> d_temp;
+
 private:
 
 };
 struct SolverPCG : LinearSolver {
     // ~SolverPCG() = default;
     SolverPCG(Simulator* simulator): LinearSolver(simulator) {}
-    void init(int diag_size, int edge_size) override {
-        init(diag_size, edge_size, true);
+    void init(int diag_size, int edge_size, bool Jx_nondiag_identity_only) override {
+        init(diag_size, edge_size, Jx_nondiag_identity_only, true);
     }
-    void init(int diag_size, int edge_size, bool use_preconditioner);
+    void init(int diag_size, int edge_size, bool Jx_nondiag_identity_only, bool use_preconditioner);
     void solve(float3* dx, const float3* rhs, int max_iters) override {
         if ( use_preconditioner ) {
-            solve_impl<true>(dx, rhs,max_iters);
+            solve_impl<true>(dx, rhs, max_iters);
         }
         else {
-            solve_impl<false>(dx, rhs,max_iters);
+            solve_impl<false>(dx, rhs, max_iters);
         }
     }
 
@@ -71,7 +77,7 @@ struct SolverPCG : LinearSolver {
 private:
     bool use_preconditioner;
     template<bool UsePreprocessingDiag>
-    void solve_impl(float3* dx, const float3* rhs,int max_iters);
+    void solve_impl(float3* dx, const float3* rhs, int max_iters);
     virtual void try_make_A_PD();
     void print_debug(const float3* rhs);
 };
@@ -79,8 +85,8 @@ private:
 struct SolverJacobi : LinearSolver {
     SolverJacobi(Simulator* simulator) : LinearSolver(simulator) {}
 
-    void init(int diag_size, int edge_size) override;
-    void solve(float3* dx, const float3* rhs,int max_iters) override;
+    void init(int diag_size, int edge_size, bool Jx_nondiag_identity_only) override;
+    void solve(float3* dx, const float3* rhs, int max_iters) override;
 
     thrust::device_vector<float3> r;
     thrust::device_vector<float3> Ax;

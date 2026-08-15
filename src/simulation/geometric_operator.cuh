@@ -166,3 +166,29 @@ inline void edges_to_csr(
     cudaFree(d_sort_keys);
     cudaFree(d_sort_values);
 }
+__device__ inline float3 clamp_to_trajectory_envelope(
+    const float3& A,        // pos_prev
+    const float3& B,        // pos_target_initial
+    const float3& P,        // pos_new
+    const float margin)     // Broad-phase query R
+{
+    float3 AB = B - A;
+    float AB_len_sq = dot(AB, AB);
+
+    float t = 0.0f;
+    if ( AB_len_sq > 1e-12f ) {
+        t = dot(P - A, AB) / AB_len_sq;
+        t = clamp(t, 0.0f, 1.0f);
+    }
+
+    float3 C = A + t * AB;
+    float3 diff = P - C;
+    float dist2 = len_sq(diff);
+
+    //  forcibly project back to the tube wall
+    if ( dist2 > margin * margin ) {
+        return C + diff * (margin * rsqrtf(dist2));
+    }
+
+    return P;
+}

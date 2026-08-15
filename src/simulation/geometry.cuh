@@ -67,7 +67,7 @@ public:
     thrust::device_vector<float> areas;
     thrust::device_vector<float3> pos_inertia;
     thrust::device_vector<float3> pos_world;
-    thrust::device_vector<float3> pos_temp;
+    thrust::device_vector<float3> pos_pred;
     thrust::device_vector<float3> pos_step_prev;
     thrust::device_vector<float3> pos_interpolation_old;
     thrust::device_vector<float3> pos_interpolation_new;
@@ -123,7 +123,7 @@ public:
     void update_for_frame();
     void update_for_step(float h, float time_factor);
     void end_for_frame();
-    void collision_detect() { m_contact.collision_detect(); }
+    void collision_detect() { m_contact.collision_detect_prepare(); }
 
     void upload_world_matrix(int obj_index, const std::vector<float>& matrix);
     void upload_local_vertices(int obj_index, const std::vector<float>& vertices);

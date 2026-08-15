@@ -79,7 +79,7 @@ __device__ __forceinline__ void segment_segment_closest_robust(
     float d = dot(u, w);
     float e = dot(v, w);
 
-    constexpr float EPS = 1e-10f;
+    constexpr float EPS = 1e-18f;
 
     float sN, sD, tN, tD;
 
@@ -198,7 +198,7 @@ static void __device__ barycentric(const float3& A, const float3& B, const float
     float d21 = dot(v2, v1);
     float denom = d00 * d11 - d01 * d01;
 
-    if ( fabs(denom) < 1e-10 ) {
+    if ( fabs(denom) < 1e-16 ) {
         u = v = w = -1.0;
         return;
     }
@@ -227,4 +227,29 @@ static __device__ bool ef_intersect(float3 v0, float3 v1, float3 x0, float3 x1, 
     barycentric(x0, x1, x2, hit_point, u, v, w);
     if ( u < 0.f || v < 0.f || w < 0.f ) return false;
     return true;
+}
+
+__device__ __forceinline__ float segment_endpoint_min_distance_sq_2d(
+    float3 A, float3 B, float3 C, float3 D) {
+    float dx, dy;
+    float min_d2 = FLT_MAX;
+
+    // A-C
+    dx = A.x - C.x;
+    dy = A.y - C.y;
+    min_d2 = fminf(min_d2, dx * dx + dy * dy);
+    // A-D
+    dx = A.x - D.x;
+    dy = A.y - D.y;
+    min_d2 = fminf(min_d2, dx * dx + dy * dy);
+    // B-C
+    dx = B.x - C.x;
+    dy = B.y - C.y;
+    min_d2 = fminf(min_d2, dx * dx + dy * dy);
+    // B-D
+    dx = B.x - D.x;
+    dy = B.y - D.y;
+    min_d2 = fminf(min_d2, dx * dx + dy * dy);
+
+    return min_d2;
 }

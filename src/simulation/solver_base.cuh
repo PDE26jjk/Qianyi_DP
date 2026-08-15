@@ -22,8 +22,6 @@ struct AutoGPUmem {
     ~AutoGPUmem();
 };
 
-
-
 struct SolverBase {
     SolverBase(const SolverBase& other) = delete;
     SolverBase(SolverBase&& other) noexcept = delete;

@@ -73,8 +73,12 @@ void initialize(unsigned int max_primitives);
 void cleanup();
 void build_face_bvh(const thrust::device_vector<float3>& vertices,
     const thrust::device_vector<int3>& faces, BVH3D& bvh, const float3* additional_offset = nullptr);
+void build_face_bvh_wo_refit(const thrust::device_vector<float3>& vertices,
+    const thrust::device_vector<int3>& faces, BVH3D& bvh);
 void build_edge_bvh(const thrust::device_vector<float3>& vertices,
     const thrust::device_vector<int2>& edges, BVH3D& bvh, const float3* additional_offset = nullptr);
+void build_edge_bvh_wo_refit(const thrust::device_vector<float3>& vertices,
+    const thrust::device_vector<int2>& edges, BVH3D& bvh);
 void refit_face_bvh(const float3* vertices,
     const thrust::device_vector<int3>& faces, BVH3D& bvh, const float3* additional_offset = nullptr);
 void refit_edge_bvh(const float3* vertices,

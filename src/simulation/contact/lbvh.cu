@@ -642,25 +642,10 @@ void build_face_bvh(const thrust::device_vector<float3>& vertices,
     compute_face_centroids_kernel<<<blocks, 256>>>(d_verts, d_faces, n, d_centroids);
     build_bvh_internal(bvh, n);
     bvh.aabbs.resize(bvh.nodes.size());
-    // compute_leaf_aabbs_face_kernel<<<blocks, 256>>>(d_verts, d_faces, n,
-    //     thrust::raw_pointer_cast(bvh.nodes.data()),
-    //     thrust::raw_pointer_cast(bvh.aabbs.data()));
-    // thrust::host_vector<unsigned int> h_offsets = bvh.level_offsets;
-    // unsigned int num_levels = h_offsets.size() - 1;
-    // const int2* d_nodes = thrust::raw_pointer_cast(bvh.nodes.data());
-    // AABB3D* d_aabbs = thrust::raw_pointer_cast(bvh.aabbs.data());
-    // const unsigned int* d_level_data = thrust::raw_pointer_cast(s.node_indices_scratch.data());
-    // for ( int l = num_levels - 2; l >= 0; --l ) {
-    //     unsigned int start = h_offsets[l];
-    //     unsigned int end = h_offsets[l + 1];
-    //     unsigned int count = end - start;
-    //     int blks = (count + 255) / 256;
-    //     merge_aabbs_kernel<<<blks, 256>>>(d_level_data + start, count, d_nodes, d_aabbs);
-    // }
+
     unsigned int num_nodes = 2 * n - 1;
     // Zero child_count for refit synchronization
     cudaMemsetAsync(s.child_count.data().get(), 0, num_nodes * sizeof(unsigned int));
-    // thrust::fill(s.child_count.begin(), s.child_count.begin() + num_nodes, 0u);
 
     // Single-kernel bottom-up refit (replaces leaf AABB + level-by-level merge)
     refit_face_bvh_kernel<<<blocks, 256>>>(
@@ -669,6 +654,19 @@ void build_face_bvh(const thrust::device_vector<float3>& vertices,
         thrust::raw_pointer_cast(bvh.parent.data()),
         thrust::raw_pointer_cast(s.child_count.data()),
         thrust::raw_pointer_cast(bvh.aabbs.data()));
+}
+void build_face_bvh_wo_refit(const thrust::device_vector<float3>& vertices,
+    const thrust::device_vector<int3>& faces, BVH3D& bvh) {
+    unsigned int n = faces.size();
+    if ( n == 0 ) return;
+    auto& s = storage::instance();
+    const float3* d_verts = thrust::raw_pointer_cast(vertices.data());
+    const int3* d_faces = thrust::raw_pointer_cast(faces.data());
+    float3* d_centroids = thrust::raw_pointer_cast(s.centroids.data());
+    int blocks = (n + 255) / 256;
+    compute_face_centroids_kernel<<<blocks, 256>>>(d_verts, d_faces, n, d_centroids);
+    build_bvh_internal(bvh, n);
+    bvh.aabbs.resize(bvh.nodes.size());
 }
 void refit_face_bvh(const float3* vertices, const thrust::device_vector<int3>& faces, BVH3D& bvh,
     const float3* additional_offset) {
@@ -703,19 +701,7 @@ void build_edge_bvh(const thrust::device_vector<float3>& vertices, const thrust:
     compute_edge_centroids_kernel<<<blocks, 256>>>(d_verts, d_edges, n, d_centroids);
     build_bvh_internal(bvh, n);
     bvh.aabbs.resize(bvh.nodes.size());
-    // compute_leaf_aabbs_edge_kernel<<<blocks, 256>>>(d_verts, d_edges, n,
-    //     thrust::raw_pointer_cast(bvh.nodes.data()),
-    //     thrust::raw_pointer_cast(bvh.aabbs.data()));
-    // thrust::host_vector<unsigned int> h_offsets = bvh.level_offsets;
-    // unsigned int num_levels = h_offsets.size() - 1;
-    // for ( int l = num_levels - 2; l >= 0; --l ) {
-    //     unsigned int start = h_offsets[l];
-    //     unsigned int count = h_offsets[l + 1] - start;
-    //     merge_aabbs_kernel<<<(count + 255) / 256, 256>>>(
-    //         thrust::raw_pointer_cast(s.node_indices_scratch.data()) + start,
-    //         count, thrust::raw_pointer_cast(bvh.nodes.data()),
-    //         thrust::raw_pointer_cast(bvh.aabbs.data()));
-    // }
+
     unsigned int num_nodes = 2 * n - 1;
     thrust::fill(s.child_count.begin(), s.child_count.begin() + num_nodes, 0u);
 
@@ -726,7 +712,18 @@ void build_edge_bvh(const thrust::device_vector<float3>& vertices, const thrust:
         thrust::raw_pointer_cast(bvh.parent.data()),
         thrust::raw_pointer_cast(s.child_count.data()),
         thrust::raw_pointer_cast(bvh.aabbs.data()));
-    CUDA_CHECK(cudaDeviceSynchronize());
+}
+void build_edge_bvh_wo_refit(const thrust::device_vector<float3>& vertices, const thrust::device_vector<int2>& edges, BVH3D& bvh) {
+    unsigned int n = edges.size();
+    if ( n == 0 ) return;
+    auto& s = storage::instance();
+    const float3* d_verts = thrust::raw_pointer_cast(vertices.data());
+    const int2* d_edges = thrust::raw_pointer_cast(edges.data());
+    float3* d_centroids = thrust::raw_pointer_cast(s.centroids.data());
+    int blocks = (n + 255) / 256;
+    compute_edge_centroids_kernel<<<blocks, 256>>>(d_verts, d_edges, n, d_centroids);
+    build_bvh_internal(bvh, n);
+    bvh.aabbs.resize(bvh.nodes.size());
 }
 void refit_edge_bvh(const float3* vertices, const thrust::device_vector<int2>& edges, BVH3D& bvh,
     const float3* additional_offset) {

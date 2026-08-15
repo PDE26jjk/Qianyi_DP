@@ -32,5 +32,6 @@ public:
     
     static py::dict check_point_attributes(int index);
     static py::dict check_edge_attributes(int p0, int p1);
+    static py::dict check_edge_collision_data(int p0, int p1);
     static void on_exit();
 };

@@ -201,6 +201,10 @@ CheckPointData Simulator::get_check_point_data(int index) const {
     CheckPointData res;
     cudaMemcpy(&res.mass, m_geo->masses.data().get() + index, sizeof(float), cudaMemcpyDeviceToHost);
     cudaMemcpy(&res.force, m_geo->forces.data().get() + index, sizeof(float3), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&res.force_elastic, m_geo->elastic_forces.data().get() + index, sizeof(float3), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&res.pos_world, m_geo->pos_world.data().get() + index, sizeof(float3), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&res.pos_prev, m_geo->pos_step_prev.data().get() + index, sizeof(float3), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&res.pos_pred, m_geo->pos_pred.data().get() + index, sizeof(float3), cudaMemcpyDeviceToHost);
     Contact& contact = m_geo->get_contact();
     std::vector<int> nearby_faces(broad_phase_size);
     cudaMemcpy(nearby_faces.data(),
@@ -253,5 +257,26 @@ CheckEdgeData Simulator::get_check_edge_data(int p0, int p1) const {
     }
     cudaMemcpy(&res.normal, m_geo->edge_normals.data().get() + eid, sizeof(float3), cudaMemcpyDeviceToHost);
     cudaMemcpy(&res.tris, m_geo->e2t.data().get() + eid, sizeof(int2), cudaMemcpyDeviceToHost);
+    return res;
+}
+
+
+CheckEdgeCollisionData Simulator::get_check_edge_collision_data(int p0, int p1) const {
+    assert(p0 < m_geo->params.nb_all_vertices);
+    assert(p1 < m_geo->params.nb_all_vertices);
+
+    CheckEdgeCollisionData res;
+    int* e;
+    cudaMalloc(&e, sizeof(int));
+    get_edge_by_points_index<<<1,1>>>(p0, p1, e, m_geo->dir_edges.data().get(), m_geo->edge_lookup.data().get());
+    CUDA_CHECK(cudaDeviceSynchronize());
+    int eid;
+    cudaMemcpy(&eid, e, sizeof(int), cudaMemcpyDeviceToHost);
+    cudaFree(e);
+    if ( eid < 0 ) throw std::runtime_error("Failed to get edge data");
+
+    Contact& contact = m_geo->get_contact();
+    contact.get_check_edge_collision_data(eid,res);
+
     return res;
 }

@@ -78,13 +78,20 @@ struct DotProductIterator {
         return ptr_a != other.ptr_a;
     }
 };
-void LinearSolver::init(int diag_size,int edge_size) {
+void LinearSolver::init(int diag_size, int edge_size, bool Jx_nondiag_identity_only_) {
     m_edge_size = edge_size;
     m_diag_size = diag_size;
-    Jx_nondiag.resize(edge_size);
+    Jx_nondiag_identity_only = Jx_nondiag_identity_only_;
     Jx_diag.resize(diag_size);
+    if ( Jx_nondiag_identity_only ) {
+        Jx_nondiag_identity.resize(edge_size);
+        Jx_bend_cross_identity.resize(edge_size);
+    }
+    else {
+        Jx_nondiag.resize(edge_size);
+        Jx_bend_cross.resize(edge_size);
+    }
     M_inv.resize(diag_size);
-    Jx_bend_cross.resize(edge_size);
 
     d_sum_result.resize(1);
 
@@ -140,7 +147,7 @@ float LinearSolver::vector_field_dot_sync(const float3* a, const float3* b) {
     //     0.0f,
     //     thrust::plus<float>());
 
-    vector_field_dot(a,b,d_sum_result.data().get());
+    vector_field_dot(a, b, d_sum_result.data().get());
     float result;
     cudaMemcpy(&result, d_sum_result.data().get(), sizeof(float), cudaMemcpyDeviceToHost);
     return result;
@@ -156,7 +163,6 @@ __global__ void Jx_mult_x_diag_kernel(
         res[i] = Jx_diag[i] * x[i];
     }
 }
-
 
 __global__ void A_mul_x_offdiag_kernel(
     float3* __restrict__ res,
@@ -182,6 +188,30 @@ __global__ void A_mul_x_offdiag_kernel(
     }
 }
 
+__global__ void A_mul_x_offdiag_kernel(
+    float3* __restrict__ res,
+    const float* __restrict__ Jx_nondiag,
+    const float* __restrict__ Jx_bend_cross,
+    const float3* __restrict__ x,
+    const int2* __restrict__ edges,
+    const int2* __restrict__ edge_opposite_points,
+    int n // edge size
+) {
+    for ( int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+          i += blockDim.x * gridDim.x ) {
+        auto [v0_i,v1_i] = edges[i];
+
+        atomicAddFloat3(&res[v0_i], Jx_nondiag[i] * x[v1_i]);
+        atomicAddFloat3(&res[v1_i], Jx_nondiag[i] * x[v0_i]);
+
+        auto p_op = edge_opposite_points[i];
+        if ( p_op.x != -1 && p_op.y != -1 ) {
+            atomicAddFloat3(&res[p_op.x], Jx_bend_cross[i] * x[p_op.y]);
+            atomicAddFloat3(&res[p_op.y], Jx_bend_cross[i] * x[p_op.x]);
+        }
+    }
+}
+
 void LinearSolver::A_mult_x(
     float3* __restrict__ dst,
     const float3* __restrict__ src
@@ -197,14 +227,26 @@ void LinearSolver::A_mult_x(
         n);
 
     n = m_edge_size;
-    A_mul_x_offdiag_kernel<<<(n + threadsPerBlock - 1) / threadsPerBlock, threadsPerBlock>>>(
-        dst,
-        Jx_nondiag.data().get(),
-        Jx_bend_cross.data().get(),
-        src,
-        geo->edges.data().get(),
-        geo->edge_opposite_points.data().get(),
-        n);
+    if ( Jx_nondiag_identity_only ) {
+        A_mul_x_offdiag_kernel<<<(n + threadsPerBlock - 1) / threadsPerBlock, threadsPerBlock>>>(
+            dst,
+            Jx_nondiag_identity.data().get(),
+            Jx_bend_cross_identity.data().get(),
+            src,
+            geo->edges.data().get(),
+            geo->edge_opposite_points.data().get(),
+            n);
+    }
+    else {
+        A_mul_x_offdiag_kernel<<<(n + threadsPerBlock - 1) / threadsPerBlock, threadsPerBlock>>>(
+            dst,
+            Jx_nondiag.data().get(),
+            Jx_bend_cross.data().get(),
+            src,
+            geo->edges.data().get(),
+            geo->edge_opposite_points.data().get(),
+            n);
+    }
 
 }
 
@@ -345,8 +387,8 @@ static __global__ void ite_kernel2(
 // template void SolverPCG::solve_impl<true>(float3* dx, const float3* rhs);
 // template void SolverPCG::solve_impl<false>(float3* dx, const float3* rhs);
 
-void SolverJacobi::init(int diag_size, int edge_size) {
-    LinearSolver::init(diag_size, edge_size);
+void SolverJacobi::init(int diag_size, int edge_size, bool Jx_nondiag_identity_only) {
+    LinearSolver::init(diag_size, edge_size, Jx_nondiag_identity_only);
     r.resize(diag_size);
     Ax.resize(diag_size);
 }
@@ -371,7 +413,7 @@ __global__ void residual_kernel(
     }
 }
 
-void SolverJacobi::solve(float3* dx, const float3* rhs,int max_iters) {
+void SolverJacobi::solve(float3* dx, const float3* rhs, int max_iters) {
     int n = m_diag_size;
     int block = 256;
     int grid = (n + block - 1) / block;
@@ -390,11 +432,11 @@ void SolverJacobi::solve(float3* dx, const float3* rhs,int max_iters) {
         A_mult_x(Ax_ptr, x);
         // r = b - Ax
         residual_kernel<<<grid, block>>>(r_ptr, b, Ax_ptr, n);
-        
+
         if ( iter % 10 == 0 && iter > 0 ) {
             r_dot_r = vector_field_dot_sync(r_ptr, r_ptr);
             if ( r_dot_r < tol ) {
-                 break;
+                break;
             }
         }
 

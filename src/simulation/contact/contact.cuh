@@ -12,17 +12,17 @@ struct Contact {
     bool do_collision_detect_broad_phase_before_step;
 
     Contact(Geometry* geo): geo(geo) {}
+    void compute_edge_ranks();
     void init();
-    void collision_detect_broad_phase(const float3* pos, const float3* offset);
-    void collision_detect();
-    void compute_inertial_offset();
+    void collision_detect_broad_phase(const float3* pos, const float3* pos_target, float query_radius, bool ef);
+    void collision_detect_prepare();
     void rebuild_bvh();
     void refit_bvh();
-    void refit_bvh(const float3* pos, const float3* offset);
     void accumulate_contact_force(float3* forces, Mat3* Jx_diag);
     void refit_bvh_with_target(const float3* pos_prev, const float3* pos_target);
     void ccd_truncation_traverse_bvh(const float3* pos_prev, const float3* pos_target);
     void check_truncation_traverse_bvh(const float3* pos_prev, float3* pos_target);
+    void get_check_edge_collision_data(int eid, CheckEdgeCollisionData& res);
 
     void collision_detect_broad_phase_stated(const float3* pos, const float3* pos_target, ContactState* vf_states, ContactState* ee_states, float query_radius);
     // // contact
@@ -74,7 +74,7 @@ struct Contact {
 
     float alpha_hard;
     float point_radius = 0.0025f;
-    float max_dist = 0.0005f;
+    // float max_dist = 0.0005f;
     lbvh3d::BVH3D tri_bvh;
     lbvh3d::BVH3D edge_bvh;
 

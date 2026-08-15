@@ -1,7 +1,5 @@
 #include "solver_VBD.cuh"
 
-#include "solver_explicit.cuh"
-
 // #include "constraint.cuh"
 #include "geometric_operator.cuh"
 #include "geometry.cuh"
@@ -9,9 +7,6 @@
 #include "contact/collision_detection.cuh"
 #include "dynamics/bending.cuh"
 #include "dynamics/planar.cuh"
-
-__device__ int debug_e_id;
-__device__ int debug_v_id;
 
 constexpr float PENALTY_MIN = 0.1f;
 constexpr float PENALTY_MAX = 1e2f;
@@ -36,7 +31,6 @@ void SolverVBD::init() {
     auto& params = *simulator->get_geo_params();
     displacement.resize(params.nb_all_vertices);
     hessians.resize(params.nb_all_vertices);
-    geo->pos_temp.resize(params.nb_all_vertices);
 
     auto& contact = geo->get_contact();
     contact.do_collision_detect_broad_phase_before_step = false;
@@ -1058,32 +1052,7 @@ __global__ void vbd_contact_dual_update_kernel(
         }
     }
 }
-__device__ inline float3 clamp_to_trajectory_envelope(
-    const float3& A,        // pos_prev
-    const float3& B,        // pos_target_initial
-    const float3& P,        // pos_new
-    const float margin)     // Broad-phase query R
-{
-    float3 AB = B - A;
-    float AB_len_sq = dot(AB, AB);
 
-    float t = 0.0f;
-    if ( AB_len_sq > 1e-12f ) {
-        t = dot(P - A, AB) / AB_len_sq;
-        t = clamp(t, 0.0f, 1.0f);
-    }
-
-    float3 C = A + t * AB;
-    float3 diff = P - C;
-    float dist2 = len_sq(diff);
-
-    //  forcibly project back to the tube wall
-    if ( dist2 > margin * margin ) {
-        return C + diff * (margin * rsqrtf(dist2));
-    }
-
-    return P;
-}
 __global__ void apply_force_color_kernel(
     float3* __restrict__ pos,
     const float3* __restrict__ pos_target,
@@ -1182,7 +1151,7 @@ void SolverVBD::step(float h) {
     int block = 256;
 
     float3* q = geo->pos_world.data().get();
-    float3* q_pred = geo->pos_temp.data().get();
+    float3* q_pred = geo->pos_pred.data().get();
     const float3* q_prev = geo->pos_step_prev.data().get();
     float3* q_inertia = geo->pos_inertia.data().get();
     float3* dx = this->displacement.data().get();

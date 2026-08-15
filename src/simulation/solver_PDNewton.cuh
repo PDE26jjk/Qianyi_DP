@@ -20,14 +20,14 @@ private:
     std::string m_linear_solver_name = "PCG";
     thrust::device_vector<float3> dx;
     thrust::device_vector<float> Jx_diag_pd;
-    thrust::device_vector<float> Jx_nondiag_pd;
+    // thrust::device_vector<float> Jx_nondiag_pd;
     thrust::device_vector<float3> subspace_rhs;
     thrust::device_vector<float3> subspace_dy;
     SolverSubspace* subspace_solver = nullptr;
 };
 struct SolverSubspace : SolverPCG {
     SolverSubspace(Simulator* simulator): SolverPCG(simulator) {}
-    void init(int diag_size, int edge_size) override;
+    void init(int diag_size, int edge_size, bool) override;
     void A_mult_x(float3* __restrict__ dst,
         const float3* __restrict__ src) override;
 };

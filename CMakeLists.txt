@@ -87,5 +87,8 @@ if(MSVC)
     )
 endif()
 
-
+add_compile_options(
+    $<$<COMPILE_LANGUAGE:CUDA>:--threads;0>
+    $<$<COMPILE_LANGUAGE:CXX>:/MP>
+)
 

@@ -128,6 +128,9 @@ PYBIND11_MODULE(Qianyi_DP, m) {
         .def_static("check_point_attributes", &SimulatorInterface::check_point_attributes,
             py::arg("index"))
         .def_static("check_edge_attributes", &SimulatorInterface::check_edge_attributes,
+            py::arg("p0"), py::arg("p1"))
+        .def_static("check_edge_collision_data",
+            &SimulatorInterface::check_edge_collision_data,
             py::arg("p0"), py::arg("p1"));
 
     py::class_<PerfTiming>(m, "PerfTiming")
