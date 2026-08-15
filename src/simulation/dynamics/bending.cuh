@@ -3,67 +3,71 @@
 #include "common/vec_math.h"
 #include "common/atomic_utils.cuh"
 
+//  Reference: Z. Wang, Y. Yang, H. Wang, "Stable Discrete Bending by Analytic
+//  Eigensystem and Adaptive Orthotropic Geometric Stiffness", ACM TOG 42(6),
+//  Article 183, 2023.
+
+// ============================================================================
+// Vertex order (follow style3D):
+//   x0, x1 : hinge endpoints (e = normalize(x1 - x0))
+//   x2     : off-hinge vertex of the left triangle
+//   x3     : off-hinge vertex of the right triangle
+// Normals (paper convention):
+//   n1 = normalize(cross(x2 - x0, x1 - x0))
+//   n2 = normalize(cross(x1 - x0, x3 - x0))
+// Altitudes:
+//   m1 = normalize(proj(x2) - x2), m2 = normalize(proj(x3) - x3)
+//        (from the off-hinge vertex toward the hinge line)
+//
+// The returned angle keeps the original project convention, 0 when flat
+//   theta = atan2(dot(cross(n1,n2), e), dot(n1,n2))
+// The gradient is the closed-form 
+//   grad(theta) = t1*n1 + t2*n2,
+// ============================================================================
 static __device__ void get_theta_dpk(
-    float3 p0, float3 p1, float3 p2, float3 p3,
+    float3 x0, float3 x1, float3 x2, float3 x3,
     float3& theta_dp0, float3& theta_dp1, float3& theta_dp2, float3& theta_dp3, float& theta
 ) {
-    float3 p01 = p1 - p0, p02 = p2 - p0;
-    float3 p32 = p2 - p3, p31 = p1 - p3;
-    float3 e = p2 - p1;
+    float3 ev = x1 - x0;
+    float l = norm(ev);
 
-    float3 n0 = cross(p01, p02);
-    float3 n1 = cross(p32, p31);
-    float n0_norm = norm(n0);
-    float n1_norm = norm(n1);
+    float3 n1_raw = cross(x2 - x0, ev);
+    float3 n2_raw = cross(ev, x3 - x0);
+    float n1n = norm(n1_raw), n2n = norm(n2_raw);
 
-    float3 n0_ = (n0_norm > 1e-6f) ? (n0 / n0_norm) : make_float3(0, 0, 0);
-    float3 n1_ = (n1_norm > 1e-6f) ? (n1 / n1_norm) : make_float3(0, 0, 0);
-    float e_norm = norm(e);
-    float3 e_ = (e_norm > 1e-6f) ? (e / e_norm) : make_float3(0, 0, 0);
+    float3 e_ = (l > 1e-6f) ? ev / l : make_float3(0, 0, 0);
+    float3 n1_ = (n1n > 1e-6f) ? n1_raw / n1n : make_float3(0, 0, 0);
+    float3 n2_ = (n2n > 1e-6f) ? n2_raw / n2n : make_float3(0, 0, 0);
 
-    float cos_theta = dot(n0_, n1_);
-    float sin_theta = dot(cross(n0_, n1_), e_);
-    theta = atan2(sin_theta, cos_theta);
+    theta = atan2(dot(cross(n1_, n2_), e_), dot(n1_, n2_));
 
-    Mat3 I = Mat3::identity();
-    Mat3 n0_dn0 = (I - Mat3::outer_product(n0_, n0_)) * (n0_norm > 1e-6f ? 1.0f / n0_norm : 0.0f);
-    Mat3 n1_dn1 = (I - Mat3::outer_product(n1_, n1_)) * (n1_norm > 1e-6f ? 1.0f / n1_norm : 0.0f);
+    if ( n1n <= 1e-6f || n2n <= 1e-6f || l <= 1e-6f ) {
+        theta_dp0 = theta_dp1 = theta_dp2 = theta_dp3 = make_float3(0, 0, 0);
+        return;
+    }
 
-    float3 e_Tn0x = -cross(n0_, e_);
-    float3 e_Tn1x = -cross(n1_, e_);
+    // Hinge altitudes and barycentric weights (h1,h2,omega1,omega2).
+    float3 proj2 = x0 + e_ * dot(x2 - x0, e_);
+    float3 alt2 = proj2 - x2;                 // m1 direction
+    float h1 = norm(alt2);
+    float ih1 = (h1 > 1e-6f) ? 1.0f / h1 : 0.0f;
+    float w1 = dot(x2 - x0, e_) / l;
 
-    Mat3 n0_dpk, n1_dpk;
-    float3 sin_dpk, cos_dpk;
+    float3 proj3 = x0 + e_ * dot(x3 - x0, e_);
+    float3 alt3 = proj3 - x3;                 // m2 direction
+    float h2 = norm(alt3);
+    float ih2 = (h2 > 1e-6f) ? 1.0f / h2 : 0.0f;
+    float w2 = dot(x3 - x0, e_) / l;
 
-    // --- p1 ---
-    n0_dpk = n0_dn0 * Mat3::cross_mat(-p02);
-    n1_dpk = n1_dn1 * Mat3::cross_mat(p32);
-    sin_dpk = e_Tn0x * n1_dpk - e_Tn1x * n0_dpk;
-    cos_dpk = n1_ * n0_dpk + n0_ * n1_dpk;
-    theta_dp1 = sin_dpk * cos_theta - cos_dpk * sin_theta;
-
-    // --- p2 ---
-    n0_dpk = n0_dn0 * Mat3::cross_mat(p01);
-    n1_dpk = n1_dn1 * Mat3::cross_mat(-p31);
-    sin_dpk = e_Tn0x * n1_dpk - e_Tn1x * n0_dpk;
-    cos_dpk = n1_ * n0_dpk + n0_ * n1_dpk;
-    theta_dp2 = sin_dpk * cos_theta - cos_dpk * sin_theta;
-
-    // --- p0 ---
-    n0_dpk = n0_dn0 * Mat3::cross_mat(e);
-    sin_dpk = -e_Tn1x * n0_dpk;
-    cos_dpk = n1_ * n0_dpk;
-    theta_dp0 = sin_dpk * cos_theta - cos_dpk * sin_theta;
-
-    // --- p3 ---
-    n1_dpk = n1_dn1 * Mat3::cross_mat(-e);
-    sin_dpk = e_Tn0x * n1_dpk;
-    cos_dpk = n0_ * n1_dpk;
-    theta_dp3 = sin_dpk * cos_theta - cos_dpk * sin_theta;
+    //   t1 = [(w1-1), -w1, 1, 0]/h1
+    //   t2 = [(w2-1), -w2, 0, 1]/h2
+    // grad(theta) = t1*n1 + t2*n2.
+    theta_dp0 = n1_ * ((w1 - 1.0f) * ih1) + n2_ * ((w2 - 1.0f) * ih2);
+    theta_dp1 = n1_ * (-w1 * ih1) + n2_ * (-w2 * ih2);
+    theta_dp2 = n1_ * ih1;
+    theta_dp3 = n2_ * ih2;
 }
 
-
-//T. Kim and D. Eberle, "Dynamic deformables: implementation and production practicalities (now with code!)," in ACM SIGGRAPH 2022 Courses  (Chapter 10)
 // Discrete Shells model, The energy density is proportional to one-half of the square of the difference between the dihedral angle and its rest dihedral angle.
 // The algorithm uses the Hessian matrix of energy with only the outer product term. (Gauss-Newton method)
 // When the fabric undergoes severe bending, intense folding, or inversion due to large-scale self-penetration, the value of ∂E/∂θ becomes very large.
@@ -89,59 +93,345 @@ static __global__ void compute_dihedral_bending_GN(
     if ( p_op.x == -1 || p_op.y == -1 ) return; // No need to calculate bending force at the boundary.
 
     int2 e_i = edges[i];
-    int p1_idx = e_i.x, p2_idx = e_i.y;
-    int p0_idx = p_op.x, p3_idx = p_op.y;
+    int x0_idx = e_i.x, x1_idx = e_i.y;
+    int x2_idx = p_op.x, x3_idx = p_op.y;
 
     float3 theta_dp0, theta_dp1, theta_dp2, theta_dp3;
     float theta;
-    get_theta_dpk(vertices[p0_idx], vertices[p1_idx], vertices[p2_idx], vertices[p3_idx],
+    get_theta_dpk(vertices[x0_idx], vertices[x1_idx], vertices[x2_idx], vertices[x3_idx],
         theta_dp0, theta_dp1, theta_dp2, theta_dp3, theta);
 
     float coef = kb;
     if ( Jx_diag != nullptr ) {
-        atomicAddMat3(&Jx_diag[p0_idx], Mat3::outer_product(theta_dp0, theta_dp0) * coef);
-        atomicAddMat3(&Jx_diag[p1_idx], Mat3::outer_product(theta_dp1, theta_dp1) * coef);
-        atomicAddMat3(&Jx_diag[p2_idx], Mat3::outer_product(theta_dp2, theta_dp2) * coef);
-        atomicAddMat3(&Jx_diag[p3_idx], Mat3::outer_product(theta_dp3, theta_dp3) * coef);
+        atomicAddMat3(&Jx_diag[x0_idx], Mat3::outer_product(theta_dp0, theta_dp0 * coef));
+        atomicAddMat3(&Jx_diag[x1_idx], Mat3::outer_product(theta_dp1, theta_dp1 * coef));
+        atomicAddMat3(&Jx_diag[x2_idx], Mat3::outer_product(theta_dp2, theta_dp2 * coef));
+        atomicAddMat3(&Jx_diag[x3_idx], Mat3::outer_product(theta_dp3, theta_dp3 * coef));
         if ( Jx != nullptr ) {
             auto [t1_i, t2_i] = e2t[i];
-            auto t1 = triangles[t1_i];
-            auto t2 = triangles[t2_i];
-            auto f1d2 = Mat3::outer_product(theta_dp1, theta_dp2) * coef;
-            atomicAddMat3(&Jx[i], f1d2);
+            auto tri1 = triangles[t1_i];
+            auto tri2 = triangles[t2_i];
+            auto f0d1 = Mat3::outer_product(theta_dp0, theta_dp1 * coef);
+            atomicAddMat3(&Jx[i], f0d1);
 
-            auto f0d1 = Mat3::outer_product(theta_dp0, theta_dp1) * coef;
-            auto f0d2 = Mat3::outer_product(theta_dp0, theta_dp2) * coef;
-            if ( p0_idx < p1_idx ) {
-                atomicAddMat3(&Jx[t1.x], f0d1);
-                atomicAddMat3(&Jx[t1.y], f0d2);
+            auto f2d0 = Mat3::outer_product(theta_dp2, theta_dp0 * coef);
+            auto f2d1 = Mat3::outer_product(theta_dp2, theta_dp1 * coef);
+            if ( x2_idx < x0_idx ) {
+                atomicAddMat3(&Jx[tri1.x], f2d0);
+                atomicAddMat3(&Jx[tri1.y], f2d1);
             }
             else {
-                atomicAddMat3(&Jx[t1.y], f0d1.transpose());
-                atomicAddMat3(&Jx[t1.z], p0_idx < p2_idx ? f0d2 : f0d2.transpose());
+                atomicAddMat3(&Jx[tri1.y], f2d0.transpose());
+                atomicAddMat3(&Jx[tri1.z], x2_idx < x1_idx ? f2d1 : f2d1.transpose());
             }
-            auto f3d1 = Mat3::outer_product(theta_dp3, theta_dp1) * coef;
-            auto f3d2 = Mat3::outer_product(theta_dp3, theta_dp2) * coef;
-            if ( p3_idx < p1_idx ) {
-                atomicAddMat3(&Jx[t2.y], f3d1);
-                atomicAddMat3(&Jx[t2.x], f3d2);
+            auto f3d0 = Mat3::outer_product(theta_dp3, theta_dp0 * coef);
+            auto f3d1 = Mat3::outer_product(theta_dp3, theta_dp1 * coef);
+            if ( x3_idx < x0_idx ) {
+                atomicAddMat3(&Jx[tri2.y], f3d0);
+                atomicAddMat3(&Jx[tri2.x], f3d1);
             }
             else {
-                atomicAddMat3(&Jx[t2.x], f3d1.transpose());
-                atomicAddMat3(&Jx[t2.z], p3_idx < p2_idx ? f3d2 : f3d2.transpose());
+                atomicAddMat3(&Jx[tri2.x], f3d0.transpose());
+                atomicAddMat3(&Jx[tri2.z], x3_idx < x1_idx ? f3d1 : f3d1.transpose());
             }
-            auto f0d3 = Mat3::outer_product(theta_dp0, theta_dp3) * coef;
+            auto f2d3 = Mat3::outer_product(theta_dp2, theta_dp3 * coef);
             // atomicAddMat3(&Jx_bend_cross[i],p0_idx < p3_idx ? f0d3 : f0d3.transpose());
-            atomicAddMat3(&Jx_bend_cross[i], f0d3);
+            atomicAddMat3(&Jx_bend_cross[i], f2d3);
         }
     }
     coef *= -(theta - rest_thetas[i]);
     if ( forces != nullptr ) {
-        atomicAddFloat3(&forces[p0_idx], theta_dp0 * coef);
-        atomicAddFloat3(&forces[p1_idx], theta_dp1 * coef);
-        atomicAddFloat3(&forces[p2_idx], theta_dp2 * coef);
-        atomicAddFloat3(&forces[p3_idx], theta_dp3 * coef);
+        atomicAddFloat3(&forces[x0_idx], theta_dp1 * coef);
+        atomicAddFloat3(&forces[x1_idx], theta_dp2 * coef);
+        atomicAddFloat3(&forces[x2_idx], theta_dp0 * coef);
+        atomicAddFloat3(&forces[x3_idx], theta_dp3 * coef);
     }
+}
+
+struct AOGSGeo {
+    float3 e;        // hinge unit direction, e = normalize(x1 - x0)
+    float l;         // hinge length
+    float3 n1, n2;   // triangle normals
+    float3 m1, m2;   // altitude unit vectors, from x2/x3 toward the hinge line
+    float h1, h2;    // hinge altitudes
+    float w1, w2;    // barycentric weights of x2/x3 on the hinge
+    float t1[4];     // t1 = [(w1-1), -w1, 1, 0]/h1
+    float t2[4];     // t2 = [(w2-1), -w2, 0, 1]/h2
+    float s[4];
+    float ct, st;    // cos(theta_paper) = -n1.n2, sin(theta_paper) = n2.m1
+};
+
+// One pass: theta (project convention), its closed-form gradient, and the full
+// paper geometry. Used by the AOGS kernel so nothing is recomputed.
+static __device__ void get_theta_dpk_aogs(
+    float3 x0, float3 x1, float3 x2, float3 x3,
+    float3& theta_dp0, float3& theta_dp1, float3& theta_dp2, float3& theta_dp3,
+    float& theta, AOGSGeo& geo
+) {
+    float3 ev = x1 - x0;
+    geo.l = norm(ev);
+    geo.e = (geo.l > 1e-6f) ? ev / geo.l : make_float3(0, 0, 0);
+
+    float3 n1_raw = cross(x2 - x0, ev);
+    float3 n2_raw = cross(ev, x3 - x0);
+    float n1n = norm(n1_raw), n2n = norm(n2_raw);
+    geo.n1 = (n1n > 1e-6f) ? n1_raw / n1n : make_float3(0, 0, 0);
+    geo.n2 = (n2n > 1e-6f) ? n2_raw / n2n : make_float3(0, 0, 0);
+
+    theta = atan2(dot(cross(geo.n1, geo.n2), geo.e), dot(geo.n1, geo.n2));
+
+    // Altitudes: m points from the off-hinge vertex toward the hinge line.
+    float3 proj2 = x0 + geo.e * dot(x2 - x0, geo.e);
+    float3 alt2 = proj2 - x2;
+    geo.h1 = norm(alt2);
+    geo.m1 = (geo.h1 > 1e-6f) ? alt2 / geo.h1 : make_float3(0, 0, 0);
+    geo.w1 = dot(x2 - x0, geo.e) / (geo.l + 1e-14f);
+
+    float3 proj3 = x0 + geo.e * dot(x3 - x0, geo.e);
+    float3 alt3 = proj3 - x3;
+    geo.h2 = norm(alt3);
+    geo.m2 = (geo.h2 > 1e-6f) ? alt3 / geo.h2 : make_float3(0, 0, 0);
+    geo.w2 = dot(x3 - x0, geo.e) / (geo.l + 1e-14f);
+
+    // Paper t1, t2, s over (x0,x1,x2,x3).
+    float ih1 = 1.0f / (geo.h1 + 1e-14f);
+    float ih2 = 1.0f / (geo.h2 + 1e-14f);
+    float il = 1.0f / (geo.l + 1e-14f);
+    geo.t1[0] = (geo.w1 - 1.0f) * ih1;
+    geo.t1[1] = -geo.w1 * ih1;
+    geo.t1[2] = ih1;
+    geo.t1[3] = 0.0f;
+    geo.t2[0] = (geo.w2 - 1.0f) * ih2;
+    geo.t2[1] = -geo.w2 * ih2;
+    geo.t2[2] = 0.0f;
+    geo.t2[3] = ih2;
+    geo.s[0] = il;
+    geo.s[1] = -il;
+    geo.s[2] = 0.0f;
+    geo.s[3] = 0.0f;
+
+    // Paper dihedral angle: n2 = -cos(theta)*n1 + sin(theta)*m1.
+    geo.ct = -dot(geo.n1, geo.n2);
+    geo.st = dot(geo.n2, geo.m1);
+
+    // Closed-form gradient grad(theta) = t1*n1 + t2*n2.
+    if ( n1n <= 1e-6f || n2n <= 1e-6f || geo.l <= 1e-6f ) {
+        theta_dp0 = theta_dp1 = theta_dp2 = theta_dp3 = make_float3(0, 0, 0);
+        return;
+    }
+    theta_dp0 = geo.n1 * geo.t1[0] + geo.n2 * geo.t2[0];
+    theta_dp1 = geo.n1 * geo.t1[1] + geo.n2 * geo.t2[1];
+    theta_dp2 = geo.n1 * ih1;
+    theta_dp3 = geo.n2 * ih2;
+}
+
+// Diagonal of F' = E * clamp(Lambda,0) * E^T without forming the 8x8 product.
+// AOGS only needs F'00..F'77 (paper Eq.15).
+// g is the project delta angle (identical to the paper g), st/ct are the paper
+// sin/cos of the dihedral angle.
+static __device__ void aogs_fp_diag(
+    float p, float g, float st, float ct, float Fp[8]
+) {
+    for ( int k = 0; k < 8; ++k ) Fp[k] = 0.0f;
+
+    // Eigenvalues of F0 and F1 (paper Eq.8).
+    float lam[8];
+    float r = sqrtf(p * p + g * g);
+    lam[0] = p + r;
+    lam[1] = g;
+    lam[2] = p - r;
+    lam[3] = -g;
+    float s2 = st * st;
+    float A = sqrtf(s2 + 4.0f * (1.0f - ct));
+    float B = sqrtf(s2 + 4.0f * (1.0f + ct));
+    lam[4] = 0.5f * g * (st + A);
+    lam[5] = 0.5f * g * (-st + B);
+    lam[6] = 0.5f * g * (st - A);
+    lam[7] = 0.5f * g * (-st - B);
+#pragma unroll
+    for ( int k = 0; k < 8; ++k ) lam[k] = fmaxf(lam[k], 0.0f); // Algorithm 1 clamp
+
+    // g = 0 (reference bending state): single nonzero eigenvalue 2p with
+    // eigenvector [1, -ct, st, 0]/sqrt(2).
+    if ( fabsf(g) < 1e-5f ) {
+        Fp[0] = p;
+        Fp[1] = p * ct * ct;
+        Fp[2] = p * st * st;
+        return;
+    }
+
+    // F0 block: analytic eigenvectors (paper Eq.9).
+#pragma unroll
+    for ( int i = 0; i < 4; ++i ) {
+        if ( lam[i] <= 0.0f ) continue;
+        float delta = (i == 1 || i == 3) ? -1.0f : 1.0f;
+        float lg = lam[i] / g;
+        float v0 = lg;
+        float v1 = delta * (st - ct * lg);
+        float v2 = delta * (ct + st * lg);
+        float v3 = 1.0f;
+        float inv_n = rsqrtf(v0 * v0 + v1 * v1 + v2 * v2 + v3 * v3);
+        Fp[0] += lam[i] * (v0 * inv_n) * (v0 * inv_n);
+        Fp[1] += lam[i] * (v1 * inv_n) * (v1 * inv_n);
+        Fp[2] += lam[i] * (v2 * inv_n) * (v2 * inv_n);
+        Fp[3] += lam[i] * (v3 * inv_n) * (v3 * inv_n);
+    }
+
+    // F1 block.
+    if ( fabsf(st) < 1e-4f ) {
+        // theta ~ 0, pi, 2pi: only the largest clamped eigenvalue of F1
+        // survives; its limit eigenvector has squared components
+        // (1/2, 0, 1/4, 1/4).
+        float lmax = fmaxf(fmaxf(lam[4], lam[5]), fmaxf(lam[6], lam[7]));
+        Fp[4] = 0.5f * lmax;
+        Fp[5] = 0.0f;
+        Fp[6] = 0.25f * lmax;
+        Fp[7] = 0.25f * lmax;
+        return;
+    }
+#pragma unroll
+    for ( int i = 4; i < 8; ++i ) {
+        if ( lam[i] <= 0.0f ) continue;
+        float delta = (i == 5 || i == 7) ? -1.0f : 1.0f;
+        float lg = lam[i] / g;
+        float v0 = lg;
+        float v1 = lg * (delta + ct) / st;
+        float v2 = delta;
+        float v3 = 1.0f;
+        float inv_n = rsqrtf(v0 * v0 + v1 * v1 + v2 * v2 + v3 * v3);
+        Fp[4] += lam[i] * (v0 * inv_n) * (v0 * inv_n);
+        Fp[5] += lam[i] * (v1 * inv_n) * (v1 * inv_n);
+        Fp[6] += lam[i] * (v2 * inv_n) * (v2 * inv_n);
+        Fp[7] += lam[i] * (v3 * inv_n) * (v3 * inv_n);
+    }
+}
+
+// ============================================================================
+// Adaptive Orthotropic Geometric Stiffness bending
+//
+// H_o = mu [ p*P + a0*S0 + a1*S1 + a2*S2 + a3*S3 ]        (paper Eq.14)
+//     = mu [ (p+a0/2) q0q0^T + (a0/2) q1q1^T
+//            + (a1/2)(q2q2^T+q3q3^T) + (a2/2)(q4q4^T+q5q5^T)
+//            + (a3/2)(q6q6^T+q7q7^T) ]
+// with p = 1 (Discrete Shells), mu folded into kb, and a0..a3 from the
+// diagonal of F' (paper Eq.15), computed directly without forming E*L'*E^T.
+// ============================================================================
+static __global__ void compute_dihedral_bending_AOGS(
+    Mat3* Jx,
+    Mat3* Jx_diag,
+    Mat3* Jx_bend_cross,
+    float3* forces,
+    const float3* __restrict__ vertices,
+    const int2* __restrict__ edges,
+    const int2* __restrict__ e2t,
+    const float* __restrict__ rest_thetas,
+    const int3* __restrict__ triangles,
+    const int2* __restrict__ edge_opposite_points,
+    int num_edges, float kb
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if ( i >= num_edges ) return;
+
+    int2 p_op = edge_opposite_points[i];
+    if ( p_op.x == -1 || p_op.y == -1 ) return; // boundary: no bending element
+
+    int2 e_i = edges[i];
+    int x0_idx = e_i.x, x1_idx = e_i.y;   // hinge endpoints 
+    int x2_idx = p_op.x, x3_idx = p_op.y; // off-hinge vertices 
+
+    // ---- theta, gradient, and geometry in one pass ----
+    AOGSGeo geo;
+    float3 th_dp0, th_dp1, th_dp2, th_dp3;
+    float theta;
+    get_theta_dpk_aogs(
+        vertices[x0_idx], vertices[x1_idx], vertices[x2_idx], vertices[x3_idx],
+        th_dp0, th_dp1, th_dp2, th_dp3, theta, geo);
+
+    // ---- forces: unchanged from the GN kernel ----
+    // g = d psi / d theta = theta - rest_theta
+    float g = theta - rest_thetas[i];
+    if ( forces != nullptr ) {
+        float coef = -kb * g;
+        atomicAddFloat3(&forces[x0_idx], th_dp0 * coef);
+        atomicAddFloat3(&forces[x1_idx], th_dp1 * coef);
+        atomicAddFloat3(&forces[x2_idx], th_dp2 * coef);
+        atomicAddFloat3(&forces[x3_idx], th_dp3 * coef);
+    }
+    if ( Jx_diag == nullptr ) return; // only forces were requested
+
+    if ( geo.h1 < 1e-6f || geo.h2 < 1e-6f || geo.l < 1e-6f ) return; // degenerate
+
+    // ---- adaptive parameters from the F' diagonal (paper Eq.15) ----
+    const float p = 1.0f; // Discrete Shells: p = d2psi/dtheta2 = 1
+    float Fp[8];
+    aogs_fp_diag(p, g, geo.st, geo.ct, Fp);
+    float a0 = fmaxf(0.0f, fmaxf(Fp[0], Fp[1]) - p);
+    float a1 = fmaxf(0.0f, fmaxf(Fp[2], Fp[3]));
+    float a2 = fmaxf(0.0f, fmaxf(Fp[6], Fp[7]));
+    float a3 = fmaxf(0.0f, fmaxf(Fp[4], Fp[5]));
+
+    // ---- disassembly of S_0..3 (Paper Eq.13) ---- 
+    // 7 base outer products, computed once per edge.
+    Mat3 N11 = Mat3::outer_product(geo.n1, geo.n1);
+    Mat3 N22 = Mat3::outer_product(geo.n2, geo.n2);
+    Mat3 M11 = Mat3::outer_product(geo.m1, geo.m1);
+    Mat3 M22 = Mat3::outer_product(geo.m2, geo.m2);
+    Mat3 N12 = Mat3::outer_product(geo.n1, geo.n2);
+    Mat3 N21 = Mat3::outer_product(geo.n2, geo.n1);
+    Mat3 EE = Mat3::outer_product(geo.e, geo.e);
+
+    // Block (a,b) of H_o in paper vertex order, by exact rank reduction.
+    auto calc_B = [&](int a, int b) -> Mat3 {
+        float T11 = geo.t1[a] * geo.t1[b];
+        float T22 = geo.t2[a] * geo.t2[b];
+        float T12 = geo.t1[a] * geo.t2[b];
+        float T21 = geo.t2[a] * geo.t1[b];
+        float Sab = geo.s[a] * geo.s[b];
+        float w_n1n1 = (p + a0) * T11 + a3 * Sab;
+        float w_n2n2 = (p + a0) * T22 + a3 * Sab;
+        float w_m1m1 = a1 * T11;
+        float w_m2m2 = a1 * T22;
+        float w_n1n2 = p * T12;
+        float w_n2n1 = p * T21;
+        float w_ee = a2 * (T11 + T22);
+        return (N11 * w_n1n1 + N22 * w_n2n2 + M11 * w_m1m1 + M22 * w_m2m2 +
+            N12 * w_n1n2 + N21 * w_n2n1 + EE * w_ee) * kb;
+    };
+
+    atomicAddMat3(&Jx_diag[x0_idx], calc_B(0, 0));
+    atomicAddMat3(&Jx_diag[x1_idx], calc_B(1, 1));
+    atomicAddMat3(&Jx_diag[x2_idx], calc_B(2, 2));
+    atomicAddMat3(&Jx_diag[x3_idx], calc_B(3, 3));
+
+    if ( Jx ) {
+        auto [t1_i, t2_i] = e2t[i];
+        auto tri1 = triangles[t1_i]; // triangle (x0,x1,x2)
+        auto tri2 = triangles[t2_i]; // triangle (x0,x1,x3)
+
+        atomicAddMat3(&Jx[i], calc_B(0, 1));          // hinge (x0,x1)
+        atomicAddMat3(&Jx_bend_cross[i], calc_B(2, 3)); // cross (x2,x3)
+
+        Mat3 B20 = calc_B(2, 0), B21 = calc_B(2, 1);   // left triangle
+        if ( x2_idx < x0_idx ) {
+            atomicAddMat3(&Jx[tri1.x], B20);
+            atomicAddMat3(&Jx[tri1.y], B21);
+        }
+        else {
+            atomicAddMat3(&Jx[tri1.y], B20.transpose());
+            atomicAddMat3(&Jx[tri1.z], x2_idx < x1_idx ? B21 : B21.transpose());
+        }
+
+        Mat3 B30 = calc_B(3, 0), B31 = calc_B(3, 1);   // right triangle
+        if ( x3_idx < x0_idx ) {
+            atomicAddMat3(&Jx[tri2.y], B30);
+            atomicAddMat3(&Jx[tri2.x], B31);
+        }
+        else {
+            atomicAddMat3(&Jx[tri2.x], B30.transpose());
+            atomicAddMat3(&Jx[tri2.z], x3_idx < x1_idx ? B31 : B31.transpose());
+        }
+    }
+
 }
 
 static __device__ float compute_cotangent(float3 p0, float3 p1, float3 p2) {
@@ -264,26 +554,5 @@ static __global__ void compute_quadratic_Bending_IBM(
             atomicAddMat3(&Jx[t2.x], f0d3);
             atomicAddMat3(&Jx[t2.z], f1d3);
         }
-        // auto assign_jacobian = [&](int3 t, int p_opp, Mat3 f0_opp, Mat3 f1_opp) {
-        //     [cite_start]int t_edges[3] = {t.x, t.y, t.z};
-        //     for(int e = 0; e < 3; ++e) {
-        //         int e_idx = t_edges[e];
-        //         if (e_idx == i) continue; // Skip the central edge
-        //         
-        //         int2 v = edges[e_idx];
-        //         // Check if this edge connects p0 and p_opp
-        //         if ((v.x == p0_idx && v.y == p_opp) || (v.y == p0_idx && v.x == p_opp)) {
-        //             atomicAddMat3(&Jx[e_idx], f0_opp);
-        //         } 
-        //         // Check if this edge connects p1 and p_opp
-        //         else if ((v.x == p1_idx && v.y == p_opp) || (v.y == p1_idx && v.x == p_opp)) {
-        //             atomicAddMat3(&Jx[e_idx], f1_opp);
-        //         }
-        //     }
-        // };
-        //
-        // assign_jacobian(triangles[t1_i], p2_idx, f0d2, f1d2);
-        // assign_jacobian(triangles[t2_i], p3_idx, f0d3, f1d3);
-
     }
 }
