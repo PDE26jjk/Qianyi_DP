@@ -218,7 +218,7 @@ void SolverPDNewton::init() {
     }
     auto& params = *simulator->get_geo_params();
     auto* geo = simulator->get_geo();
-    linear->init(params.nb_all_cloth_vertices, params.nb_all_cloth_edges, true);
+    linear->init(params.nb_all_cloth_vertices, params.nb_all_cloth_edges, false);
 
     dx.resize(params.nb_all_vertices);
 
@@ -306,6 +306,9 @@ void SolverPDNewton::step(float h) {
     int2* edges = geo->edges.data().get();
     int3* tri_edges = geo->triangles.data().get();
     int3* tris = geo->triangle_indices.data().get();
+    int2* e2t = geo->e2t.data().get();
+    int2* eop = geo->edge_opposite_points.data().get();
+    float* rest_thetas = geo->rest_thetas.data().get();
     char* mask = geo->vertices_mask.data().get();
     float* mass = geo->masses.data().get();
     float* mass_inv = geo->mass_inv.data().get();
@@ -315,8 +318,8 @@ void SolverPDNewton::step(float h) {
     // const float* Jx_nondiag_pd = this->Jx_nondiag_pd.data().get();
     Mat3* Jx_diag = linear->Jx_diag.data().get();
     Mat3* M_inv = linear->M_inv.data().get();
-    // Mat3* Jx_nondiag = linear->Jx_nondiag.data().get();
-    // Mat3* Jx_bend_cross = linear->Jx_bend_cross.data().get();
+    Mat3* Jx_nondiag = linear->Jx_nondiag.data().get();
+    Mat3* Jx_bending_cross = linear->Jx_bend_cross.data().get();
     float* static_diags = geo->static_diags.data().get();
     cudaMemcpyAsync(static_diags, Jx_diag_pd, n * sizeof(float), cudaMemcpyDeviceToDevice);
     float mask_stiff = max(0.f, get_global_parameter("mask_stiff", 1e2f));
@@ -335,6 +338,7 @@ void SolverPDNewton::step(float h) {
     int linear_iters = max(1, (int)get_global_parameter("linear_iters", 10));
     int subspace_iters = max(0, (int)get_global_parameter("subspace_iters", 1));
     float max_force_scale = max(0.f, get_global_parameter("max_force_scale", 100.f));
+    float bending_k = max(0.f, get_global_parameter("bending_k", 0.2f));
     for ( int i = 0; i < iters; i++ ) {
         n = params.nb_all_cloth_vertices;
         cudaMemsetAsync(f, 0, sizeof(float3) * n);
@@ -346,17 +350,43 @@ void SolverPDNewton::step(float h) {
 
         step_begin_pd<<<(n + block - 1) / block, block>>>(f, q_inertia, q, mass, h, n);
         n = params.nb_all_cloth_edges;
+        cudaMemsetAsync(Jx_nondiag, 0, sizeof(Mat3) * n);
+        cudaMemsetAsync(Jx_bending_cross, 0, sizeof(Mat3) * n);
         // preprocessing_nondiag<<<(n + block - 1) / block, block>>>(
         //     Jx_nondiag, Jx_nondiag_pd, n);
         // cudaMemsetAsync(Jx_bend_cross, 0, sizeof(Mat3) * n);
         // compute_constraint();
         // geo->accumulate_sewing_force();
+        if ( geo->constitutive_model == ConstitutiveModel::SpringMass ) {
+            accumulate_spring_forces<<<(n + block - 1) / block, block>>>(
+                Jx_nondiag, Jx_diag, f_elastic, nullptr, q, edges,
+                geo->edge_lengths.data().get(),
+                geo->obj_data.data().get(), geo->vertices_obj.data().get(),
+                n);
+        }
+        else if ( geo->constitutive_model == ConstitutiveModel::FEM_BW ) {}
+        
+        n = params.nb_all_cloth_edges;
+        if ( geo->bending_model == BendingModel::IBM_quadratic )
+            compute_quadratic_bending_IBM<<< (n + block - 1) / block, block>>>(
+                Jx_nondiag, Jx_diag, Jx_bending_cross,
+                f, nullptr,
+                geo->IBM_q.data().get(),
+                q, edges, e2t, tri_edges, eop,
+                n, bending_k);
+        else if ( geo->bending_model == BendingModel::DiscreteShells_GN )
+            compute_dihedral_bending_GN<<<(n + block - 1), block>>>(
+                Jx_nondiag, Jx_diag, Jx_bending_cross,
+                f, q, edges, e2t, rest_thetas,
+                tri_edges, eop,
+                n, bending_k);
+        else if ( geo->bending_model == BendingModel::DiscreteShells_AOGS )
+            compute_dihedral_bending_AOGS<<<(n + block - 1), block>>>(
+                Jx_nondiag, Jx_diag, Jx_bending_cross,
+                f, q, edges, e2t, rest_thetas,
+                tri_edges, eop,
+                n, bending_k);
 
-        accumulate_spring_forces<<<(n + block - 1) / block, block>>>(
-            nullptr, nullptr, f_elastic, nullptr, q, edges,
-            geo->edge_lengths.data().get(),
-            geo->obj_data.data().get(), geo->vertices_obj.data().get(),
-            n);
         n = params.nb_all_cloth_vertices;
 
         prepare_linear_step_kernel<<<(n + block - 1) / block, block>>>(

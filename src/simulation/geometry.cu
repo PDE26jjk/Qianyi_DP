@@ -114,21 +114,50 @@ void Geometry::init(const GeoDataInput& geo) {
 
     init_triangle_data();
 
-    // precompute bending
-    IBM_q.assign(params.nb_all_cloth_edges, make_float4(0.0f, 0.0f, 0.0f, 0.f));
-    int threadsPerBlock = 256;
-    int n = params.nb_all_cloth_edges;
-    int blocksPerGrid = (n + threadsPerBlock - 1) / threadsPerBlock;
-    precompute_IBM_Q<<<blocksPerGrid, threadsPerBlock>>>(
-        thrust::raw_pointer_cast(IBM_q.data()),
-        thrust::raw_pointer_cast(edges.data()),
-        thrust::raw_pointer_cast(e2t.data()),
-        thrust::raw_pointer_cast(pos_2D.data()),
-        thrust::raw_pointer_cast(edge_opposite_points.data()),
-        thrust::raw_pointer_cast(Dms.data()),
-        n
-        );
-
+    // check and set physical model
+    switch ( int constitutive_model_planar = (int)get_global_parameter("constitutive_model_planar", 0) ) {
+    case 0:
+        constitutive_model = ConstitutiveModel::SpringMass;
+        break;
+    case 1:
+        constitutive_model = ConstitutiveModel::FEM_BW;
+        break;
+    default:
+        std::cout << "Unsupported constitutive model " << constitutive_model_planar << ", using FEM_BW." << std::endl;
+        constitutive_model = ConstitutiveModel::FEM_BW;
+        break;
+    }
+    switch ( int bending_model_ = (int)get_global_parameter("bending_model", 0) ) {
+    case 0:
+        bending_model = BendingModel::IBM_quadratic;
+        break;
+    case 1:
+        bending_model = BendingModel::DiscreteShells_GN;
+        break;
+    case 2:
+        bending_model = BendingModel::DiscreteShells_AOGS;
+        break;
+    default:
+        std::cout << "Unsupported bending model " << bending_model_ << ", using DiscreteShells_GN." << std::endl;
+        bending_model = BendingModel::DiscreteShells_GN;
+        break;
+    }
+    if ( bending_model == BendingModel::IBM_quadratic ) {
+        // precompute bending
+        IBM_q.assign(params.nb_all_cloth_edges, make_float4(0.0f, 0.0f, 0.0f, 0.f));
+        int threadsPerBlock = 256;
+        int n = params.nb_all_cloth_edges;
+        int blocksPerGrid = (n + threadsPerBlock - 1) / threadsPerBlock;
+        precompute_IBM_Q<<<blocksPerGrid, threadsPerBlock>>>(
+            thrust::raw_pointer_cast(IBM_q.data()),
+            thrust::raw_pointer_cast(edges.data()),
+            thrust::raw_pointer_cast(e2t.data()),
+            thrust::raw_pointer_cast(pos_2D.data()),
+            thrust::raw_pointer_cast(edge_opposite_points.data()),
+            thrust::raw_pointer_cast(Dms.data()),
+            n
+            );
+    }
     need_update_inv_mass = true;
     need_update_interpolation_vertices_this_frame = false;
     need_record_interpolation_this_frame = true;
@@ -203,6 +232,7 @@ void Geometry::init_edge_data() {
         dir_edges.data().get(), edge_lookup.data().get());
 
     calc_edge_length();
+    rest_thetas.assign(num_edges,0.f); // TODO
 }
 
 static __device__ int get_opposite_point(const int2& edge, const int3& tri, const int2* edges) {

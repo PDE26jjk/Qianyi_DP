@@ -30,6 +30,15 @@ struct AttachInfo {
     float v;
     float d;
 };
+enum class ConstitutiveModel: char {
+    SpringMass,
+    FEM_BW,
+};
+enum class BendingModel: char {
+    IBM_quadratic,
+    DiscreteShells_GN,
+    DiscreteShells_AOGS,
+};
 struct Geometry {
     virtual ~Geometry() = default;
     Geometry(Simulator* simulator): simulator(simulator), m_contact(Contact(this)) {}
@@ -62,6 +71,7 @@ public:
     thrust::device_vector<int2> dir_edges; // size = 2 * nb_all_edges,  [target, edge_id] per element
     thrust::device_vector<int2> edge_lookup; // size = nb_all_vertices, [offset, count] per vertex
     thrust::device_vector<int2> e2t;
+    thrust::device_vector<float> rest_thetas;
     thrust::device_vector<int2> edge_opposite_points;
     thrust::device_vector<Mat2> Dms;
     thrust::device_vector<float> areas;
@@ -97,7 +107,10 @@ public:
 
     thrust::device_vector<float3> temp_vertices_f3;
 
+    ConstitutiveModel constitutive_model;
+
     // bending
+    BendingModel bending_model;
     thrust::device_vector<float4> IBM_q;
     bool need_record_interpolation_this_frame;
     bool need_update_interpolation_vertices_this_frame;

@@ -93,6 +93,9 @@ void SolverExplicit::step(float h) {
     float3* f = geo->forces.data().get();
     float3* f_elastic = geo->elastic_forces.data().get();
     int2* edges = geo->edges.data().get();
+    int2* e2t = geo->e2t.data().get();
+    int2* eop = geo->edge_opposite_points.data().get();
+    float* rest_thetas = geo->rest_thetas.data().get();
     int3* tri_edges = geo->triangles.data().get();
     int3* tris = geo->triangle_indices.data().get();
     char* mask = geo->vertices_mask.data().get();
@@ -125,10 +128,10 @@ void SolverExplicit::step(float h) {
 
     forward_step<<<(n + block - 1) / block, block>>>(
         v, nullptr, mass_inv,
-        nullptr,f_elastic,
+        nullptr, f_elastic,
         mask, q_inertia, nullptr, q, nullptr,
         static_diags,
-        h, 1e2, geo->gravity,false, n);
+        h, 1e2, geo->gravity, false, n);
     // n = pp_result_size_h;
     // compute_collision_penalty_force_point_point<<<(n + block - 1) / block, block>>>(
     //     nullptr, nullptr,
@@ -176,26 +179,23 @@ void SolverExplicit::step(float h) {
     //     nullptr,
     //     geo->Dms.data().get(),
     //     n);
-    // compute_dihedral_bending_Fizt<<<blocksPerGrid, block>>>(
-    //     nullptr, nullptr, nullptr,
-    //     thrust::raw_pointer_cast(forces.data()),
-    //     thrust::raw_pointer_cast(vertices_world.data()),
-    //     thrust::raw_pointer_cast(edges.data()),
-    //     nullptr,
-    //     nullptr,
-    //     thrust::raw_pointer_cast(edge_opposite_points.data()),
-    //     n, 0.2);
+
     n = params.nb_all_cloth_edges;
-    // compute_quadratic_Bending_IBM<<< (n + block - 1) / block, block>>>(
-    //     nullptr, nullptr, nullptr,
-    //     forces.data().get(), nullptr,
-    //     IBM_q.data().get(),
-    //     q,
-    //     edges.data().get(),
-    //     e2t.data().get(),
-    //     triangles.data().get(),
-    //     edge_opposite_points.data().get(),
-    //     n, 0.2f);
+    if ( geo->bending_model == BendingModel::IBM_quadratic )
+        compute_quadratic_bending_IBM<<< (n + block - 1) / block, block>>>(
+            nullptr, nullptr, nullptr,
+            f, nullptr,
+            geo->IBM_q.data().get(),
+            q, edges, e2t, tri_edges, eop,
+            n, 0.2f);
+    else if ( geo->bending_model == BendingModel::DiscreteShells_GN
+        || geo->bending_model == BendingModel::DiscreteShells_AOGS )
+        // The forces are the same
+        compute_dihedral_bending_GN<<<(n + block - 1), block>>>(
+            nullptr, nullptr, nullptr,
+            f, q, edges, e2t, rest_thetas,
+            tri_edges, eop,
+            n, 0.2);
     geo->accumulate_sewing_force();
     geo->get_contact().accumulate_contact_force(f, nullptr);
     // update substep end
@@ -208,7 +208,7 @@ void SolverExplicit::step(float h) {
     bool ground = geo->ground;
     float ground_f = max(0.f, (get_global_parameter("ground_f", 1e3)));
     step_end_kernel<<<(n + block - 1) / block, block>>>(
-        q, v, q_inertia, f,f_elastic, mask, mass_inv, obj_data, vertices_obj, h, max_vel, ground, ground_f, n);
+        q, v, q_inertia, f, f_elastic, mask, mass_inv, obj_data, vertices_obj, h, max_vel, ground, ground_f, n);
 
     // if ( substep % LCP_substeps == 0 ) {
     //     collision_LCP_postprocess_unified(vertices_world.data().get());

@@ -308,7 +308,8 @@ static __device__ void aogs_fp_diag(
 
 // ============================================================================
 // Adaptive Orthotropic Geometric Stiffness bending
-//
+// The instruction count is more than double that of the GN method, but more stable.
+// 
 // H_o = mu [ p*P + a0*S0 + a1*S1 + a2*S2 + a3*S3 ]        (paper Eq.14)
 //     = mu [ (p+a0/2) q0q0^T + (a0/2) q1q1^T
 //            + (a1/2)(q2q2^T+q3q3^T) + (a2/2)(q4q4^T+q5q5^T)
@@ -479,7 +480,7 @@ static __global__ void precompute_IBM_Q(
 // M. Wardetzky, M. Bergou, D. Harmon, D. Zorin, and E. Grinspun, "Discrete quadratic curvature energies" , Computer Aided Geometric Design, vol. 24, no. 8, pp. 499–518, Nov. 2007, doi: 10.1016/j.cagd.2007.07.006.
 // Discrete Willmore Energy of isometric bending model (IBM), assume the edge lengths remain unchanged.
 // It is valid only when the rest dihedral angle is straight angle.
-static __global__ void compute_quadratic_Bending_IBM(
+static __global__ void compute_quadratic_bending_IBM(
     Mat3* __restrict__ Jx,
     Mat3* __restrict__ Jx_diag,
     Mat3* __restrict__ Jx_bend_cross,
@@ -517,7 +518,6 @@ static __global__ void compute_quadratic_Bending_IBM(
     }
 
     // These should be precomputed and are written here for completeness.
-    kb = -kb;
     if ( Jx_diag ) {
         atomicAddMat3(&Jx_diag[p0_idx], Mat3::identity(q.x * q.x * kb));
         atomicAddMat3(&Jx_diag[p1_idx], Mat3::identity(q.y * q.y * kb));

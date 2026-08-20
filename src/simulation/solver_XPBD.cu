@@ -674,14 +674,14 @@ void SolverXPBD::step(float h) {
     float ef_force_k = max(0.f, geo->get_global_parameter("ef_force_k", 0.2f));
     float damping = max(0.f, get_global_parameter("xpbd_damping", 0.f));
     float relaxation = max(0.f, geo->get_global_parameter("xpbd_relaxation", 0.9f));
-    int constitutive_model_planar = (int)geo->get_global_parameter("constitutive_model_planar", 0);
+
 
     auto& contact = geo->get_contact();
     for ( int i = 0; i < iters; i++ ) {
         if ( lambdas )
             cudaMemsetAsync(lambdas, 0, this->lambdas.size() * sizeof(float));
         for ( int j = 0; j < dynamics_iters; j++ ) {
-            if ( constitutive_model_planar == 0 ) {
+            if ( geo->constitutive_model == ConstitutiveModel::SpringMass ) {
                 n = params.nb_all_cloth_edges;
                 xpbd_solve_springs_kernel<<<(n + block - 1) / block, block>>>(lambdas, dx,
                     q, v, mass_inv, edges,
@@ -689,7 +689,7 @@ void SolverXPBD::step(float h) {
                     obj_data, vertices_obj,
                     damping, h, n);
             }
-            else if ( constitutive_model_planar == 1 ) {
+            else if ( geo->constitutive_model == ConstitutiveModel::FEM_BW ) {
                 n = params.nb_all_cloth_triangles;
                 xpbd_solve_triangle_fem_kernel<<<(n + block - 1) / block, block>>>(
                     lambdas, dx,

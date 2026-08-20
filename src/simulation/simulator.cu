@@ -73,7 +73,7 @@ void Simulator::init(const GeoDataInput& geo
         create_solver();
     }
     if ( m_geo == nullptr ) {
-        m_geo = new Geometry(this);
+        m_geo = new Geometry(this); 
     }
     m_geo->init(geo);
     m_solver->init();
