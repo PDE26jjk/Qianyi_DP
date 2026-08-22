@@ -79,5 +79,12 @@ ehthumbs.db
 
 Qianyi_DP.egg-info/
 
-Agents.md
+!AGENTS.md
 .agents/
+
+# Local-only developer notes (machine paths, local env details - never shared)
+LOCAL_DEV.md
+
+# Test artifacts (generated, gitignored by design)
+build/artifacts/
+tests/artifacts/

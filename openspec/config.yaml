@@ -1,0 +1,51 @@
+schema: spec-driven
+
+# Project context (optional)
+context: |
+  Qianyi data-processing backend (Qianyi_DP): a CUDA-accelerated cloth simulation and
+  geometry library.
+  - Tech stack: C++20 + CUDA + pybind11; setup.py builds the Qianyi_DP.pyd module via
+    CMake (the local build output path and Python environment are machine-specific -
+    see LOCAL_DEV.md at the repo root).
+  - Public Python API: qydp.geometry (sample_points / delaunay_2d / find_map_weight),
+    qydp.pattern_helper, qydp.simulator (input_data / update / get_simulation_data /
+    get_debug_colors / check_point_attributes / check_edge_attributes / set_solver /
+    set_parameter / get_all_solver), qydp.test (timing-only benchmarks), qydp.PerfTiming.
+  - Correctness reference: the Qianyi Blender frontend repository (a sibling checkout on
+    the maintainer's machine; simulation_manager.py is the source of truth for driver
+    semantics: input_data(mesh_list + sewings) -> update(substeps of dt <= 0.001) ->
+    get_simulation_data); the standard solver configuration is PDNewton plus the
+    canonical PDNewton parameter block (locally validated values; provenance recorded
+    in LOCAL_DEV.md).
+  - Constraints: simulation tests use procedural scenes and must not depend on Blender;
+    GIFs are optional artifacts written to a gitignored directory; the default verification
+    approach is frame-by-frame data inspection (Agent-driven debugging). The mismatch
+    between get_all_solver() and the solver names accepted by set_solver() is a known
+    issue pending a fix. SDF is not yet integrated into the solver - do not test it.
+  - Language conventions: code comments MUST be in English; all public files committed
+    to the repo (docs, OpenSpec artifacts, AGENTS.md, README) MUST be in English.
+  - Portability rule: machine-specific paths, local build outputs, and local test
+    environment details MUST NOT appear in OpenSpec artifacts or committed docs; they
+    MUST be recorded in LOCAL_DEV.md at the repo root (gitignored).
+
+# Per-artifact rules (optional)
+# Add custom rules for specific artifacts.
+# Example:
+#   rules:
+#     proposal:
+#       - Keep proposals under 500 words
+#       - Always include a "Non-goals" section
+#     tasks:
+#       - Break tasks into chunks of max 2 hours
+
+# Per-operation guidance (optional)
+# Add advisory guidance for how apply and archive work should be conducted.
+# This is separate from artifact rules above.
+# Example:
+#   operations:
+#     apply:
+#       guidance:
+#         - Keep test summaries concise
+#     archive:
+#       guidance:
+#         - Summarize the archive outcome before finishing
