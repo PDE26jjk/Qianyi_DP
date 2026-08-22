@@ -84,6 +84,7 @@ static __global__ void compute_dihedral_bending_GN(
     const float* __restrict__ rest_thetas,
     const int3* __restrict__ triangles,
     const int2* __restrict__ edge_opposite_points,
+    const float* __restrict__ bending_factor,
     int num_edges, float kb
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -101,7 +102,7 @@ static __global__ void compute_dihedral_bending_GN(
     get_theta_dpk(vertices[x0_idx], vertices[x1_idx], vertices[x2_idx], vertices[x3_idx],
         theta_dp0, theta_dp1, theta_dp2, theta_dp3, theta);
 
-    float coef = kb;
+    float coef = kb * bending_factor[i];
     if ( Jx_diag != nullptr ) {
         atomicAddMat3(&Jx_diag[x0_idx], Mat3::outer_product(theta_dp0, theta_dp0 * coef));
         atomicAddMat3(&Jx_diag[x1_idx], Mat3::outer_product(theta_dp1, theta_dp1 * coef));
@@ -328,6 +329,7 @@ static __global__ void compute_dihedral_bending_AOGS(
     const float* __restrict__ rest_thetas,
     const int3* __restrict__ triangles,
     const int2* __restrict__ edge_opposite_points,
+    const float* __restrict__ bending_factor,
     int num_edges, float kb
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -351,8 +353,9 @@ static __global__ void compute_dihedral_bending_AOGS(
     // ---- forces: unchanged from the GN kernel ----
     // g = d psi / d theta = theta - rest_theta
     float g = theta - rest_thetas[i];
+    float bending_k = kb * bending_factor[i];
     if ( forces != nullptr ) {
-        float coef = -kb * g;
+        float coef = -bending_k * g;
         atomicAddFloat3(&forces[x0_idx], th_dp0 * coef);
         atomicAddFloat3(&forces[x1_idx], th_dp1 * coef);
         atomicAddFloat3(&forces[x2_idx], th_dp2 * coef);
@@ -396,7 +399,7 @@ static __global__ void compute_dihedral_bending_AOGS(
         float w_n2n1 = p * T21;
         float w_ee = a2 * (T11 + T22);
         return (N11 * w_n1n1 + N22 * w_n2n2 + M11 * w_m1m1 + M22 * w_m2m2 +
-            N12 * w_n1n2 + N21 * w_n2n1 + EE * w_ee) * kb;
+            N12 * w_n1n2 + N21 * w_n2n1 + EE * w_ee) * bending_k;
     };
 
     atomicAddMat3(&Jx_diag[x0_idx], calc_B(0, 0));

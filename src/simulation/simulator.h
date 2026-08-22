@@ -22,6 +22,7 @@ struct ObjectDataInput {
     float thickness; // m
     float friction;
     int collision_layer;
+    float grain_dir; // pattern grain direction
     float3 stretch;
     // float3 shear;
     float3 bending;

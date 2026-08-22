@@ -75,6 +75,7 @@ public:
     thrust::device_vector<int2> edge_opposite_points;
     thrust::device_vector<Mat2> Dms;
     thrust::device_vector<float> areas;
+    thrust::device_vector<float> bending_factor;
     thrust::device_vector<float3> pos_inertia;
     thrust::device_vector<float3> pos_world;
     thrust::device_vector<float3> pos_pred;
@@ -151,6 +152,7 @@ public:
     void init_edge_data();
     void calc_edge_length();
     void init_triangle_data();
+    void precompute_bending_factor();
     void average_mass_by_cloth();
     void init_subspace();
     void precompute_subspace_H(const float* Jx_diag_pd, const float* Jx_nondiag_pd);

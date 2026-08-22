@@ -345,7 +345,7 @@ void SolverPDNewton::step(float h) {
         cudaMemsetAsync(f_elastic, 0, sizeof(float3) * n);
         cudaMemsetAsync(Jx_diag, 0, sizeof(Mat3) * n);
         contact.accumulate_contact_force(f, Jx_diag);
-        truncate_forces_kernel<<<(n + block - 1), block>>>(
+        truncate_forces_kernel<<<(n + block - 1) / block, block>>>(
             f, Jx_diag, static_diags, max_force_scale, n);
 
         step_begin_pd<<<(n + block - 1) / block, block>>>(f, q_inertia, q, mass, h, n);
@@ -379,12 +379,14 @@ void SolverPDNewton::step(float h) {
                 Jx_nondiag, Jx_diag, Jx_bending_cross,
                 f, q, edges, e2t, rest_thetas,
                 tri_edges, eop,
+                geo->bending_factor.data().get(),
                 n, bending_k);
         else if ( geo->bending_model == BendingModel::DiscreteShells_AOGS )
             compute_dihedral_bending_AOGS<<<(n + block - 1), block>>>(
                 Jx_nondiag, Jx_diag, Jx_bending_cross,
                 f, q, edges, e2t, rest_thetas,
                 tri_edges, eop,
+                geo->bending_factor.data().get(),
                 n, bending_k);
 
         n = params.nb_all_cloth_vertices;

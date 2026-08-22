@@ -142,6 +142,7 @@ void Geometry::init(const GeoDataInput& geo) {
         bending_model = BendingModel::DiscreteShells_GN;
         break;
     }
+    precompute_bending_factor();
     if ( bending_model == BendingModel::IBM_quadratic ) {
         // precompute bending
         IBM_q.assign(params.nb_all_cloth_edges, make_float4(0.0f, 0.0f, 0.0f, 0.f));
@@ -169,6 +170,74 @@ void Geometry::init(const GeoDataInput& geo) {
     init_picker();
     init_sewing();
     CUDA_CHECK(cudaDeviceSynchronize());
+}
+
+static __global__ void precompute_dihedral_bending_factor_kernel(
+    float* __restrict__ bending_factor,
+    const float3* __restrict__ pos_2D,
+    const int2* __restrict__ edges,
+    const int2* __restrict__ e2t,
+    const float* __restrict__ edge_lengths,
+    const float* __restrict__ areas,
+    const int* __restrict__ vertices_obj,
+    const ObjectDataInput* __restrict__ obj_data,
+    const int num_edges
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if ( i >= num_edges ) return;
+
+    int2 adjacent_triangles = e2t[i];
+    float area_sum = 0.0f;
+    if ( adjacent_triangles.x >= 0 ) area_sum += areas[adjacent_triangles.x];
+    if ( adjacent_triangles.y >= 0 ) area_sum += areas[adjacent_triangles.y];
+
+    float edge_length = edge_lengths[i];
+    if ( area_sum <= 1e-12f || edge_length <= 1e-12f ) {
+        bending_factor[i] = 1.0f;
+        return;
+    }
+
+    int2 edge = edges[i];
+    int object_index = vertices_obj[edge.x];
+    ObjectDataInput object = obj_data[object_index];
+
+    float3 edge_vector = pos_2D[edge.y] - pos_2D[edge.x];
+    float edge_norm = norm(edge_vector);
+    if ( edge_norm <= 1e-12f ) {
+        bending_factor[i] = 1.0f;
+        return;
+    }
+    edge_vector /= edge_norm;
+
+    float grain_dir = object.grain_dir;
+    float3 grain_axis = make_float3(cosf(grain_dir), sinf(grain_dir), 0.0f);
+    float3 cross_grain_axis = make_float3(-sinf(grain_dir), cosf(grain_dir), 0.0f);
+    float longitude_projection = dot(edge_vector, grain_axis);
+    float latitude_projection = dot(edge_vector, cross_grain_axis);
+
+    float longitude_bending = object.bending.x + object.bending.z;
+    float latitude_bending = object.bending.y + object.bending.z;
+    float anisotropic_scale =
+        longitude_projection * longitude_projection * longitude_bending +
+        latitude_projection * latitude_projection * latitude_bending;
+    float geometric_scale = 3.0f * edge_length * edge_length / area_sum;
+    bending_factor[i] = geometric_scale * anisotropic_scale;
+}
+
+void Geometry::precompute_bending_factor() {
+    bending_factor.resize(params.nb_all_edges);
+    int block = 256;
+    int blocks = (params.nb_all_edges + block - 1) / block;
+    precompute_dihedral_bending_factor_kernel<<<blocks, block>>>(
+        bending_factor.data().get(),
+        pos_2D.data().get(),
+        edges.data().get(),
+        e2t.data().get(),
+        edge_lengths.data().get(),
+        areas.data().get(),
+        vertices_obj.data().get(),
+        obj_data.data().get(),
+        params.nb_all_edges);
 }
 
 // void* Geometry::get_device_temp_memory() {

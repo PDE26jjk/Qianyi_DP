@@ -115,6 +115,8 @@ void SimulatorInterface::input_data(py::dict input) {
             obj_data[i].granularity = mesh["granularity"].cast<float>() * 0.001f; // mm->m
             obj_data[i].friction = mesh["friction"].cast<float>();
             obj_data[i].thickness = mesh["thickness"].cast<float>() * 0.001f;// mm->m
+            obj_data[i].grain_dir = mesh.contains("grain_dir")
+                ? mesh["grain_dir"].cast<float>() : 0.0f;
             obj_data[i].stretch = to_float3(mesh["stretch"].cast<py::array_t<float>>());
             // obj_data[i].shear = to_float3(mesh["shear"].cast<py::array_t<float>>());
             obj_data[i].bending = to_float3(mesh["bending"].cast<py::array_t<float>>());
@@ -122,6 +124,7 @@ void SimulatorInterface::input_data(py::dict input) {
         }
         else {
             obj_data[i].mass_densitys = 1.f;
+            obj_data[i].grain_dir = 0.0f;
             obj_data[i].kinetic = true; // TODO soft body
         }
         obj_data[i].collision_layer = mesh["collision_layer"].cast<int>();

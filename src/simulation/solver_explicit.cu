@@ -195,6 +195,7 @@ void SolverExplicit::step(float h) {
             nullptr, nullptr, nullptr,
             f, q, edges, e2t, rest_thetas,
             tri_edges, eop,
+            geo->bending_factor.data().get(),
             n, 0.2);
     geo->accumulate_sewing_force();
     geo->get_contact().accumulate_contact_force(f, nullptr);
