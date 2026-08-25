@@ -167,7 +167,7 @@ void Simulator::update_local_vertices(int obj_index, const std::vector<float>& v
 }
 
 std::vector<std::string> Simulator::get_all_solver() {
-    return { "Explicit", "PCG", "Chebyshev", "PNCG" };
+    return { "Explicit", "PDNewton", "VBD", "XPBD" };
 }
 
 void Simulator::set_solver(const std::string& string) {

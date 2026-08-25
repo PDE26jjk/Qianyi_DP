@@ -334,7 +334,6 @@ void SolverPCG::solve_impl(float3* dx, const float3* rhs, int max_iters) {
     }
 
     cudaMemcpy(&delta_new_host, d_delta_new_ptr, sizeof(float), cudaMemcpyDeviceToHost);
-    std::cout << "PCG iter = " << iter << ", delta=" << delta_new_host << std::endl;
 
     if ( isnan(delta_new_host) ) {
         print_debug(rhs);

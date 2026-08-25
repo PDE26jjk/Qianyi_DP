@@ -443,5 +443,4 @@ void SolverJacobi::solve(float3* dx, const float3* rhs, int max_iters) {
         // x = x + M^{-1} * r
         jacobi_update_kernel<<<grid, block>>>(x, r_ptr, M_inv_ptr, n);
     }
-    std::cout << "Jacobi iter = " << iter << ", delta=" << r_dot_r << std::endl;
 }

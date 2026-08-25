@@ -225,7 +225,7 @@ void SolverPDNewton::init() {
     geo->init_subspace();
     Jx_diag_pd.assign(params.nb_all_vertices, 0.f);
     // Jx_nondiag_pd.assign(params.nb_all_edges, 0.f);
-    linear->Jx_nondiag_identity.assign(params.nb_all_vertices, 0.f);
+    linear->Jx_nondiag_identity.assign(params.nb_all_edges, 0.f);
     linear->Jx_bend_cross_identity.assign(params.nb_all_edges, 0.f);
     int block = 256;
     int n = params.nb_all_cloth_edges;
