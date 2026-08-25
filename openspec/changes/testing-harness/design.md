@@ -5,10 +5,18 @@ Current repository state: only the `qydp.test` timing benchmarks (sort / BVH / S
 Verified facts (smoke-tested):
 - Blender-equivalent driver: **PDNewton defaults / the canonical parameter block + `update(0.001)`** runs 100 frames fully finite with real cloth motion; the legacy local scene data's arbitrary scaling factors or large dt produce PCG NaN.
 - `update(h)` internally subdivides by `step_h` (default 0.001); the canonical block sets `step_h=0.003`.
-- The Blender frontend never configures solver or parameters (pure defaults); both it and the locally validated canonical parameter block (see `LOCAL_DEV.md`) treat PDNewton as canonical.
+- The frontend is a single runtime: the study notebook (`study02_clean.ipynb` in
+  the frontend repo, run inside Blender via a notebook plugin) applies the canonical
+  PDNewton block via `set_solver`/`set_parameter`, then the addon's
+  `simulation_manager.py` drives `input_data`/`update` on the same `qydp.simulator`
+  singleton; the addon runtime itself does not call `set_parameter` but inherits
+  the notebook-set parameters. Parameter configuration is planned to move into the UI.
 - `sample_points` is grid-based sampling (grid spacing = radius/sqrt(2), acceptance/refinement rules in `src/geometry/sample_points.cu`) - it is NOT Poisson-disc sampling; the test's spacing oracle MUST be derived from that source, not assumed.
 - Scene contract: every triangle edge must appear in `edges`; `granularity` / `thickness` are in mm (converted internally, x0.001); cloth objects must precede obstacles.
-- Known API issue: `get_all_solver()` hardcodes `('Explicit','PCG','Chebyshev','PNCG')`, inconsistent with the names actually accepted by `set_solver()` (`PDNewton` / `XPBD` / `VBD`) (user confirmed pending fix).
+- Known API issue (fixed during implementation): `get_all_solver()` hardcoded
+  `('Explicit','PCG','Chebyshev','PNCG')`, inconsistent with the names actually
+  accepted by `set_solver()` (`PDNewton` / `XPBD` / `VBD` / `Explicit`); the list
+  is now synced (see Confirmed Findings).
 - C-level debug prints are noisy (full Jx matrix dumps, `[Qianyi Error]` per edge, etc.); pybind11's ostream_redirect does not capture C printf.
 
 ## Goals / Non-Goals
@@ -24,7 +32,9 @@ Verified facts (smoke-tested):
 - No changes to `src/` CUDA code (no test-only accessors; separate proposal if needed).
 - Not testing SDF (not yet integrated into the solver), not testing pattern_helper (this phase), not testing VBD / XPBD / Explicit correctness (xfail smoke only).
 - No CI integration yet (local first, but output is CI-ready).
-- Not fixing the `get_all_solver()` inconsistency (user will fix later; the test layer only locks in the check).
+- The `get_all_solver()` inconsistency was not an implementation task of this
+  change (the test layer locks in the check); the enumeration fix landed
+  separately during implementation (commit d8fe410).
 
 ## Decisions
 
@@ -46,7 +56,7 @@ Defaults follow the Blender frontend: `mass=100`, `granularity=20` (mm), `thickn
 
 ### D5. Driver semantics (source of truth = simulation_manager.py)
 
-`input_data({mesh_list, sewings})` -> `set_solver('PDNewton')` -> apply the standard parameter block (28 entries, canonical locally validated values - see `LOCAL_DEV.md`) -> per frame `update(0.001)` x 42 (ceil substeps at 24fps, matching the frontend's `max_update_time_step=0.001`) -> `get_simulation_data()` (local) plus `world_space=True` for traces/rendering. Frames, fps, and dt are configurable; default 60 frames @ 24fps.
+`input_data({mesh_list, sewings})` -> `set_solver('PDNewton')` -> apply the standard parameter block (27 entries, canonical locally validated values - see `LOCAL_DEV.md`) -> per frame `update(0.001)` x 42 (ceil substeps at 24fps, matching the frontend's `max_update_time_step=0.001`) -> `get_simulation_data()` (local) plus `world_space=True` for traces/rendering. Frames, fps, and dt are configurable; default 60 frames @ 24fps.
 
 ### D6. Default artifacts: per-frame data traces (not GIF)
 
@@ -65,7 +75,9 @@ Defaults follow the Blender frontend: `mass=100`, `granularity=20` (mm), `thickn
 ### D9. Experimental solvers and known issues governance
 
 - Solver registry: PDNewton = `standard`; VBD/XPBD/Explicit = `experimental` (smoke tests `xfail(strict=True, reason=...)`; strict ensures that when they become usable the test **fails and prompts manual confirmation**, instead of passing silently).
-- `get_all_solver()` inconsistency: `api/test_api_consistency.py`, `xfail(strict)` with a reason stating the difference and fix direction (sync the hardcoded list in simulator.cu).
+- `get_all_solver()` inconsistency: `api/test_api_consistency.py` locks the
+  check; the enumeration was synced during implementation (commit d8fe410), so
+  the test is now a plain assertion.
 
 ### D10. Output noise control
 
@@ -97,3 +109,25 @@ Additive only, no migration: landing order per tasks.md; rollback = remove `test
 
 - Warp discovers only a CPU device in this environment (driver 13.0 but no GPU listed) - whether this relates to CUDA_PATH/runtime libs is pending a spike; does not block this phase (matplotlib rendering + scipy references).
 - Performance baseline threshold policy (hard thresholds vs trend-only recording) will be decided with data during the bench phase.
+
+## Confirmed Findings During Implementation (2026-08-24)
+
+- **set_solver ordering**: `Simulator::init` (called by `input_data`) creates
+  the solver object from the current solver name, so `set_solver` after
+  `input_data` has no effect on the active solver. The driver now calls
+  `set_solver`/`set_parameters` before `input_data` (matching the frontend
+  notebook usage). The earlier "VBD runs PCG nan" probe was actually PDNewton
+  running with the VBD parameter block (large `step_h`), not VBD itself.
+- **PDNewton determinism (known issue)**: identical PDNewton runs differ by up
+  to ~0.03-0.18 m (already at frame 0), reproduced in fresh subprocesses;
+  `on_exit()` does not restore equality. The determinism test is therefore
+  implemented as specified but marked `xfail(strict=True)` with the fix
+  direction (C++ side: full buffer reset in `Geometry::init` / rule out
+  kernel-level nondeterminism). It will enforce once the C++ side is fixed.
+- **Experimental solvers deferred**: VBD/XPBD/Explicit smoke tests are skipped
+  per maintainer decision (only PDNewton is tested this phase); the strict-xfail
+  governance machinery remains in place for re-enabling later.
+- **PDNewton init out-of-bounds (fixed)**: `Jx_nondiag_identity` was sized by
+  vertex count but written per edge during the spring precompute, causing
+  size-dependent crashes (e.g. a 20x20 grid) or silent memory corruption; the
+  sizing was corrected in a separate commit (d8fe410).

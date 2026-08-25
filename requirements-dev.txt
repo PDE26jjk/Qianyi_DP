@@ -1,0 +1,5 @@
+# Development/test dependencies for Qianyi_DP.
+# Python 3.11 is used for Blender compatibility (see LOCAL_DEV.md).
+# Record ALL future Python dependency changes here - never in OpenSpec artifacts.
+pytest
+

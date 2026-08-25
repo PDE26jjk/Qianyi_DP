@@ -17,11 +17,18 @@ context: |
     get_simulation_data); the standard solver configuration is PDNewton plus the
     canonical PDNewton parameter block (locally validated values; provenance recorded
     in LOCAL_DEV.md).
+  - Frontend runtime note: the study notebook (study02_clean.ipynb in the frontend repo,
+    run inside Blender via a notebook plugin) applies the canonical PDNewton parameter
+    block via set_solver/set_parameter, then the addon's simulation_manager.py drives
+    input_data/update/get_simulation_data on the same qydp.simulator singleton; the addon
+    runtime itself does not call set_parameter. Parameter configuration is planned to
+    move into the UI.
   - Constraints: simulation tests use procedural scenes and must not depend on Blender;
     GIFs are optional artifacts written to a gitignored directory; the default verification
     approach is frame-by-frame data inspection (Agent-driven debugging). The mismatch
-    between get_all_solver() and the solver names accepted by set_solver() is a known
-    issue pending a fix. SDF is not yet integrated into the solver - do not test it.
+    between get_all_solver() and the solver names accepted by set_solver() was fixed
+    in 2026-08-26 (enumeration synced with create_solver()). SDF is not yet integrated
+    into the solver - do not test it.
   - Language conventions: code comments MUST be in English; all public files committed
     to the repo (docs, OpenSpec artifacts, AGENTS.md, README) MUST be in English.
   - Portability rule: machine-specific paths, local build outputs, and local test

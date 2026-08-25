@@ -10,5 +10,13 @@
 
 lbvh参考了 [ppf-contact-solver](https://github.com/st-tech/ppf-contact-solver)
 
+## Portability
+
+Machine-specific paths, local build outputs, and local environment details
+(for example the CMake output location, the Python environment, or the Blender
+frontend checkout) MUST NOT appear in committed docs, tests, or OpenSpec
+artifacts. They are recorded in `LOCAL_DEV.md` at the repository root, which is
+gitignored and never committed.
+
 
 

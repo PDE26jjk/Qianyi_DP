@@ -4,3 +4,23 @@ requires = [
     "wheel",
 ]
 build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+pythonpath = ["tests"]
+testpaths = ["tests"]
+# pytest's default fd capture conflicts on Windows with the harness's
+# fd-level output redirect (FdOutputRedirect); sys-level capture keeps pytest
+# output capture while letting C-level prints flow through the per-case logs.
+# The cache provider is disabled so restricted environments do not litter the
+# repo root with failed cache temp dirs.
+addopts = ["--capture=sys", "-p", "no:cacheprovider"]
+markers = [
+    "sim: simulation correctness/invariant tests",
+    "algo: geometry algorithm correctness tests",
+    "api: public API consistency tests",
+    "bench: performance baseline tests (not part of the default gate)",
+    "visual: GIF/rendering tests (opt-in via --gif)",
+    "slow: slow tests excluded from the default quick group",
+    "quick: standard quick group (sim smoke + algo + api)",
+]

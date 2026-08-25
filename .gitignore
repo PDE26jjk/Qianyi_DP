@@ -81,6 +81,7 @@ Qianyi_DP.egg-info/
 
 !AGENTS.md
 .agents/
+.data/
 
 # Local-only developer notes (machine paths, local env details - never shared)
 LOCAL_DEV.md
