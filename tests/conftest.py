@@ -7,7 +7,9 @@ import os
 import shutil
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 
@@ -30,6 +32,20 @@ FINGERPRINT_HINT = (
     "submodule and a readable `__version__`). It is likely a stale or partial "
     "build; rebuild the module with CMake and retry."
 )
+
+GCD_SETUP_HINT = (
+    "Set QYDP_GCD_ROOT to the GarmentCodeData element directory and "
+    "QYDP_GCD_BODY to the neutral-body OBJ. Concrete machine-specific paths "
+    "are recorded in LOCAL_DEV.md (gitignored)."
+)
+
+
+@dataclass(frozen=True)
+class GcdDataConfig:
+    """Resolved GarmentCodeData paths consumed by data-driven drape tests."""
+
+    root: Path
+    body_obj: Path | None
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
@@ -233,3 +249,43 @@ def qydp():
     if module is None:
         pytest.skip(f"Qianyi_DP module not found. {BUILD_HINT}")
     return module
+
+
+@pytest.fixture(scope="session")
+def qydp_data() -> GcdDataConfig:
+    """Resolve the GarmentCodeData dataset root and neutral-body OBJ.
+
+    Paths come exclusively from the QYDP_GCD_ROOT / QYDP_GCD_BODY environment
+    variables (never from committed files); data tests skip with setup
+    instructions when either configured path is missing.
+    """
+    root = os.environ.get("QYDP_GCD_ROOT")
+    body = os.environ.get("QYDP_GCD_BODY")
+    if not root:
+        pytest.skip(f"QYDP_GCD_ROOT is not set. {GCD_SETUP_HINT}")
+    root_path = Path(root).expanduser()
+    if not root_path.is_dir():
+        pytest.skip(
+            f"QYDP_GCD_ROOT points to a missing directory: {root}\n{GCD_SETUP_HINT}"
+        )
+    body_path: Path | None = None
+    if body:
+        body_path = Path(body).expanduser()
+        if not body_path.is_file():
+            pytest.skip(
+                f"QYDP_GCD_BODY points to a missing file: {body}\n{GCD_SETUP_HINT}"
+            )
+    return GcdDataConfig(root=root_path, body_obj=body_path)
+
+
+@pytest.fixture
+def scratch_dir() -> Path:
+    """Writable per-test scratch directory under the gitignored artifacts."""
+    scratch_root = REPO_ROOT / "tests" / "artifacts" / ".scratch"
+    scratch_root.mkdir(parents=True, exist_ok=True)
+    path = scratch_root / uuid4().hex
+    path.mkdir()
+    try:
+        yield path
+    finally:
+        shutil.rmtree(path, ignore_errors=True)

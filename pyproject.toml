@@ -23,4 +23,6 @@ markers = [
     "visual: GIF/rendering tests (opt-in via --gif)",
     "slow: slow tests excluded from the default quick group",
     "quick: standard quick group (sim smoke + algo + api)",
+    "data: data-driven drape tests backed by the GarmentCodeData dataset",
+    "drape: drape simulation tests (invariants and reference comparison)",
 ]

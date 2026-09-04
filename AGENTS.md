@@ -43,6 +43,9 @@ python -m pytest -m sim
 python -m pytest -m algo
 python -m pytest -m bench
 
+# Data-driven drape tests (GarmentCodeData; see below)
+python -m pytest -m 'data or drape'
+
 # Generate GIF artifacts (opt-in; visual marker)
 python -m pytest -m visual --gif
 
@@ -50,8 +53,36 @@ python -m pytest -m visual --gif
 python -m pytest -m quick --junitxml=tests/artifacts/junit.xml
 ```
 
-Markers: `sim`, `algo`, `api`, `bench`, `visual`, `slow`, `quick`.
+Markers: `sim`, `algo`, `api`, `bench`, `visual`, `slow`, `quick`, `data`,
+`drape`.
 `quick` = simulation smoke + geometry correctness + API consistency.
+
+## Data-driven drape tests (GarmentCodeData)
+
+The `data` / `drape` markers run real-garment regression cases backed by the
+GarmentCodeData dataset:
+
+- The loader (`tests/harness/gcd/`) maps one dataset element (box mesh,
+  segmentation, specification, vertex labels) to the `input_data` contract:
+  one cloth mesh per panel, identity-position sewing pairs along each seam
+  chain (the box mesh is a closed garment), optional neutral-body obstacle,
+  and attachment weights from the semantic labels.
+- The sampler (`tests/harness/gcd/sampler.py`) selects a reproducible,
+  stratified manifest by garment type and face-count bucket (S < 5k,
+  M 5-25k, L 25-50k, XL > 50k; XL excluded by default).
+- The batch runner (`tests/harness/gcd/batch.py`) executes each element in an
+  isolated subprocess with a per-case timeout and writes the standard per-case
+  artifacts plus a failure class: `loader error`, `simulation blow-up`,
+  `reference mismatch`, or `timeout`.
+- The invariant tier checks finite frames, bounding envelope, seam closure,
+  area preservation, and attached-vertex drift; the no-body tier runs with
+  gravity disabled. The reference tier (body configured) records loose
+  geometric metrics against `sim.ply` (record-only until calibrated).
+
+The dataset root and neutral-body OBJ come from `QYDP_GCD_ROOT` /
+`QYDP_GCD_BODY` (machine-specific paths live in `LOCAL_DEV.md` only); data
+tests skip with setup instructions when either is missing. Loader unit tests
+use a synthetic fixture and never require the dataset.
 
 ## Artifact locations
 
@@ -63,6 +94,10 @@ Markers: `sim`, `algo`, `api`, `bench`, `visual`, `slow`, `quick`.
     (frame index, per-frame stats) when a case fails;
   - `sim.log` - C-level output (noise discarded, `Error`/`PCG`/`ERROR` lines
     kept).
+  - `loader_report.json` - GCD loader report (panel count, stitch count,
+    scale/bbox stats, spec mismatch list, added seam edges).
+- Batch runs additionally write `batch_summary.json` next to the case
+  directories (total/passed/failed plus the failure-class breakdown).
 - GIF artifacts: `build/artifacts/visual/` (gitignored), with `gallery.md`.
 
 ## Debugging a failure

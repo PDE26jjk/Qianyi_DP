@@ -51,7 +51,12 @@ class SimDriver:
         frame_time = 1.0 / self.fps
         return max(1, math.ceil(frame_time / self.dt))
 
-    def run(self, input_data: dict, solver: str | None = None) -> SimRun:
+    def run(
+        self,
+        input_data: dict,
+        solver: str | None = None,
+        gravity: float | None = None,
+    ) -> SimRun:
         """Run the configured simulation and return per-frame data."""
         solver = solver or self.solver
         if solver not in SOLVER_REGISTRY:
@@ -64,6 +69,10 @@ class SimDriver:
         # creates the solver object from the solver name at input_data time, so
         # a set_solver call after input_data would keep the previous solver.
         params = apply_preset(sim, solver)
+        if gravity is not None:
+            params = dict(params)
+            params["gravity"] = gravity
+            sim.set_parameter("gravity", float(gravity))
         sim.input_data(input_data)
 
         substeps = self.substeps_per_frame()
