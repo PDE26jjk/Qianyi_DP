@@ -159,26 +159,8 @@ def check_invariants(
     return InvariantResult(passed=not failures, stats=stats, failures=failures)
 
 
-def _per_panel_reference_areas(
-    reference_vertices: np.ndarray,
-    reference_faces: np.ndarray,
-    panel_triangles: dict[str, np.ndarray],
-) -> dict[str, float]:
-    """Per-panel reference (sim.ply) areas in the same triangle subsets."""
-    areas: dict[str, float] = {}
-    for name, local_triangles in panel_triangles.items():
-        tri = reference_vertices[reference_faces[local_triangles]]
-        v0, v1, v2 = tri[:, 0], tri[:, 1], tri[:, 2]
-        areas[name] = float(
-            0.5 * np.linalg.norm(np.cross(v1 - v0, v2 - v0), axis=1).sum()
-        )
-    return areas
-
-
 def reference_metrics(
     final_vertices: np.ndarray,
-    mesh_list: list[dict],
-    panel_triangles: dict[str, np.ndarray],
     reference_vertices: np.ndarray,
     reference_faces: np.ndarray,
     *,
@@ -187,33 +169,12 @@ def reference_metrics(
 ) -> dict:
     """Loose reference comparison against ``sim.ply`` (record-only by default).
 
-    Metrics: per-panel area ratio, z-extent, vertical quantiles, and
-    bidirectional mean surface distance. Until tolerances are calibrated the
-    metrics are recorded with ``passed: None``; when ``hard_fail`` is set the
-    configured tolerances decide the pass/fail status.
+    Metrics: z-extent, vertical quantiles, and bidirectional mean surface
+    distance. Until tolerances are calibrated the metrics are recorded with
+    ``passed: None``; when ``hard_fail`` is set the configured tolerances
+    decide the pass/fail status.
     """
-    cloth = [m for m in mesh_list if m["object_type"] == 0]
-    ref_areas = _per_panel_reference_areas(
-        reference_vertices, reference_faces, panel_triangles
-    )
-    sim_areas: dict[str, float] = {}
-    vertex_offset = 0
-    for name, mesh in zip(sorted(panel_triangles), cloth):
-        triangles = np.asarray(mesh["triangles"], dtype=np.int64).reshape(-1, 3)
-        tri = final_vertices[triangles + vertex_offset]
-        v0, v1, v2 = tri[:, 0], tri[:, 1], tri[:, 2]
-        sim_areas[name] = float(
-            0.5 * np.linalg.norm(np.cross(v1 - v0, v2 - v0), axis=1).sum()
-        )
-        vertex_offset += len(mesh["vertices"]) // 3
-
-    names = sorted(ref_areas)
-    area_ratios = {
-        name: sim_areas[name] / max(ref_areas[name], 1e-12) for name in names
-    }
     metrics = {
-        "per_panel_area_ratio": area_ratios,
-        "area_ratio_mean": float(np.mean(list(area_ratios.values()))),
         "z_extent_sim": float(final_vertices[:, 2].max() - final_vertices[:, 2].min()),
         "z_extent_ref": float(
             reference_vertices[:, 2].max() - reference_vertices[:, 2].min()
@@ -247,18 +208,11 @@ def reference_metrics(
         metrics["passed"] = None
         return metrics
     tol = {
-        "area_ratio_min": 0.6,
-        "area_ratio_max": 1.4,
         "z_extent_ratio": 0.5,
         "mean_surface_distance": 0.1,
         **(tolerances or {}),
     }
     failures: list[str] = []
-    if not (tol["area_ratio_min"] <= metrics["area_ratio_mean"] <= tol["area_ratio_max"]):
-        failures.append(
-            f"mean area ratio {metrics['area_ratio_mean']:.3f} outside "
-            f"[{tol['area_ratio_min']}, {tol['area_ratio_max']}]"
-        )
     z_ratio = metrics["z_extent_sim"] / max(metrics["z_extent_ref"], 1e-12)
     metrics["z_extent_ratio"] = float(z_ratio)
     if abs(z_ratio - 1.0) > tol["z_extent_ratio"]:

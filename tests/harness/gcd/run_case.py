@@ -155,8 +155,6 @@ def run_case(
     ):
         metrics = reference_metrics(
             run.local_frames[-1],
-            element.input_data["mesh_list"],
-            element.panel_triangle_assignment,
             element.reference_vertices,
             element.reference_faces,
             hard_fail=hard_fail,

@@ -32,7 +32,7 @@ from __future__ import annotations
 import hashlib
 import json
 import pickle
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -389,7 +389,6 @@ class LoadedElement:
     report: dict
     reference_vertices: np.ndarray | None = None
     reference_faces: np.ndarray | None = None
-    panel_triangle_assignment: dict[str, np.ndarray] = field(default_factory=dict)
 
 
 # Bump this whenever the loader's geometry/restore/fit algorithm changes: the
