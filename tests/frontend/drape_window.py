@@ -266,12 +266,12 @@ def render_scene(renderer, scene: scenes.SceneData, local: np.ndarray, failed: b
         points = np.ascontiguousarray(to_render(points))
         if name in renderer._instances:
             renderer.update_shape_instance(name, color1=color)
-            write_panel_vertices(renderer, name, points, panel.render_triangles)
+            write_panel_vertices(renderer, name, points, panel.triangles)
         else:
             renderer.render_mesh(
                 name=name,
                 points=points,
-                indices=panel.render_triangles.reshape(-1),
+                indices=panel.triangles.reshape(-1),
                 colors=tuple(color),
             )
 

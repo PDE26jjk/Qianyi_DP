@@ -34,9 +34,7 @@ def test_cloth_grid_builds_valid_input_data():
     assert scene.seams == []
     assert scene.obstacle is None
     panel = scene.panels[0]
-    # No sewings -> the display topology is the full topology.
-    assert len(panel.render_triangles) == len(panel.triangles)
-    assert not panel.seam_mask.any()
+    assert len(panel.triangles) > 0
     # Camera hint points at the cloth.
     front = np.asarray(scene.camera_front)
     center = scene.cloth_vertices.mean(axis=0)
@@ -74,11 +72,6 @@ def test_gcd_scene_loads_raw_panel_topology():
     assert scene.seams, "sewing chains must be registered for rendering"
     assert scene.diagonal > 0.0
 
-    for panel in scene.panels:
-        # Raw seam copies are real panel topology and remain renderable.
-        assert len(panel.render_triangles) == len(panel.triangles)
-
     for chain in scene.seams:
         panel = scene.panels[chain.panel_index]
         assert chain.vertex_ids.max() < len(panel.vertices)
-        assert panel.seam_mask[chain.vertex_ids].all()
