@@ -59,7 +59,7 @@ static __global__ void compute_stitch_constraint(
             //     atomicAddMat3(&Jx[idx], -K);
             // }
             // zero spring_length
-            Mat3 K = Mat3::identity() * (-k);
+            Mat3 K = Mat3::identity(k);
 
             if ( Jx_diag ) {
                 atomicAddMat3(&Jx_diag[p0_i], K);

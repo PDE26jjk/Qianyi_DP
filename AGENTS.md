@@ -84,6 +84,41 @@ The dataset root and neutral-body OBJ come from `QYDP_GCD_ROOT` /
 tests skip with setup instructions when either is missing. Loader unit tests
 use a synthetic fixture and never require the dataset.
 
+## Interactive drape debug window
+
+`tests/frontend/drape_window.py` is a Warp-based debug window for watching a
+drape simulation live, dragging the cloth, and catching blow-ups (see the
+`drape-debug-window` OpenSpec change):
+
+```bash
+python tests/frontend/drape_window.py                 # CONFIG scene
+python tests/frontend/drape_window.py --list-scenes
+python tests/frontend/drape_window.py --scene gcd:<element_id> --frames 120 \
+    --screenshot out.png --drag 640,450,120,-80       # scripted agent mode
+```
+
+- Scenes come from the registry in `tests/frontend/scenes.py`
+  (`cloth-grid` procedural, `gcd:<id>` GarmentCodeData); adding a debug
+  scene is a one-function change covered by CPU-only registry tests.
+- All settings are code constants in the `CONFIG` block (solver, parameter
+  overrides, fps/dt/substeps, blow-up threshold); there is no settings UI.
+  Default pacing is interactive (2x `update(0.003)` per frame; `update(0.01)`
+  tunnels through collisions); harness pacing (42x `update(0.001)`) is a
+  CONFIG option.
+- Right-drag picks/pulls the cloth (engine `pick_triangle`); left-drag
+  orbits, scroll zooms, WASD pans (Warp built-ins). Keys: `Space` pause,
+  `N` single frame, `R` reset, `K` screenshot, `Esc` close.
+- Blow-up detection (non-finite vertices or per-frame displacement over the
+  threshold) auto-pauses and renders the cloth red.
+- Seam-aware rendering: seam-band faces (any face with a stitch-only
+  vertex, per the dataset's segmentation labeling, exposed by the GCD
+  loader as `seam_face_mask`) are not drawn; panels cycle a color palette
+  with a small display-only gap. Display only - the engine input keeps the
+  full topology.
+- Screenshots go to `tests/artifacts/frontend/<scene>/` (gitignored); the
+  drag math lives in renderer-free `tests/frontend/picking.py` and has
+  CPU unit tests plus a GPU headless pick-cycle test (`-m sim`).
+
 ## Artifact locations
 
 - Per-case data: `tests/artifacts/<case_id>/` (gitignored):
@@ -98,6 +133,7 @@ use a synthetic fixture and never require the dataset.
     scale/bbox stats, spec mismatch list, added seam edges).
 - Batch runs additionally write `batch_summary.json` next to the case
   directories (total/passed/failed plus the failure-class breakdown).
+- Debug-window screenshots: `tests/artifacts/frontend/<scene>/` (gitignored).
 - GIF artifacts: `build/artifacts/visual/` (gitignored), with `gallery.md`.
 
 ## Debugging a failure

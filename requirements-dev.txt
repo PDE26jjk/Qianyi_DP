@@ -3,3 +3,6 @@
 # Record ALL future Python dependency changes here - never in OpenSpec artifacts.
 pytest
 trimesh
+pyyaml
+# Interactive drape debug window (tests/frontend/); requires a CUDA runtime.
+warp-lang

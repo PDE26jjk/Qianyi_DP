@@ -71,7 +71,7 @@ void Geometry::init_sewing() {
                 edge1_idx = abs(edge1_idx);
                 auto tris1 = e2t[edge1_idx];
                 auto eop1 = edge_opposite_points[edge1_idx];
-                // Edge vertices could be in reverse order.
+                // Pattern boundary vertices could be in reverse order.
                 if ( tris1.x == -1 || tris1.y == -1 ) {
                     sewing_e2t[sewing_e_idx].x = tris1.x != -1 ? tris1.x : tris1.y;
                     sewing_edge_opposite_points[sewing_e_idx].x = eop1.x != -1 ? eop1.x : eop1.y;
@@ -364,14 +364,14 @@ void Geometry::check_sewing(bool forced_connect) {
     need_update_inv_mass = true;
     sewing_done = false;
 }
-void Geometry::accumulate_sewing_force() {
+void Geometry::accumulate_sewing_force(Mat3* Jx_diag, Mat3* Jx_nondiag) {
     if ( !sewing_done ) {
         float min_dist = 2e-3f;
         int block = 256;
         int n = params.nb_all_stitches;
         float sewing_k = max(0.f, get_global_parameter("sewing_k",2e3));
         compute_stitch_constraint<<<(n + block - 1) / block, block>>>(
-            nullptr, nullptr, elastic_forces.data().get(),
+            Jx_diag, Jx_nondiag, elastic_forces.data().get(),
             nullptr,
             pos_world.data().get(), vertices_obj.data().get(), obj_data.data().get(),
             vertices_mask.data().get(), stitches.data().get(), min_dist, sewing_k, n);

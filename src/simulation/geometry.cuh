@@ -191,7 +191,7 @@ public:
     void check_picker();
 
     void check_sewing(bool forced_connect = false);
-    void accumulate_sewing_force();
+    void accumulate_sewing_force(Mat3* Jx_diag, Mat3* Jx_nondiag);
 
     void update_pin(float3* q);
 

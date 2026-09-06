@@ -356,7 +356,7 @@ void SolverPDNewton::step(float h) {
         //     Jx_nondiag, Jx_nondiag_pd, n);
         // cudaMemsetAsync(Jx_bend_cross, 0, sizeof(Mat3) * n);
         // compute_constraint();
-        // geo->accumulate_sewing_force();
+        geo->accumulate_sewing_force(Jx_diag, Jx_nondiag);
         if ( geo->constitutive_model == ConstitutiveModel::SpringMass ) {
             accumulate_spring_forces<<<(n + block - 1) / block, block>>>(
                 Jx_nondiag, Jx_diag, f_elastic, nullptr, q, edges,
