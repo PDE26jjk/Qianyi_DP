@@ -112,8 +112,8 @@ class PickController:
     """Drives the engine's triangle pick constraint from world-space rays.
 
     The controller tests the FULL panel topology (including seam-bridging
-    faces the display omits) and maps hits to (mesh_index, triangle_index)
-    in ``input_data`` coordinates. ``panels`` are ``PanelRender`` objects.
+    faces) and maps hits to (mesh_index, triangle_index) in ``input_data``
+    coordinates. ``panels`` are ``PanelRender`` objects.
     """
 
     def __init__(self, simulator, panels) -> None:
@@ -129,8 +129,29 @@ class PickController:
         # global cloth vertex ids).
         self.last_pick: tuple[int, int, np.ndarray] | None = None
 
-    def press(self, origin: np.ndarray, direction: np.ndarray) -> bool:
-        """Pick the closest cloth triangle under the ray, if any."""
+    def press(
+            self,
+            origin: np.ndarray,
+            direction: np.ndarray,
+            positions: np.ndarray | None = None,
+    ) -> bool:
+        """Pick the closest cloth triangle under the ray, if any.
+
+        The ray is tested against the cloth's *current* positions: when
+        ``positions`` is omitted the controller reads them from the engine
+        (``get_simulation_data``), so picking works after the cloth has moved.
+        ``positions`` is the concatenated cloth vertex buffer in panel order.
+        """
+        if positions is None:
+            positions = np.asarray(
+                self._simulator.get_simulation_data(), dtype=np.float32
+            )
+        self._triangles = [
+            positions[
+                panel.vertex_offset: panel.vertex_offset + len(panel.vertices)
+            ][panel.triangles].astype(np.float64)
+            for panel in self._panels
+        ]
         best: tuple[float, int, int] | None = None  # (t, panel, triangle)
         for panel_index, tris in enumerate(self._triangles):
             hit = ray_triangle_hit(origin, direction, tris)
