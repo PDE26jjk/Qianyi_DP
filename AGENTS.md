@@ -29,6 +29,9 @@ Quick group (the standard single command):
 python -m pytest -m quick
 ```
 
+Writing or adding tests requires the user's explicit approval first. Do not add
+tests speculatively or as a by-product of an implementation change.
+
 Other useful invocations:
 
 ```bash
@@ -63,10 +66,14 @@ The `data` / `drape` markers run real-garment regression cases backed by the
 GarmentCodeData dataset:
 
 - The loader (`tests/harness/gcd/`) maps one dataset element (box mesh,
-  segmentation, specification, vertex labels) to the `input_data` contract:
-  one cloth mesh per panel, identity-position sewing pairs along each seam
-  chain (the box mesh is a closed garment), optional neutral-body obstacle,
-  and attachment weights from the semantic labels.
+  segmentation, specification) to the `input_data` contract: one cloth mesh
+  per panel, identity-position sewing pairs along each seam chain, and an
+  optional neutral-body obstacle. Panels come from the box mesh's UV islands
+  (the dataset stores each panel as a separate connected component, with
+  UV-duplicated seam vertices). Normal vertices keep their box-mesh positions;
+  seam vertices are re-projected onto each panel's plane via the non-seam
+  (u,v)->3D affine, so no seam triangle is dropped and no panel vertex is
+  moved. Attachment semantics are not used (`attached_vertices` are all zero).
 - The sampler (`tests/harness/gcd/sampler.py`) selects a reproducible,
   stratified manifest by garment type and face-count bucket (S < 5k,
   M 5-25k, L 25-50k, XL > 50k; XL excluded by default).
@@ -81,8 +88,9 @@ GarmentCodeData dataset:
 
 The dataset root and neutral-body OBJ come from `QYDP_GCD_ROOT` /
 `QYDP_GCD_BODY` (machine-specific paths live in `LOCAL_DEV.md` only); data
-tests skip with setup instructions when either is missing. Loader unit tests
-use a synthetic fixture and never require the dataset.
+tests skip with setup instructions when either is missing. The loader has no
+synthetic unit tests - an element that cannot be loaded (for example a mesh
+without UV coordinates) simply raises.
 
 ## Interactive drape debug window
 
@@ -110,11 +118,9 @@ python tests/frontend/drape_window.py --scene gcd:<element_id> --frames 120 \
   `N` single frame, `R` reset, `K` screenshot, `Esc` close.
 - Blow-up detection (non-finite vertices or per-frame displacement over the
   threshold) auto-pauses and renders the cloth red.
-- Seam-aware rendering: seam-band faces (any face with a stitch-only
-  vertex, per the dataset's segmentation labeling, exposed by the GCD
-  loader as `seam_face_mask`) are not drawn; panels cycle a color palette
-  with a small display-only gap. Display only - the engine input keeps the
-  full topology.
+- Seam-aware rendering (display only): panels cycle a color palette and the
+  sewing chains are drawn as thin lines. Seam-band faces are not culled at
+  render time; the engine input keeps the full topology.
 - Screenshots go to `tests/artifacts/frontend/<scene>/` (gitignored); the
   drag math lives in renderer-free `tests/frontend/picking.py` and has
   CPU unit tests plus a GPU headless pick-cycle test (`-m sim`).
@@ -129,8 +135,8 @@ python tests/frontend/drape_window.py --scene gcd:<element_id> --frames 120 \
     (frame index, per-frame stats) when a case fails;
   - `sim.log` - C-level output (noise discarded, `Error`/`PCG`/`ERROR` lines
     kept).
-  - `loader_report.json` - GCD loader report (panel count, stitch count,
-    scale/bbox stats, spec mismatch list, added seam edges).
+  - `loader_report.json` - GCD loader report (panel count, sewing-entries
+    count, garment bbox/bounds, body stats).
 - Batch runs additionally write `batch_summary.json` next to the case
   directories (total/passed/failed plus the failure-class breakdown).
 - Debug-window screenshots: `tests/artifacts/frontend/<scene>/` (gitignored).

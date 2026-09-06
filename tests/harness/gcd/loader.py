@@ -1,10 +1,17 @@
 """GarmentCodeData element loader.
 
 Maps one dataset element (box mesh, per-vertex segmentation, specification
-JSON, semantic vertex labels, and optionally a neutral body OBJ) to the
-Qianyi_DP ``input_data`` contract: one cloth mesh per panel, vertex-pair
-sewings derived from stitch labels, attachment weights from semantic labels,
-and (when configured) a body obstacle mesh.
+JSON, and optionally a neutral body OBJ) to the Qianyi_DP ``input_data``
+contract: one cloth mesh per panel, vertex-pair sewings derived from the
+stitch labels, and (when configured) a body obstacle mesh.
+
+The box mesh is a closed garment whose connected components are the panels:
+trimesh UV-duplicates the seam vertices, which splits the raw mesh into one
+island per panel. Each panel's UV island is used to split the garment and to
+name the panel. Normal vertices keep their box-mesh positions; seam vertices
+are re-projected onto each panel's plane with the non-seam (u,v)->3D affine,
+so no seam triangle is dropped and no panel vertex is moved. Attachment
+semantics are not used (``attached_vertices`` are all zero).
 
 Dataset facts verified against the local GarmentCodeData download (recorded in
 LOCAL_DEV.md, gitignored):
@@ -14,22 +21,22 @@ LOCAL_DEV.md, gitignored):
   scanning for consecutive duplicates (the PLY header has no ``v_id_map``
   property).
 - ``sim_segmentation.txt`` has one label per *original* vertex; labels are
-  comma-separated (a vertex may belong to several seams at a junction).
+  comma-separated. Stitch vertices are tagged ``stitch_N``; non-stitch
+  vertices carry a panel name.
 - ``specification.json`` lists panel-edge stitches; the mesh seam labels
-  ``stitch_N`` map by index to that list and are cross-checked against it.
+  ``stitch_N`` map by index to that list.
 """
 
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 import pickle
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
 import trimesh
-import yaml
 
 from ..meshspec import validate_mesh_list
 from .errors import (
@@ -292,201 +299,6 @@ def _split_panels_by_uv_islands(
 
     return panels, sewings
 
-def _pattern_edge_points(panel_info: dict, edge_index: int) -> np.ndarray:
-    """Return one specification edge in engine coordinates, in edge order."""
-    pattern_vertices = np.asarray(panel_info["vertices"], dtype=np.float64)
-    edge = panel_info["edges"][edge_index]
-    endpoints = pattern_vertices[np.asarray(edge["endpoints"], dtype=np.int64)]
-    angles = np.deg2rad(
-        np.asarray(panel_info.get("rotation", [0.0, 0.0, 0.0]), dtype=np.float64)
-    )
-    sx, sy, sz = np.sin(angles)
-    cx, cy, cz = np.cos(angles)
-    rotation = np.asarray(
-        [
-            [cz * cy, cz * sy * sx - sz * cx, cz * sy * cx + sz * sx],
-            [sz * cy, sz * sy * sx + cz * cx, sz * sy * cx - cz * sx],
-            [-sy, cy * sx, cy * cx],
-        ]
-    )
-    translation = np.asarray(
-        panel_info.get("translation", [0.0, 0.0, 0.0]), dtype=np.float64
-    )
-    points = np.column_stack([endpoints, np.zeros(len(endpoints))])
-    return np.ascontiguousarray(
-        ((points @ rotation.T) + translation) @ _YUP_TO_ZUP.T * CM_TO_M,
-        dtype=np.float32,
-    )
-
-
-def _order_seam_path_by_uv(
-        path: list[int],
-        panels: dict[str, PanelMesh],
-        stitch_entry: list[dict],
-) -> list[int]:
-    """Order a collapsed seam by the raw UV island, not merged IDs."""
-    if not stitch_entry:
-        return path
-    # A stitch vertex can be absent from the *first* side panel (it may live
-    # in another seam side or a third panel at a junction). Take the UV from
-    # whichever seam-side panel actually contains the vertex, and never drop a
-    # vertex from the chain -- dropping it silently removes it from the
-    # restore step and leaves it at its raw, UV-expanded position.
-    side_names: list[str] = []
-    for entry in stitch_entry:
-        if isinstance(entry, dict) and "panel" in entry:
-            name = str(entry["panel"])
-            if name in panels and name not in side_names:
-                side_names.append(name)
-    if not side_names:
-        return path
-    samples: list[np.ndarray] = []
-    usable: list[int] = []
-    tail: list[int] = []
-    for original_id in path:
-        found = False
-        for panel_name in side_names:
-            panel = panels[panel_name]
-            candidates = panel.local_indices_by_original.get(int(original_id), [])
-            if candidates:
-                samples.append(panel.uv[candidates[0]])
-                usable.append(int(original_id))
-                found = True
-                break
-        if not found:
-            # No UV in any seam-side panel: keep the vertex at the end of the
-            # chain so it is still restored, instead of silently removing it.
-            tail.append(int(original_id))
-    if len(samples) < 3:
-        return path
-    points = np.asarray(samples, dtype=np.float64)
-    _, _, vh = np.linalg.svd(points - points.mean(axis=0), full_matrices=False)
-    projection = (points - points.mean(axis=0)) @ vh[0]
-    return [value for _, value in sorted(zip(projection, usable))] + tail
-
-
-def _restore_seam_vertices(
-        panels: dict[str, PanelMesh],
-        seam_paths: dict[str, list[int]],
-        specification: dict,
-) -> None:
-    """Restore only seam vertices from specification edge geometry.
-
-    All non-seam raw PLY positions remain untouched. The averaged box mesh has
-    no separate 3D seam positions, so each labeled chain is placed on its
-    specification edge while preserving its ordered panel topology.
-    """
-    pattern_panels = specification.get("pattern", {}).get("panels", {})
-    stitch_entries = specification.get("pattern", {}).get("stitches", [])
-    proposals: dict[int, dict[int, list[np.ndarray]]] = {}
-    seam_vertices_by_panel: dict[int, set[int]] = {}
-    seam_links_by_panel: dict[int, set[tuple[int, int]]] = {}
-    panel_planes: dict[int, tuple[np.ndarray, np.ndarray]] = {}
-    for panel in panels.values():
-        seam_ids = {
-            local
-            for path in seam_paths.values()
-            for original_id in path
-            for local in panel.local_indices_by_original.get(int(original_id), [])
-        }
-        non_seam = np.asarray(
-            [point for local, point in enumerate(panel.vertices) if local not in seam_ids],
-            dtype=np.float64,
-        )
-        if len(non_seam) >= 3:
-            plane_point = non_seam.mean(axis=0).astype(np.float32)
-            _, _, vh = np.linalg.svd(non_seam - plane_point, full_matrices=False)
-            panel_planes[id(panel)] = (plane_point, vh[-1].astype(np.float32))
-    for name, path in seam_paths.items():
-        index = int(name.split("_")[1])
-        if index >= len(stitch_entries) or len(path) < 2:
-            continue
-        sides = stitch_entries[index]
-        side_data: list[tuple[PanelMesh, list[int], np.ndarray]] = []
-        for side in sides:
-            panel_name = str(side.get("panel", ""))
-            if panel_name not in panels or "edge" not in side:
-                continue
-            panel_info = pattern_panels.get(panel_name, {})
-            if not panel_info.get("vertices") or not panel_info.get("edges"):
-                continue
-            panel = panels[panel_name]
-            local_indices: list[int] = []
-            for original_id in path:
-                candidates = panel.local_indices_by_original.get(int(original_id), [])
-                if len(sides) > 1 and len({str(x.get("panel")) for x in sides}) == 1:
-                    side_index = len(side_data)
-                    local_indices.append(
-                        candidates[side_index] if len(candidates) > side_index else -1
-                    )
-                else:
-                    local_indices.append(candidates[0] if candidates else -1)
-            edge_index = int(side["edge"])
-            if edge_index >= len(panel_info["edges"]):
-                continue
-            edge_points = _pattern_edge_points(panel_info=panel_info, edge_index=edge_index)
-            side_data.append((panel, local_indices, edge_points))
-        if not side_data:
-            continue
-        valid_points = [
-            panel.vertices[local]
-            for panel, local_indices, _ in side_data
-            for local in local_indices
-            if local >= 0
-        ]
-        if not valid_points:
-            continue
-        raw_center = np.mean(np.asarray(valid_points, dtype=np.float32), axis=0)
-        pattern_centers = np.asarray(
-            [0.5 * (edge[0] + edge[1]) for _, _, edge in side_data],
-            dtype=np.float32,
-        )
-        pattern_center = pattern_centers.mean(axis=0)
-        for panel, local_indices, edge_points in side_data:
-            # Translate each recovered side as a rigid chain. This preserves
-            # every raw seam-chain edge length and avoids arbitrary reordering
-            # or resampling along the specification edge.
-            # Use the specification edge midpoint to separate this seam side,
-            # then remove its panel-normal component below so the result stays
-            # in the existing panel plane.
-            offset = 0.5 * (edge_points[0] + edge_points[1]) - pattern_center
-            panel_id = id(panel)
-            plane_point, normal = panel_planes.get(
-                panel_id,
-                (panel.vertices.mean(axis=0), np.asarray([0.0, 0.0, 1.0], dtype=np.float32)),
-            )
-            offset = offset - normal * np.dot(offset, normal)
-            for local in local_indices:
-                if local >= 0:
-                    proposals.setdefault(panel_id, {}).setdefault(local, []).append(offset)
-                    seam_vertices_by_panel.setdefault(panel_id, set()).add(local)
-            panel_id = id(panel)
-            valid_local_indices = [local for local in local_indices if local >= 0]
-            for first, second in zip(valid_local_indices[:-1], valid_local_indices[1:]):
-                seam_links_by_panel.setdefault(panel_id, set()).add(
-                    tuple(sorted((first, second)))
-                )
-
-    # Apply each vertex's seam-side proposal independently. In particular, the
-    # two sides of a same-panel dart must not be merged into one component:
-    # averaging their offsets collapses the dart back to zero length.
-    for panel in panels.values():
-        panel_id = id(panel)
-        vertices = seam_vertices_by_panel.get(panel_id, set())
-        if not vertices:
-            continue
-        plane_point, normal = panel_planes.get(
-            panel_id,
-            (panel.vertices.mean(axis=0), np.asarray([0.0, 0.0, 1.0], dtype=np.float32)),
-        )
-        for local in vertices:
-            displacement = proposals[panel_id][local][0]
-            point = panel.vertices[local]
-            point = point - normal * np.dot(point - plane_point, normal)
-            panel.vertices[local] = point + displacement
-
-
-
 
 def _compute_face_normals(vertices: np.ndarray, triangles: np.ndarray) -> np.ndarray:
     """Per-face normals for an obstacle mesh (object_type=1)."""
@@ -669,7 +481,6 @@ def _load_element_impl(
     element_id = element_dir.name
 
     mesh = trimesh.load(str(files["boxmesh"]), process=False)
-    # return mesh
     vertices_cm = np.asarray(mesh.vertices, dtype=np.float64)
     faces = np.asarray(mesh.faces, dtype=np.int32)
     uv = getattr(mesh.visual, "uv", None)

@@ -42,12 +42,12 @@
   zero frame counter), Esc (close with guarded `renderer.close()`),
   consuming the owned keys before Warp's built-in bindings; verify each key
   behaves as specified in a manual run
-- [x] 3.4 Implement seam-aware rendering (design D10): filter
-  seam-band faces (any face with a stitch-only vertex, exposed by the
-  loader as per-panel seam_face_mask per the dataset's segmentation
-  labeling) out of the render meshes and draw no sewing-line overlays
-  (maintainer decision); verify on a GarmentCodeData element that panel
-  boundaries appear as gaps and hoods (vertical panels) still render
+- [x] 3.4 Implement seam-aware rendering (design D10): cycle a color palette
+  per panel and draw the sewing chains as thin lines (recomputed every frame
+  from the loader's sewing entries); render the full panel topology so the
+  engine input and picking keep every triangle; verify on a GarmentCodeData
+  element that seam chains are visible as moving lines and panels are
+  distinguishable by color
 
 ## 4. Cloth picking
 

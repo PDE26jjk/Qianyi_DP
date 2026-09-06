@@ -155,24 +155,23 @@ without creating a window — and asserts the observable effect on the cloth.
 
 ### Requirement: Seam-aware panel rendering
 
-For multi-panel scenes with sewings, the window SHALL render cloth surfaces
-without seam-bridging triangles (triangles whose vertices all lie on sewing
-chains), while the simulation input keeps them. The window SHALL NOT draw
-sewing-line overlays: panel boundaries appear as gaps between the separated
-panel surfaces (maintainer decision; static seam overlays would sit frozen
-inside the moving garment).
+For multi-panel scenes with sewings, the window SHALL render the full cloth
+topology (seam-bridging triangles are kept and drawn as fabric), draw the
+sewing chains as thin lines so seam boundaries stay visible, and cycle a
+color palette per panel. This is display-only - the engine input keeps the
+full topology.
 
-#### Scenario: Bridging faces are not drawn as cloth
+#### Scenario: Sewing chains are drawn on moving cloth
 
 - **WHEN** a multi-panel scene is displayed
-- **THEN** the rendered cloth excludes seam-bridging triangles, leaving a
-  visible gap along panel boundaries instead of a rendered seam strip
+- **THEN** the seam-chain lines are recomputed every frame from the current
+  panel vertices and follow the moving panels
 
-#### Scenario: No sewing-line overlay
+#### Scenario: Full topology stays in the engine
 
-- **WHEN** a multi-panel scene with sewings is displayed and the cloth moves
-- **THEN** no sewing-chain lines are drawn and nothing stays frozen at the
-  initial positions
+- **WHEN** a multi-panel scene is displayed
+- **THEN** the rendered cloth uses the full panel topology, and the engine
+  `input_data` and picking keep the same (unculled) triangles
 
 ### Requirement: Code-only configuration
 

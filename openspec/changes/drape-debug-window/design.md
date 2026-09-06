@@ -192,27 +192,18 @@ scripted mode in D8 and the manual pass.
 
 ### D10. Seam-aware panel rendering (display only)
 
-The dataset's box mesh contains seam bands (mesh strips connecting the
-panels, ~3.8k of 57k faces on the probe element) whose vertices carry the
-ADJACENT panels' labels, so rendering full panel triangle lists draws them
-as panel fabric. Ground truth comes from the dataset's own labeling
-(GarmentCodeData docs, `sim_segmentation.txt`: per-vertex panel labels with
-stitch vertices labeled separately):
+The box mesh's panels are split by UV islands and stay as separate render
+meshes with their full topology. The window:
 
-- A face is a SEAM face iff at least one of its vertices carries no panel
-  label (stitch-only). Verified on the probe element: exactly the
-  PSS/PPS/SSS label-composition faces (3775); the all-panel PPP faces are
-  panel fabric — including panels placed vertically in the box (hoods), so
-  orientation is NOT a criterion (an earlier normal-direction threshold
-  misclassified hoods and partial bands and was removed).
-- The loader (`tests/harness/gcd/loader.py`) exposes the per-panel
-  `seam_face_mask` (it already parsed the labels for panel assignment); the
-  window drops those faces from RENDERING only - `input_data`, the engine
-  meshes, and picking keep the full topology.
-- No sewing-line overlay: Warp's line rendering does not update geometry
-  for repeated names (frozen lines); maintainer prefers no overlay. Panels
-  additionally get a small display-only radial offset (`_SEAM_GAP_M`) and
-  cycle a color palette so boundaries stay obvious.
+- Renders each panel's full triangles in a distinct color (cyclic palette),
+  so seam boundaries are distinguishable by color alone; seam-bridging faces
+  are kept and drawn.
+- Builds the seam-chain geometry from the loader's `input_data["sewings"]`
+  (panel-local stitch index pairs) and draws the chains as thin lines,
+  recomputed every frame from the current panel vertices so they follow the
+  moving cloth.
+- Keeps everything display-only: `input_data`, the engine meshes, and picking
+  use the full (unculled) topology.
 
 ## Risks / Trade-offs
 
