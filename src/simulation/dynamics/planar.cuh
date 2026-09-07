@@ -3,6 +3,8 @@
 #include "common/atomic_utils.cuh"
 
 constexpr float base_spring_stiffness = 4e2; // empirical global stiffness factor
+constexpr float base_fem_stiffness = base_spring_stiffness * 3.4641f; // 2*3^0.5, Approximation of an equilateral triangle
+
 
 // T. Liu, A. W. Bargteil, J. F. O’Brien, and L. Kavan, "Fast simulation of mass-spring systems," ACM Trans. Graph., vol. 32, no. 6, p. 214:1-214:7, Nov. 2013, doi: 10.1145/2508363.2508406.
 static __global__ void pd_precompute_spring_forces(
@@ -17,7 +19,7 @@ static __global__ void pd_precompute_spring_forces(
           i += blockDim.x * gridDim.x ) {
         auto [v0,v1] = edges[i];
         float3 ks = obj_data[vertices_obj[v0]].stretch;
-        
+
         float k = base_spring_stiffness * (ks.x + ks.y + ks.z) * 0.333f;
         float weight = k;
         atomicAdd(&Jx_diag_scalar[v0], weight);
@@ -130,10 +132,10 @@ static __global__ void accumulate_spring_forces(
         if ( energys ) {
             atomicAdd(&energys[v0], energy);
         }
-        if (Jx_diag) {
+        if ( Jx_diag ) {
             atomicAddMat3(&Jx_diag[v0], K);
             atomicAddMat3(&Jx_diag[v1], K);
-            if (Jx_nondiag) {
+            if ( Jx_nondiag ) {
                 atomicAddMat3(&Jx_nondiag[i], -K);
             }
         }
@@ -150,9 +152,9 @@ static __global__ void compute_BW_FEM(
     const float3* __restrict__ vertices,
     const int3* __restrict__ triangle_edges,
     const int2* __restrict__ edges,
-    const int* __restrict__ vertices_obj,
-    const float* __restrict__ YoungsModulus,
     const Mat2* __restrict__ Dms,
+    const ObjectDataInput* __restrict__ obj_data,
+    const int* __restrict__ vertices_obj,
     int num_triangles
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -179,6 +181,12 @@ static __global__ void compute_BW_FEM(
     float3 e1 = vertices[v1_idx] - v0;
     float3 e2 = vertices[v2_idx] - v0;
 
+    // stiffnesses from object data (stretch.x = u, .y = v, .z = shear)
+    const float3 stretch = obj_data[vertices_obj[v0_idx]].stretch * base_fem_stiffness;
+    const float ku = stretch.x;
+    const float kv = stretch.y;
+    const float ks = stretch.z;
+
     float wudp1 = Dm_inv.r[0].x; // Dm_inv[0, 0]
     float wvdp1 = Dm_inv.r[0].y; // Dm_inv[0, 1]
     float wudp2 = Dm_inv.r[1].x; // Dm_inv[1, 0]
@@ -187,35 +195,43 @@ static __global__ void compute_BW_FEM(
     float3 wv = e1 * wvdp1 + e2 * wvdp2;
     float wu_norm = norm(wu);
     float wv_norm = norm(wv);
-    float3 wu_ = wu_norm > 1e-6f ? wu * (1.0f / wu_norm) : make_float3(0.0f, 0.0f, 0.0f);
-    float3 wv_ = wv_norm > 1e-6f ? wv * (1.0f / wv_norm) : make_float3(0.0f, 0.0f, 0.0f);
+    float3 wu_ = wu_norm > 1e-12f ? wu * (1.0f / wu_norm) : make_float3(0.0f, 0.0f, 0.0f);
+    float3 wv_ = wv_norm > 1e-12f ? wv * (1.0f / wv_norm) : make_float3(0.0f, 0.0f, 0.0f);
 
+    // Constraint violations
     float Cu = wu_norm - 1.0f;
     float Cv = wv_norm - 1.0f;
+
+    // Gradients w.r.t. material coordinates
     float3 Cudp1 = wu_ * wudp1;
     float3 Cvdp1 = wv_ * wvdp1;
     float3 Cudp2 = wu_ * wudp2;
     float3 Cvdp2 = wv_ * wvdp2;
 
-    float k = 1.38e3f;
-
-    //  Projector Matrices
+    // ---- forces (negative gradient of energy) ----
+    // energy = 0.5 * area * (ku * Cu^2 + kv * Cv^2 + ks * Cs^2)
+    // => f = -area * (ku * Cu * dCu/dp + kv * Cv * dCv/dp + ks * Cs * dCs/dp)
+    float3 f1 = -area * (ku * Cu * Cudp1 + kv * Cv * Cvdp1);
+    float3 f2 = -area * (ku * Cu * Cudp2 + kv * Cv * Cvdp2);
+    
+    // ---- Hessian blocks ----
     Mat3 I = Mat3::identity();
-    Mat3 wu_proj_mat = (I - Mat3::outer_product(wu_, wu_)) * (wu_norm > 1e-6f ? 1.0f / wu_norm : 0.0f);
-    Mat3 wv_proj_mat = (I - Mat3::outer_product(wv_, wv_)) * (wv_norm > 1e-6f ? 1.0f / wv_norm : 0.0f);
-    float3 f1 = -area * (Cu * Cudp1 + Cv * Cvdp1) * k;
-    float3 f2 = -area * (Cu * Cudp2 + Cv * Cvdp2) * k;
+    Mat3 wu_proj_mat = (I - Mat3::outer_product(wu_, wu_)) * (wu_norm > 1e-12f ? 1.0f / wu_norm : 0.0f);
+    Mat3 wv_proj_mat = (I - Mat3::outer_product(wv_, wv_)) * (wv_norm > 1e-12f ? 1.0f / wv_norm : 0.0f);
 
-    float coef = -area * k;
+    float coef = area;
+    // Hessian of stretch energy (w.r.t. material coords)
+    // d²E / d p1² = area * [ ku * (Cudp1 Cudp1ᵀ + Cu * wu_proj * wudp1²) +
+    //                          kv * (Cvdp1 Cvdp1ᵀ + Cv * wv_proj * wvdp1²) ]
+    // (similarly for p2 and cross term)
+    Mat3 f1d1 = (Mat3::outer_product(Cudp1, Cudp1 * ku) + Mat3::outer_product(Cvdp1, Cvdp1 * kv) +
+        wu_proj_mat * (Cu * wudp1 * wudp1 * ku) + wv_proj_mat * (Cv * wvdp1 * wvdp1 * kv)) * coef;
 
-    Mat3 f1d1 = (Mat3::outer_product(Cudp1, Cudp1) + Mat3::outer_product(Cvdp1, Cvdp1) +
-        wu_proj_mat * (Cu * wudp1 * wudp1) + wv_proj_mat * (Cv * wvdp1 * wvdp1)) * coef;
+    Mat3 f2d2 = (Mat3::outer_product(Cudp2, Cudp2 * ku) + Mat3::outer_product(Cvdp2, Cvdp2 * kv) +
+        wu_proj_mat * (Cu * wudp2 * wudp2 * ku) + wv_proj_mat * (Cv * wvdp2 * wvdp2 * kv)) * coef;
 
-    Mat3 f2d2 = (Mat3::outer_product(Cudp2, Cudp2) + Mat3::outer_product(Cvdp2, Cvdp2) +
-        wu_proj_mat * (Cu * wudp2 * wudp2) + wv_proj_mat * (Cv * wvdp2 * wvdp2)) * coef;
-
-    Mat3 f1d2 = (Mat3::outer_product(Cudp1, Cudp2) + Mat3::outer_product(Cvdp1, Cvdp2) +
-        wu_proj_mat * (Cu * wudp1 * wudp2) + wv_proj_mat * (Cv * wvdp1 * wvdp2)) * coef;
+    Mat3 f1d2 = (Mat3::outer_product(Cudp1, Cudp2 * ku) + Mat3::outer_product(Cvdp1, Cvdp2 * kv) +
+        wu_proj_mat * (Cu * wudp1 * wudp2 * ku) + wv_proj_mat * (Cv * wvdp1 * wvdp2 * kv)) * coef;
     if ( Jx_diag ) {
         atomicAddMat3(&Jx_diag[v1_idx], f1d1);
         atomicAddMat3(&Jx_diag[v2_idx], f2d2);
@@ -245,8 +261,7 @@ static __global__ void compute_BW_FEM(
     float3 wv_proj_ = (wv_ - wu_ * wu_dot_wv) * (wu_norm > 1e-6f ? 1.0f / wu_norm : 0.0f);
     float3 wu_proj_ = (wu_ - wv_ * wu_dot_wv) * (wv_norm > 1e-6f ? 1.0f / wv_norm : 0.0f);
 
-    float k_shear = k;
-    float shear_coef = -area * k_shear * Cshear;
+    float shear_coef = -area * ks * Cshear;
 
     float3 f1_s = (wv_proj_ * wudp1 + wu_proj_ * wvdp1) * shear_coef;
     float3 f2_s = (wv_proj_ * wudp2 + wu_proj_ * wvdp2) * shear_coef;
@@ -255,19 +270,19 @@ static __global__ void compute_BW_FEM(
     atomicAddFloat3(&forces[v1_idx], f1 + f1_s);
     atomicAddFloat3(&forces[v2_idx], f2 + f2_s);
     if ( enerys ) {
-        atomicAdd(&enerys[v0_idx], 0.5f * area * (k * (Cu * Cu + Cv * Cv) + k * wu_dot_wv * wu_dot_wv));
+        float energy = 0.5f * area * (ku * Cu * Cu + kv * Cv * Cv + ks * Cshear * Cshear);
+        atomicAdd(&enerys[v0_idx], energy);
     }
     #if 0 // Hessian of shear, only SPD part.
     float3 dCs_dx1 = wv_proj_ * wudp1 + wu_proj_ * wvdp1;
     float3 dCs_dx2 = wv_proj_ * wudp2 + wu_proj_ * wvdp2;
 
-    float s_coef = -area * k_shear; // 注意：Hessian = -coef, 此处 coef 对应 Jx
+    float s_coef = -area * ks; 
 
     Mat3 f1d1_s = Mat3::outer_product(dCs_dx1, dCs_dx1) * s_coef;
     Mat3 f2d2_s = Mat3::outer_product(dCs_dx2, dCs_dx2) * s_coef;
     Mat3 f1d2_s = Mat3::outer_product(dCs_dx1, dCs_dx2) * s_coef;
 
-    // --- 累加到 Jx ---
     if (Jx_diag) {
         atomicAddMat3(&Jx_diag[v1_idx], f1d1_s);
         atomicAddMat3(&Jx_diag[v2_idx], f2d2_s);

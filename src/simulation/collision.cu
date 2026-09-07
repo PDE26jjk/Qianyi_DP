@@ -16,23 +16,6 @@
 #include "cuda_tools/cub_tools.cuh"
 
 
-void Contact::compute_edge_ranks() {
-    const int n = geo->edge_lengths.size();
-
-    thrust::device_vector<int> indices(n);
-    thrust::sequence(thrust::cuda::par_nosync, indices.begin(), indices.end());
-    thrust::device_vector<float> lengths_copy = geo->edge_lengths;
-
-    thrust::sort_by_key(thrust::cuda::par_nosync,
-        lengths_copy.begin(), lengths_copy.end(),
-        indices.begin());
-    thrust::device_vector<int> ranks(n);
-    thrust::sequence(thrust::cuda::par_nosync, ranks.begin(), ranks.end());
-    thrust::scatter(thrust::cuda::par_nosync,
-        ranks.begin(), ranks.end(),
-        indices.begin(),
-        edge_sorted_rank.begin());
-}
 void Contact::init() {
     auto& params = geo->params;
     // point_hash_table_size = max(67, next_prime((uint32_t)params.nb_all_cloth_vertices));
@@ -90,6 +73,11 @@ void Contact::init() {
     lbvh3d::initialize(max(params.nb_all_triangles, params.nb_all_edges));
     // rebuild_bvh();
     do_collision_detect_broad_phase_before_step = true;
+    int h_debug_e_id = (int)geo->get_global_parameter("debug_e_id", -1);
+    int h_debug_v_id = (int)geo->get_global_parameter("debug_v_id", -1);
+    cudaMemcpyToSymbol((const void*)&debug_e_id, &h_debug_e_id, sizeof(int));
+    cudaMemcpyToSymbol((const void*)&debug_v_id, &h_debug_v_id, sizeof(int));
+
 }
 // static __device__ __forceinline__ float3 tri_normal(const float3& x0, const float3& x1, const float3& x2) {
 //     return normalized(cross(x1 - x0, x2 - x0));
@@ -163,11 +151,6 @@ void Contact::collision_detect_prepare() {
         // broad phase
         collision_detect_broad_phase(geo->pos_world.data().get(), geo->inertial_offset.data().get(), point_radius, true);
     }
-    int h_debug_e_id = (int)geo->get_global_parameter("debug_e_id", -1);
-    int h_debug_v_id = (int)geo->get_global_parameter("debug_v_id", -1);
-    cudaMemcpyToSymbol((const void*)&debug_e_id, &h_debug_e_id, sizeof(int));
-    cudaMemcpyToSymbol((const void*)&debug_v_id, &h_debug_v_id, sizeof(int));
-
 }
 
 __global__ void refit_face_offset_bvh_kernel(
@@ -237,17 +220,30 @@ __global__ void compute_rank_kernel(const unsigned int* indices_sorted, unsigned
         rank[indices_sorted[i]] = i;
     }
 }
+
+void Contact::compute_edge_ranks() {
+    const int n = geo->edge_lengths.size();
+
+    thrust::device_vector<int> indices(n);
+    thrust::sequence(thrust::cuda::par_nosync, indices.begin(), indices.end());
+    thrust::device_vector<float> lengths_copy = geo->edge_lengths;
+
+    thrust::sort_by_key(thrust::cuda::par_nosync,
+        lengths_copy.begin(), lengths_copy.end(),
+        indices.begin());
+    thrust::device_vector<int> ranks(n);
+    thrust::sequence(thrust::cuda::par_nosync, ranks.begin(), ranks.end());
+    thrust::scatter(thrust::cuda::par_nosync,
+        ranks.begin(), ranks.end(),
+        indices.begin(),
+        edge_sorted_rank.begin());
+}
+
 void Contact::rebuild_bvh() {
     lbvh3d::build_face_bvh_wo_refit(geo->pos_world, geo->triangle_indices, tri_bvh);
     lbvh3d::build_edge_bvh_wo_refit(geo->pos_world, geo->edges, edge_bvh);
     cudaMemcpyAsync(edge_sorted_indices.data().get(), lbvh3d::get_sorted_indices(),
         sizeof(unsigned int) * edge_sorted_indices.size(), cudaMemcpyDeviceToDevice);
-    // int block = 256;
-    // int n = geo->params.nb_all_edges;
-    // compute_rank_kernel<<<(n + block - 1) / block,block>>>(
-    //     edge_sorted_indices.data().get(), edge_sorted_rank.data().get(),
-    //     n
-    //     );
     compute_edge_ranks(); // sorted by length
     lbvh3d::compute_and_sort_by_morton_codes(geo->pos_world.data().get(),
         geo->pos_world.size(), point_sorted_indices.data().get());

@@ -301,7 +301,7 @@ void Geometry::init_edge_data() {
         dir_edges.data().get(), edge_lookup.data().get());
 
     calc_edge_length();
-    rest_thetas.assign(num_edges,0.f); // TODO
+    rest_thetas.assign(num_edges, 0.f); // TODO
 }
 
 static __device__ int get_opposite_point(const int2& edge, const int3& tri, const int2* edges) {
@@ -491,17 +491,23 @@ void Geometry::init_triangle_data() {
                 float3 e1 = x1 - x0;
                 float3 e2 = x2 - x0;
 
-                float3 normal = normalized(cross(e1, e2));
-                float3 u_dir = normalized(e1);
-                float3 v_dir = cross(normal, u_dir);
+                // Object-specific grain direction (radians) from object data
+                float grain_dir = obj_data[vertices_obj[v0]].grain_dir;
+                float3 grain_axis = make_float3(cosf(grain_dir), sinf(grain_dir), 0.0f);
+                float3 cross_grain_axis = make_float3(-sinf(grain_dir), cosf(grain_dir), 0.0f);
+
+                // Project edge vectors onto the grain-aligned local material frame
+                float e1_u = dot(e1, grain_axis);
+                float e1_v = dot(e1, cross_grain_axis);
+                float e2_u = dot(e2, grain_axis);
+                float e2_v = dot(e2, cross_grain_axis);
 
                 // Fill Dm matrix: columns are [e1_uv, e2_uv]
-                // Dm = [ l1,  e2.dot(u) ]
-                //      [ 0,   e2.dot(v) ]
-                Dms[i].r[0].x = norm(e1);
-                Dms[i].r[0].y = dot(e2, u_dir);
-                Dms[i].r[1].x = 0.0f;
-                Dms[i].r[1].y = dot(e2, v_dir);
+                Dms[i].r[0].x = e1_u;
+                Dms[i].r[1].x = e1_v;
+                Dms[i].r[0].y = e2_u;
+                Dms[i].r[1].y = e2_v;
+
                 float area = 0.5f * fabsf(Dms[i].det());
                 // atomicAdd(&areas[vertices_obj[edge1.x]], area);
                 float mass_per_v = area * obj_data[vertices_obj[v0]].mass_densitys / 3.f;
@@ -535,6 +541,7 @@ void Geometry::init_triangle_data() {
         average_mass_by_cloth();
 
 }
+
 float Geometry::get_global_parameter(const std::string& key, float default_value) const {
     return simulator->get_parameter(key, default_value);
 }

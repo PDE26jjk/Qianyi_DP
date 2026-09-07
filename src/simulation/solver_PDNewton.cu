@@ -242,7 +242,8 @@ void SolverPDNewton::init() {
         subspace_solver = new SolverSubspace(simulator);
     }
     subspace_solver->init(geo->basis_size, 0, false);
-
+    auto& contact = geo->get_contact();
+    contact.do_collision_detect_broad_phase_before_step = false;
 }
 
 static __global__ void truncate_forces_kernel(
@@ -361,11 +362,18 @@ void SolverPDNewton::step(float h) {
             accumulate_spring_forces<<<(n + block - 1) / block, block>>>(
                 Jx_nondiag, Jx_diag, f_elastic, nullptr, q, edges,
                 geo->edge_lengths.data().get(),
-                geo->obj_data.data().get(), geo->vertices_obj.data().get(),
+                obj_data, vertices_obj,
                 n);
         }
-        else if ( geo->constitutive_model == ConstitutiveModel::FEM_BW ) {}
-        
+        else if ( geo->constitutive_model == ConstitutiveModel::FEM_BW ) {
+            n = params.nb_all_cloth_triangles;
+            compute_BW_FEM<<<(n + block - 1) / block, block>>>(
+                Jx_nondiag, Jx_diag, f_elastic, nullptr, q, tri_edges,
+                edges,geo->Dms.data().get(),
+                obj_data, vertices_obj,
+                n);
+        }
+
         n = params.nb_all_cloth_edges;
         if ( geo->bending_model == BendingModel::IBM_quadratic )
             compute_quadratic_bending_IBM<<< (n + block - 1) / block, block>>>(

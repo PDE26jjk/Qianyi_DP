@@ -183,7 +183,7 @@ __global__ void xpbd_solve_triangle_fem_kernel(
     const Mat2 Dm_inv = Dm.inverse();
 
     // stiffnesses from object data (stretch.x = u, .y = v, .z = shear)
-    const float3 stretch = obj_data[vertices_obj[v0]].stretch * 1.38e3f;
+    const float3 stretch = obj_data[vertices_obj[v0]].stretch * base_fem_stiffness;
     const float ku = stretch.x;
     const float kv = stretch.y;
     const float ks = stretch.z;

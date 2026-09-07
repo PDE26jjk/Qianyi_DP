@@ -91,7 +91,6 @@ void Simulator::update(float h) {
     m_geo->collision_detect();
 
     m_solver->begin_frame();
-    // auto& edge_lookup = m_geo->edge_lookup;
 
     float dt_rest = h;
     float step_h = max(1e-20f, get_parameter("step_h", 0.001f));

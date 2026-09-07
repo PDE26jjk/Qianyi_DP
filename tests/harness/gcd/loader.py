@@ -53,7 +53,6 @@ CM_TO_M = 0.01
 # fabric parameters in this phase (design D9).
 FABRIC_DEFAULTS: dict = {
     "mass": 100.0,
-    "granularity": 20.0,
     "thickness": 0.1,
     "friction": 0.03,
     "stretch": (1.0, 1.0, 1.0),
@@ -334,7 +333,7 @@ def load_body_mesh(
         "triangles": triangles.reshape(-1),
         "world_matrix": _IDENTITY_WORLD_MATRIX.copy(),
         "object_type": 1,
-        "collision_layer": 0,
+        "collision_layer": -10,
         "normals": normals.reshape(-1),
         "mass": 1.0,
     }
@@ -507,6 +506,9 @@ def _load_element_impl(
 
     mesh_list: list[dict] = []
     for panel in panels:
+        edge_vecs = panel.vertices_2d[panel.edges[:, 0], :2] - panel.vertices_2d[panel.edges[:, 1], :2]
+        edge_lengths = np.linalg.norm(edge_vecs, axis=1)
+        granularity = float(np.mean(edge_lengths) * 1000.0)
         mesh_list.append(
             {
                 "vertices": panel.vertices_2d.reshape(-1),
@@ -518,7 +520,7 @@ def _load_element_impl(
                 "collision_layer": FABRIC_DEFAULTS["collision_layer"],
                 "grain_dir": FABRIC_DEFAULTS["grain_dir"],
                 "mass": FABRIC_DEFAULTS["mass"],
-                "granularity": FABRIC_DEFAULTS["granularity"],
+                "granularity": granularity,
                 "thickness": FABRIC_DEFAULTS["thickness"],
                 "friction": FABRIC_DEFAULTS["friction"],
                 "stretch": np.asarray(FABRIC_DEFAULTS["stretch"], dtype=np.float32),

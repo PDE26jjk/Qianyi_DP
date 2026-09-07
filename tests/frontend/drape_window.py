@@ -108,11 +108,14 @@ class SimState:
         self.failure_text: str | None = None
 
 
-def init_sim(simulator, scene: scenes.SceneData) -> SimState:
+def init_sim(simulator, scene: scenes.SceneData, sim_params_overlay=None) -> SimState:
     """apply_preset -> overrides -> input_data (order matters, see driver)."""
     apply_preset(simulator, CONFIG["solver"])
     for key, value in CONFIG["param_overrides"].items():
         simulator.set_parameter(key, float(value))
+
+    if sim_params_overlay:
+        simulator.set_parameters(sim_params_overlay)
     simulator.input_data(scene.input_data)
     return SimState()
 
@@ -322,10 +325,11 @@ def screenshot_path(scene_name: str, frame: int) -> Path:
 # Interactive loop
 # ---------------------------------------------------------------------------
 
-def run_interactive(renderer, simulator, scene: scenes.SceneData) -> None:
+def run_interactive(renderer, simulator, scene: scenes.SceneData,
+                    sim_params_overlay: dict[str, float] = None) -> None:
     import pyglet  # noqa: PLC0415
 
-    holder = {"state": init_sim(simulator, scene)}
+    holder = {"state": init_sim(simulator, scene, sim_params_overlay)}
     controller = picking.PickController(simulator, scene.panels)
     single_step = {"pending": False}
     exit_requested = {"flag": False}
@@ -354,7 +358,7 @@ def run_interactive(renderer, simulator, scene: scenes.SceneData) -> None:
             single_step["pending"] = True
         elif symbol == pyglet.window.key.R:
             controller.release()
-            holder["state"] = init_sim(simulator, scene)
+            holder["state"] = init_sim(simulator, scene, sim_params_overlay)
             print("reset to initial state")
         elif symbol == pyglet.window.key.K:
             state = holder["state"]
@@ -442,12 +446,12 @@ def run_interactive(renderer, simulator, scene: scenes.SceneData) -> None:
 # ---------------------------------------------------------------------------
 
 def run_scripted(
-    renderer,
-    simulator,
-    scene: scenes.SceneData,
-    frames: int,
-    drag: tuple[float, float, float, float] | None,
-    screenshot: Path,
+        renderer,
+        simulator,
+        scene: scenes.SceneData,
+        frames: int,
+        drag: tuple[float, float, float, float] | None,
+        screenshot: Path,
 ) -> None:
     state = init_sim(simulator, scene)
     controller = picking.PickController(simulator, scene.panels)

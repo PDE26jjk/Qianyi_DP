@@ -89,3 +89,5 @@ LOCAL_DEV.md
 # Test artifacts (generated, gitignored by design)
 build/artifacts/
 tests/artifacts/
+
+study*.ipynb

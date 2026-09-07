@@ -27,7 +27,7 @@ struct ObjectDataInput {
     // float3 shear;
     float3 bending;
     float mass_densitys; // mass density per object, kg/m^2
-    bool kinetic; // The solver does not update its position
+    bool kinetic; // The solver does not update its position, todo set mass for it
     bool vertices_updated;
     bool matrix_updated;
     Mat4 new_matrix;
