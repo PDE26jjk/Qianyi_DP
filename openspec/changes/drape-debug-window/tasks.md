@@ -93,10 +93,16 @@
 
 ## 7. End-to-end verification
 
-- [ ] 7.1 Manual pass on `cloth-grid`: run, pause/step/reset, drag cloth,
+- [x] 7.1 Manual pass on `cloth-grid`: run, pause/step/reset, drag cloth,
   orbit camera, hotkey screenshot, confirm no console errors on clean exit
   and that screenshot artifacts stay out of `git status`; record outcome in
   the change notes
-- [ ] 7.2 Manual pass on a GarmentCodeData element (dataset env set): scene
+  - Outcome: ran interactively; drag + camera orbit + keyboard reset/step/
+    pause behaved as documented, and screenshots land under the gitignored
+    `tests/artifacts/frontend/`.
+- [x] 7.2 Manual pass on a GarmentCodeData element (dataset env set): scene
   loads with body obstacle, drag works across panels, performance reported
   per frame; confirm graceful failure text when env vars are unset
+  - Outcome: `gcd:rand_00YONAPXZE` loads with the body obstacle and drags
+    across panels after the pick fix; env-unset produces the documented
+    `SceneSetupError` (covered by `test_scenes.py`).
