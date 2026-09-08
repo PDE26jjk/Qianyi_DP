@@ -129,7 +129,9 @@ def run_case(
         params["gravity"] = gravity
         sim.set_parameter("gravity", float(gravity))
 
-    driver = SimDriver(qydp, fps=fps, frames=frames, dt=0.001)
+    # dt is the per-frame time step; the engine subdivides it internally by
+    # step_h (set via set_parameter), so one update(dt) is one frame.
+    driver = SimDriver(qydp, fps=fps, frames=frames, dt=1.0 / fps)
     wall_start = time.perf_counter()
     run = driver.run(element.input_data, gravity=gravity)
     wall_time = time.perf_counter() - wall_start
@@ -160,11 +162,10 @@ def run_case(
             hard_fail=hard_fail,
         )
 
-    substeps = frames * driver.substeps_per_frame()
     perf = {
         "wall_time_s": float(wall_time),
-        "substeps": int(substeps),
-        "per_substep_s": float(wall_time / max(substeps, 1)),
+        "frames": int(frames),
+        "per_frame_s": float(wall_time / max(frames, 1)),
         "faces": int(element.report["faces"]),
         "size_bucket": (
             "S" if element.report["faces"] < 5000

@@ -2,13 +2,13 @@
 
 Driver semantics follow the Blender frontend (``simulation_manager.py``):
 ``input_data`` -> ``set_solver`` -> apply the solver parameter block -> for
-each frame run ``ceil(frame_time / dt)`` substeps of ``update(dt)`` and
-collect local- and world-space vertex data per frame.
+each frame call ``update(dt)`` once and collect local- and world-space vertex
+data. The engine subdivides each ``update(dt)`` internally using ``step_h``
+(set via ``set_parameter``); the driver does not loop substeps externally.
 """
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 
 import numpy as np
@@ -30,7 +30,11 @@ class SimRun:
 
 
 class SimDriver:
-    """Drive a Qianyi_DP simulation with Blender-equivalent semantics."""
+    """Drive a Qianyi_DP simulation with Blender-equivalent semantics.
+
+    ``dt`` is the per-frame time step passed to ``update(dt)`` once per frame;
+    ``fps`` is informational (frame_time = 1/fps) and does not drive stepping.
+    """
 
     def __init__(
         self,
@@ -45,11 +49,6 @@ class SimDriver:
         self.fps = fps
         self.frames = frames
         self.dt = dt
-
-    def substeps_per_frame(self) -> int:
-        """Substeps per frame: ceil(frame_time / dt), minimum 1."""
-        frame_time = 1.0 / self.fps
-        return max(1, math.ceil(frame_time / self.dt))
 
     def run(
         self,
@@ -75,15 +74,13 @@ class SimDriver:
             sim.set_parameter("gravity", float(gravity))
         sim.input_data(input_data)
 
-        substeps = self.substeps_per_frame()
         local_frames: list[np.ndarray] = []
         world_frames: list[np.ndarray] = []
         timestamps: list[float] = []
         elapsed = 0.0
         for _ in range(self.frames):
-            for _ in range(substeps):
-                sim.update(self.dt)
-                elapsed += self.dt
+            sim.update(self.dt)
+            elapsed += self.dt
             local_frames.append(np.array(sim.get_simulation_data(), copy=True))
             world_frames.append(np.array(sim.get_simulation_data(world_space=True), copy=True))
             timestamps.append(elapsed)

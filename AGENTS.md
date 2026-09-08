@@ -109,10 +109,10 @@ python tests/frontend/drape_window.py --scene gcd:<element_id> --frames 120 \
   (`cloth-grid` procedural, `gcd:<id>` GarmentCodeData); adding a debug
   scene is a one-function change covered by CPU-only registry tests.
 - All settings are code constants in the `CONFIG` block (solver, parameter
-  overrides, fps/dt/substeps, blow-up threshold); there is no settings UI.
-  Default pacing is interactive (2x `update(0.003)` per frame; `update(0.01)`
-  tunnels through collisions); harness pacing (42x `update(0.001)`) is a
-  CONFIG option.
+  overrides, dt, blow-up threshold); there is no settings UI. The window calls
+  `update(CONFIG['dt'])` once per frame; the engine subdivides each call
+  internally by `step_h` (set in the solver preset). A large `dt` (for example
+  `update(0.01)`) can tunnel through collisions.
 - Right-drag picks/pulls the cloth (engine `pick_triangle`); left-drag
   orbits, scroll zooms, WASD pans (Warp built-ins). Keys: `Space` pause,
   `N` single frame, `R` reset, `K` screenshot, `Esc` close.

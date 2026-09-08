@@ -21,7 +21,7 @@ pytestmark = pytest.mark.sim
 
 FRAMES = 60
 FPS = 24
-DT = 0.001
+DT = 1.0 / FPS
 PINNED_INDICES = (0, 9, 90, 99)
 MIN_FREE_DISP_M = 0.05
 PINNED_DRIFT_TOL_M = 1e-3

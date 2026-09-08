@@ -38,7 +38,7 @@ pytestmark = [
 CASE_ID = "sim/determinism"
 FRAMES = 20
 FPS = 24
-DT = 0.001
+DT = 1.0 / FPS
 PINNED_INDICES = (0, 9, 90, 99)
 SUBPROCESS_SCRIPT = Path(__file__).with_name("determinism_subprocess.py")
 

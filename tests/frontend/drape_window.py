@@ -25,7 +25,6 @@ relaunch. Controls (owned keys are consumed before Warp's built-ins):
 from __future__ import annotations
 
 import argparse
-import math
 import sys
 import time
 from pathlib import Path
@@ -51,15 +50,7 @@ CONFIG = {
     # applied on top of the preset before input_data.
     "solver": "PDNewton",
     "param_overrides": {},
-    # Drive semantics: interactive pacing by default (2 x update(0.003) per
-    # rendered frame - dt=0.01 tunnels through the thin collision layer and
-    # the garment drops off the body instantly; 0.003 is the canonical
-    # step_h and keeps the garment stable). For harness-equivalent runs set
-    # dt=0.001 and substeps=None (42 substeps/frame, matches the batch
-    # tests exactly, far slower than real time on large garments).
-    "fps": 24,
-    "dt": 0.003,
-    "substeps": 2,  # None -> harness semantics ceil((1/fps)/dt)
+    "dt": 0.03,
     # Blow-up detection (design D6): auto-pause when any vertex is
     # non-finite or moves further than this in one rendered frame.
     "blowup_displacement_m": 0.5,
@@ -88,13 +79,6 @@ CONFIG = {
 SCREENSHOT_DIR = REPO_ROOT / "tests" / "artifacts" / "frontend"
 
 
-def substeps_per_frame() -> int:
-    frame_time = 1.0 / CONFIG["fps"]
-    if CONFIG["substeps"] is not None:
-        return max(1, int(CONFIG["substeps"]))
-    return max(1, math.ceil(frame_time / CONFIG["dt"]))
-
-
 # ---------------------------------------------------------------------------
 # Simulation helpers
 # ---------------------------------------------------------------------------
@@ -121,8 +105,7 @@ def init_sim(simulator, scene: scenes.SceneData, sim_params_overlay=None) -> Sim
 
 
 def advance_frame(simulator, state: SimState) -> None:
-    for _ in range(substeps_per_frame()):
-        simulator.update(CONFIG["dt"])
+    simulator.update(CONFIG["dt"])
     state.frame += 1
 
 
@@ -496,7 +479,7 @@ def run_scripted(
 
     controller.release()
     elapsed = time.perf_counter() - start
-    sim_seconds = state.frame * substeps_per_frame() * CONFIG["dt"]
+    sim_seconds = state.frame * CONFIG["dt"]
     print(
         f"scripted run: {state.frame} frames in {elapsed:.1f}s "
         f"({state.frame / max(elapsed, 1e-9):.1f} fps effective), "
@@ -559,8 +542,7 @@ def main(argv=None) -> int:
 
     print(
         f"Qianyi_DP {getattr(qydp, '__version__', 'dev')} | scene {scene.name} | "
-        f"solver {CONFIG['solver']} | {substeps_per_frame()} substeps/frame at "
-        f"dt={CONFIG['dt']}"
+        f"solver {CONFIG['solver']} | dt={CONFIG['dt']}"
     )
     renderer = make_renderer(scene)
     simulator = qydp.simulator

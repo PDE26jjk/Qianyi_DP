@@ -23,7 +23,7 @@ from harness.traces import compute_frame_stats, write_frames_npz, write_traces_j
 
 FRAMES = 20
 FPS = 24
-DT = 0.001
+DT = 1.0 / FPS
 PINNED_INDICES = (0, 9, 90, 99)
 
 
@@ -52,4 +52,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-
