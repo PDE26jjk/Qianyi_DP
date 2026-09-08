@@ -253,6 +253,48 @@ void Contact::refit_bvh() {
     lbvh3d::refit_edge_bvh(geo->pos_world.data().get(), geo->edges, edge_bvh, nullptr);
 }
 
+// Geometric mean
+static __device__ __forceinline__ float combine_mu(const float mu0, const float mu1) {
+    if ( mu0 <= 0.0f ) return mu1;
+    if ( mu1 <= 0.0f ) return mu0;
+    return sqrtf(mu0 * mu1);
+}
+
+// Coulomb friction force and its Hessian for a single contact.
+// Mirrors Newton's compute_projected_isotropic_friction: the tangential slip is
+// projected onto the contact tangent plane and a smooth IPC-style ramp is used
+// for |u_t| <= eps_u so the 1/|u_t| singularity is avoided.
+static __device__ __forceinline__ void evaluate_coulomb_friction(
+    const float mu,
+    const float normal_load,
+    const float3& n,
+    const float3& slip,
+    const float eps_u,
+    float3& force,
+    Mat3& hessian
+) {
+    const float dot_nu = dot(n, slip);
+    const float3 u_t = slip - n * dot_nu;
+    const float u_norm = norm(u_t);
+    if ( u_norm > 0.0f && mu > 0.0f && normal_load > 0.0f && eps_u > 0.0f ) {
+        float f1_SF_over_x;
+        if ( u_norm > eps_u ) {
+            f1_SF_over_x = 1.0f / u_norm;
+        }
+        else {
+            f1_SF_over_x = (-u_norm / eps_u + 2.0f) / eps_u;
+        }
+        const float scale = mu * normal_load * f1_SF_over_x;
+        force = -scale * u_t;
+        hessian = Mat3::outer_product(n, n * -scale);
+        hessian.add_diag(scale);
+    }
+    else {
+        force = make_float3(0.0f, 0.0f, 0.0f);
+        hessian = Mat3::zero();
+    }
+}
+
 __global__ void compute_vf_force(
     float3* __restrict__ forces,
     Mat3* __restrict__ Jx,
@@ -260,6 +302,7 @@ __global__ void compute_vf_force(
     const int* __restrict__ broad_phase_pairs,
     const int broad_phase_size,
     const float3*__restrict__ pos,
+    const float3*__restrict__ pos_prev,
     const float3*__restrict__ vertex_normals,
     const int3* tri_indices,
     const float* __restrict__ static_diags,
@@ -270,6 +313,7 @@ __global__ void compute_vf_force(
     const bool ground,
     const float k,
     const float ground_k,
+    const float friction_slip_eps,
     int num_vertices
 ) {
     int vid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -290,6 +334,14 @@ __global__ void compute_vf_force(
         force0.z = (thickness0 - x0.z) * vert_stiff * ground_k;
         // outer_product of (0,0,1)
         hess0.r[2].z = vert_stiff * ground_k;
+        // Friction on the ground plane (normal = +z, static surface).
+        float3 f_frac;
+        Mat3 K_frac;
+        evaluate_coulomb_friction(
+            od.friction, force0.z, make_float3(0.0f, 0.0f, 1.0f),
+            x0 - pos_prev[vid], friction_slip_eps, f_frac, K_frac);
+        force0 = force0 + f_frac;
+        if ( Jx ) hess0 = hess0 + K_frac;
         is_collided = true;
     }
     int count = pairs[0];
@@ -322,18 +374,11 @@ __global__ void compute_vf_force(
         else if ( vert_stiff <= 0.f ) continue;
 
         float3 force;
+        Mat3 hess = Mat3::zero();
         if ( force_type == 0 ) {
             float force_mag = stiff * pen;
             force = normal * force_mag;
-            if ( Jx ) {
-                Mat3 hess = Mat3::outer_product(normal, normal * stiff);
-                hess0 += hess;
-                if ( i1 < active_vertices_size ) {
-                    atomicAddMat3(&Jx[i1], hess * (u * u));
-                    atomicAddMat3(&Jx[i2], hess * (v * v));
-                    atomicAddMat3(&Jx[i3], hess * (w * w));
-                }
-            }
+            if ( Jx ) hess = Mat3::outer_product(normal, normal * stiff);
         }
         else {
             float d = max(thickness - pen, thickness * 0.1f);
@@ -344,11 +389,49 @@ __global__ void compute_vf_force(
 
             float E_prime = stiff * diff * (2.0f * log_term + 1.0f - 1.0f / d_ratio);
             force = log_term * E_prime * normal;
+            if ( Jx ) {
+                // Linearized normal stiffness of the IPC barrier (diagonal approx).
+                // Force along n is f(d) with d = thickness - pen; the term added to
+                // Jx is -df/dd * (n n^T) (energy Hessian, same sign as type-0).
+                const float r = d_ratio;
+                const float L = log_term;
+                const float hB = 2.0f * L + 1.0f - 1.0f / r;
+                const float df_dd = (1.0f / thickness) * (
+                    (1.0f / r) * stiff * diff * hB
+                    + L * stiff * (-thickness * hB + diff * (2.0f / r + 1.0f / (r * r))));
+                // Zero when the lower clamp is active (force is frozen there).
+                const float hess_val = (thickness - pen > thickness * 0.1f)
+                                           ? fmaxf(0.0f, -df_dd) : 0.0f;
+                hess = Mat3::outer_product(normal, normal * hess_val);
+            }
         }
-        force0 = force0 + force;
+        force0 += force;
+        if ( Jx ) hess0 += hess;
+
+        // Coulomb friction: geometric-mean mu, tangential slip is the vertex
+        // displacement relative to the (barycentric) face contact point.
+        const float f_n = norm(force);
+        const float mu = combine_mu(od.friction, obj_data[vertices_obj[i1]].friction);
+        const float3 slip = (x0 - pos_prev[vid])
+            - (u * (x1 - pos_prev[i1]) + v * (x2 - pos_prev[i2]) + w * (x3 - pos_prev[i3]));
+        float3 f_frac;
+        Mat3 K_frac;
+        evaluate_coulomb_friction(mu, f_n, normal, slip, friction_slip_eps, f_frac, K_frac);
+        force0 += f_frac;
+
+        force += f_frac;
         atomicAddFloat3(&forces[i1], force * -u);
         atomicAddFloat3(&forces[i2], force * -v);
         atomicAddFloat3(&forces[i3], force * -w);
+        if ( Jx ) {
+            hess0 += K_frac;
+            hess += K_frac;
+            if ( i1 < active_vertices_size ) {
+                atomicAddMat3(&Jx[i1], hess * (u * u));
+                atomicAddMat3(&Jx[i2], hess * (v * v));
+                atomicAddMat3(&Jx[i3], hess * (w * w));
+            }
+        }
 
         is_collided = true;
     }
@@ -363,6 +446,7 @@ static __global__ void compute_ee_force(
     const int* __restrict__ broad_phase_pairs,
     const int broad_phase_size,
     const float3*__restrict__ pos,
+    const float3*__restrict__ pos_prev,
     const int2* edges,
     const float* __restrict__ static_diags,
     const ObjectDataInput* obj_data,
@@ -371,6 +455,7 @@ static __global__ void compute_ee_force(
     const int force_type, // 0: spring, 1: IPC
     const int active_vertices_size,
     const float k,
+    const float friction_slip_eps,
     int num_edges
 ) {
     int eid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -424,18 +509,11 @@ static __global__ void compute_ee_force(
         if ( stiff <= 0.f ) continue;
 
         float3 force;
+        Mat3 hess = Mat3::zero();
         if ( force_type == 0 ) {
             float force_mag = stiff * pen;
             force = normal * force_mag;
-            if ( Jx ) {
-                Mat3 hess = Mat3::outer_product(normal, normal) * stiff;
-                hess0 += hess * ((1.0f - s) * (1.0f - s));
-                hess1 += hess * (s * s);
-                if ( e.x < active_vertices_size ) {
-                    atomicAddMat3(&Jx[e.x], hess * ((1.0f - t) * (1.0f - t)));
-                    atomicAddMat3(&Jx[e.y], hess * (t * t));
-                }
-            }
+            if ( Jx ) hess = Mat3::outer_product(normal, normal * stiff);
         }
         else {
             float d = max(thickness - pen, thickness * 0.05f);
@@ -446,11 +524,50 @@ static __global__ void compute_ee_force(
 
             float E_prime = stiff * diff * (2.0f * log_term + 1.0f - 1.0f / d_ratio);
             force = log_term * E_prime * normal;
+            if ( Jx ) {
+                // Linearized normal stiffness of the IPC barrier (diagonal approx).
+                const float r = d_ratio;
+                const float L = log_term;
+                const float hB = 2.0f * L + 1.0f - 1.0f / r;
+                const float df_dd = (1.0f / thickness) * (
+                    (1.0f / r) * stiff * diff * hB
+                    + L * stiff * (-thickness * hB + diff * (2.0f / r + 1.0f / (r * r))));
+                // Zero when the lower clamp is active (force is frozen there).
+                const float hess_val = (thickness - pen > thickness * 0.05f)
+                                           ? fmaxf(0.0f, -df_dd) : 0.0f;
+                hess = Mat3::outer_product(normal, normal * hess_val);
+            }
         }
-        force0 = force0 + force * (1.0f - s);
-        force1 = force1 + force * s;
+        force0 += force * (1.0f - s);
+        force1 += force * s;
+        if ( Jx ) {
+            hess0 += hess * ((1.0f - s) * (1.0f - s));
+            hess1 += hess * (s * s);
+        }
+
+        // Coulomb friction: geometric-mean mu, tangential slip is the relative
+        // displacement of the two edge contact points.
+        const float f_n = norm(force);
+        const float mu = combine_mu(obj_data[vertices_obj[edge.x]].friction, obj_data[vertices_obj[e.x]].friction);
+        const float3 slip = ((1.0f - s) * (p0 - pos_prev[edge.x]) + s * (p1 - pos_prev[edge.y]))
+            - ((1.0f - t) * (q0 - pos_prev[e.x]) + t * (q1 - pos_prev[e.y]));
+        float3 f_frac;
+        Mat3 K_frac;
+        evaluate_coulomb_friction(mu, f_n, normal, slip, friction_slip_eps, f_frac, K_frac);
+        force0 += f_frac * (1.0f - s);
+        force1 += f_frac * s;
+        force += f_frac;
         atomicAddFloat3(&forces[e.x], force * (t - 1.f));
         atomicAddFloat3(&forces[e.y], force * -t);
+        if ( Jx ) {
+            hess0 += K_frac * ((1.0f - s) * (1.0f - s));
+            hess1 += K_frac * (s * s);
+            hess += K_frac;
+            if ( e.x < active_vertices_size ) {
+                atomicAddMat3(&Jx[e.x], hess * ((1.0f - t) * (1.0f - t)));
+                atomicAddMat3(&Jx[e.y], hess * (t * t));
+            }
+        }
 
         is_collided = true;
     }
@@ -601,7 +718,7 @@ __global__ void solve_untangling_kernel(
         }
     }
 }
-void Contact::accumulate_contact_force(float3* forces, Mat3* Jx_diag) {
+void Contact::accumulate_contact_force(float3* forces, Mat3* Jx_diag, float h) {
     auto& params = geo->params;
     int num_vertices = params.nb_all_vertices;
     int num_edges = params.nb_all_edges;
@@ -612,6 +729,11 @@ void Contact::accumulate_contact_force(float3* forces, Mat3* Jx_diag) {
     float ef_force_k = max(0.f, geo->get_global_parameter("ef_force_k", 0.2f));
     int vf_force_type = max(0, (int)geo->get_global_parameter("vf_force_type", 1));
     int ee_force_type = max(0, (int)geo->get_global_parameter("ee_force_type", 1));
+    int friction_on = max(0, (int)geo->get_global_parameter("friction_on", 1));
+    float friction_epsilon = max(0.f, geo->get_global_parameter("friction_epsilon", 1e-2f));
+    // Smoothing distance for the friction slip (displacement units). Zero disables it,
+    // which is how friction_on=0 (or h<=0) turns friction off.
+    float friction_slip_eps = (friction_on && h > 0.f) ? friction_epsilon * h : 0.0f;
     // #define CHECK(v,type) thrust::host_vector<type> _##v = v;\
     // std::vector<type> __##v(_##v.begin(), _##v.end())
     // auto& edge_opposite_points = geo->edge_opposite_points;
@@ -624,6 +746,7 @@ void Contact::accumulate_contact_force(float3* forces, Mat3* Jx_diag) {
         broad_phase_vf.data().get(),
         broad_phase_size,
         geo->pos_world.data().get(),
+        geo->pos_step_prev.data().get(),
         geo->vertex_normals.data().get(),
         geo->triangle_indices.data().get(),
         geo->static_diags.data().get(),
@@ -633,6 +756,7 @@ void Contact::accumulate_contact_force(float3* forces, Mat3* Jx_diag) {
         cloth_vertices,
         geo->ground,
         vf_force_k, vf_ground_k,
+        friction_slip_eps,
         num_vertices
         );
     compute_ee_force<<<(num_edges + threadsPerBlock - 1) / threadsPerBlock, threadsPerBlock>>>(
@@ -641,13 +765,14 @@ void Contact::accumulate_contact_force(float3* forces, Mat3* Jx_diag) {
         broad_phase_ee.data().get(),
         broad_phase_size,
         geo->pos_world.data().get(),
+        geo->pos_step_prev.data().get(),
         geo->edges.data().get(),
         geo->static_diags.data().get(),
         geo->obj_data.data().get(),
         geo->vertices_obj.data().get(),
         geo->edge_normals.data().get(),
         ee_force_type, cloth_vertices,
-        ee_force_k, num_edges
+        ee_force_k, friction_slip_eps, num_edges
         );
 
     solve_untangling_kernel<<<(num_edges + threadsPerBlock - 1) / threadsPerBlock, threadsPerBlock>>>(
@@ -896,7 +1021,9 @@ __global__ void collect_all_edge_collisions_debug(
     if ( force_type == 0 ) {
         float force_mag = stiff * pen;
         force = normal * force_mag;
-        printf("id:%d, force_mag: %e, stiff: %e, pen:%e, st:(%e, %e), A0:(%e, %e, %e), B0:(%e, %e, %e), C0:(%e, %e, %e), D0:(%e, %e, %e)\n", is_target_e1 ? eid2_raw : eid * (int)sign, force_mag,
+        printf(
+            "id:%d, force_mag: %e, stiff: %e, pen:%e, st:(%e, %e), A0:(%e, %e, %e), B0:(%e, %e, %e), C0:(%e, %e, %e), D0:(%e, %e, %e)\n",
+            is_target_e1 ? eid2_raw : eid * (int)sign, force_mag,
             stiff, pen, s, t,
             p0.x, p0.y, p0.z, p1.x, p1.y, p1.z, q0.x, q0.y, q0.z, q1.x, q1.y, q1.z);
     }

@@ -345,7 +345,7 @@ void SolverPDNewton::step(float h) {
         cudaMemsetAsync(f, 0, sizeof(float3) * n);
         cudaMemsetAsync(f_elastic, 0, sizeof(float3) * n);
         cudaMemsetAsync(Jx_diag, 0, sizeof(Mat3) * n);
-        contact.accumulate_contact_force(f, Jx_diag);
+        contact.accumulate_contact_force(f, Jx_diag, h);
         truncate_forces_kernel<<<(n + block - 1) / block, block>>>(
             f, Jx_diag, static_diags, max_force_scale, n);
 

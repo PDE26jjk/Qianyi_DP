@@ -53,8 +53,8 @@ CM_TO_M = 0.01
 # fabric parameters in this phase (design D9).
 FABRIC_DEFAULTS: dict = {
     "mass": 100.0,
-    "thickness": 0.1,
-    "friction": 0.03,
+    "thickness": 1.0,
+    "friction": 0.5,
     "stretch": (1.0, 1.0, 1.0),
     "bending": (1.0, 1.0, 1.0),
     "collision_layer": 0,

@@ -8,6 +8,14 @@
 #include "dynamics/bending.cuh"
 #include "dynamics/planar.cuh"
 
+// Combined friction coefficient. Geometric mean per convention; fall back to the
+// known side when the other material has no friction field (unset rigid objects
+// default to 0) so cloth-vs-body contacts still grip.
+static __device__ __forceinline__ float combine_mu(const float mu0, const float mu1) {
+    if ( mu0 <= 0.0f ) return mu1;
+    if ( mu1 <= 0.0f ) return mu0;
+    return sqrtf(mu0 * mu1);
+}
 
 static __global__ void step_end_kernel(
     float3* __restrict__ pos_world,
@@ -439,7 +447,7 @@ __global__ void xpbd_solve_vf_contacts_kernel(
 
         // --- Tangential friction ---
         const float3 v1 = vel[i1], v2 = vel[i2], v3 = vel[i3];
-        float friction_mu = (friction_mu0 + obj_data[vertices_obj[i1]].friction) * 0.5f;
+        float friction_mu = combine_mu(friction_mu0, obj_data[vertices_obj[i1]].friction);
         float3 v_contact = v0 - (v1 * u + v2 * v + v3 * w);
         float3 vt = v_contact - normal * dot(v_contact, normal);
         float speed = norm(vt);
@@ -559,7 +567,7 @@ __global__ void xpbd_solve_ee_contacts_kernel(
 
         // --- Tangential friction ---
         const float3 vq0 = vel[ic], vq1 = vel[id];
-        float friction_mu = (friction_mu0 + obj_data[vertices_obj[ic]].friction) * 0.5f;
+        float friction_mu = combine_mu(friction_mu0, obj_data[vertices_obj[ic]].friction);
         float3 v_contact_a = v0 * (1.0f - s) + v1 * s;
         float3 v_contact_b = vq0 * (1.0f - t) + vq1 * t;
         float3 v_rel = v_contact_a - v_contact_b;

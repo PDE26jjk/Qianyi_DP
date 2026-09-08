@@ -198,7 +198,7 @@ void SolverExplicit::step(float h) {
             geo->bending_factor.data().get(),
             n, 0.2);
     geo->accumulate_sewing_force(nullptr, nullptr);
-    geo->get_contact().accumulate_contact_force(f, nullptr);
+    geo->get_contact().accumulate_contact_force(f, nullptr, h);
     // update substep end
 
     n = params.nb_all_cloth_vertices;

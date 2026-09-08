@@ -18,7 +18,7 @@ struct Contact {
     void collision_detect_prepare();
     void rebuild_bvh();
     void refit_bvh();
-    void accumulate_contact_force(float3* forces, Mat3* Jx_diag);
+    void accumulate_contact_force(float3* forces, Mat3* Jx_diag, float h);
     void refit_bvh_with_target(const float3* pos_prev, const float3* pos_target);
     void ccd_truncation_traverse_bvh(const float3* pos_prev, const float3* pos_target);
     void check_truncation_traverse_bvh(const float3* pos_prev, float3* pos_target);
