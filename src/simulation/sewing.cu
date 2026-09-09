@@ -88,7 +88,7 @@ void Geometry::init_sewing() {
                     sewing_edge_opposite_points[sewing_e_idx].y = eop2.x != -1 ? eop2.x : eop2.y;
                 }
                 else { // Internal lines
-                    sewing_e2t[sewing_e_idx].y = tris1.y;
+                    sewing_e2t[sewing_e_idx].y = tris2.y;
                     sewing_edge_opposite_points[sewing_e_idx].y = eop2.y;
                 }
             }
@@ -126,21 +126,26 @@ static __global__ void check_sewing_kernel(
     auto stitch = stitches[idx];
     if ( stitches_status[idx] == stitch_status_done ) return;// Already done
     auto [v0,v1] = stitch;
-    if ( mask[v0] && mask[v1] ) { // No need to move
-        // stitches_status[idx] = stitch_status_suspend;
-        stitches_status[idx] = stitch_status_done;
-        atomicAdd(stitches_done_count, 1);       
-        return;
+    if ( mask[v0] && mask[v1] ) {
+        constexpr char proxy_bit = static_cast<char>(MaskBit::proxy_mask);
+        if ( (mask[v0] & proxy_bit) && (mask[v1] & proxy_bit) ) {
+            stitches_status[idx] = stitch_status_suspend;
+        }
+        else { // No need to move
+            stitches_status[idx] = stitch_status_done;
+            atomicAdd(stitches_done_count, 1);
+            return;
+        }
     }
     v0 = min(vertex_proxy[v0], v0);
     v1 = min(vertex_proxy[v1], v1);
     auto p0 = vertices[v0], p1 = vertices[v1];
     if ( forced_connect || len_sq(p0 - p1) < min_dist_sq ) {
         if ( mask[v0] ) {
-            vertex_proxy[v1] = v0;
+            atomicMin(&vertex_proxy[v1], v0);
         }
         else if ( mask[v1] ) {
-            vertex_proxy[v0] = v1;
+            atomicMin(&vertex_proxy[v0], v1);
         }
         else {
             atomicMin(&vertex_proxy[v1], v0);
@@ -239,7 +244,7 @@ static __device__ void reorder_triangle(
     int e1_i = v2e_include_stitches(v0, v1, edge_lookup, dir_edges);
     int e2_i = v2e_include_stitches(v0, v2, edge_lookup, dir_edges);
     int e3_i = v2e_include_stitches(v1, v2, edge_lookup, dir_edges);
-    if (e1_i == -1 || e2_i == -1 || e3_i == -1 ) {
+    if ( e1_i == -1 || e2_i == -1 || e3_i == -1 ) {
         printf("ERROR in reorder_triangle!\n");
         return;
     }
@@ -322,7 +327,7 @@ void Geometry::check_sewing(bool forced_connect) {
     int stitches_done_count_new;
     cudaMemcpy(&stitches_done_count_new, stitches_done_count.data().get(), sizeof(int), cudaMemcpyDeviceToHost);
 
-    // std::cout << "stitches: " << stitches_done_count_new << "/" << n << std::endl;
+    std::cout << "stitches: " << stitches_done_count_new << "/" << n << std::endl;
     if ( stitches_done_count_new > stitches_done_count_old ) {
         // #define CHECK(v,type) thrust::host_vector<type> _##v = v;\
         // std::vector<type> __##v(_##v.begin(), _##v.end())
@@ -364,16 +369,78 @@ void Geometry::check_sewing(bool forced_connect) {
     need_update_inv_mass = true;
     sewing_done = false;
 }
+
+static __global__ void compute_stitch_constraint(
+    Mat3* __restrict__ Jx,
+    Mat3* __restrict__ Jx_diag,
+    float3* __restrict__ forces,
+    float* __restrict__ enerys,
+    const float3* __restrict__ vertices,
+    const int* __restrict__ vertices_obj,
+    const ObjectDataInput* __restrict__ obj_data,
+    const int* __restrict__ vertex_proxy,
+    const char* __restrict__ stitches_status,
+    const int2* __restrict__ stitches,
+    float min_dist,
+    float k_input,
+    int n // stitches size
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if ( idx >= n ) return;
+    if ( stitches_status[idx] == stitch_status_done ) return;
+    auto s = stitches[idx];
+    auto [p0_i, p1_i] = s;
+    p0_i = min(vertex_proxy[p0_i], p0_i);
+    p1_i = min(vertex_proxy[p1_i], p1_i);
+    if ( p0_i == p1_i ) return; // already in the same cluster
+
+    float3 p0 = vertices[p0_i], p1 = vertices[p1_i];
+    float3 e = p0 - p1;
+    float length = norm(e);
+    if ( length > 1e-7f ) {
+        //
+        float3 normal = e / length;
+        // float force_max_mag = dot(rel_v, normal) / dt * 0.45f;
+        float force_max_mag = 100000.f;
+
+        float spring_length = max(min_dist, 1e-6f);
+        float length_diff = length - spring_length;
+        float factor = min(obj_data[vertices_obj[p0_i]].granularity, obj_data[vertices_obj[p1_i]].granularity) * 0.05f;
+        float k = k_input * factor;
+        k = min(k, abs(force_max_mag / length_diff));
+        float3 force = normal * (length_diff * k);
+        if ( enerys ) {
+            atomicAdd(&enerys[p0_i], 0.5f * k * length_diff * length_diff);
+        }
+
+        atomicAddFloat3(&forces[p0_i], -force);
+        atomicAddFloat3(&forces[p1_i], force);
+        if ( Jx || Jx_diag ) {
+
+            Mat3 K = Mat3::identity(k);
+
+            if ( Jx_diag ) {
+                atomicAddMat3(&Jx_diag[p0_i], K);
+                atomicAddMat3(&Jx_diag[p1_i], K);
+            }
+            if ( Jx ) {
+                atomicAddMat3(&Jx[idx], -K);
+            }
+        }
+    }
+}
 void Geometry::accumulate_sewing_force(Mat3* Jx_diag, Mat3* Jx_nondiag) {
     if ( !sewing_done ) {
         float min_dist = 2e-3f;
         int block = 256;
         int n = params.nb_all_stitches;
-        float sewing_k = max(0.f, get_global_parameter("sewing_k",2e3));
+        float sewing_k = max(0.f, get_global_parameter("sewing_k", 2e3));
         compute_stitch_constraint<<<(n + block - 1) / block, block>>>(
             Jx_diag, Jx_nondiag, elastic_forces.data().get(),
             nullptr,
-            pos_world.data().get(), vertices_obj.data().get(), obj_data.data().get(),
-            vertices_mask.data().get(), stitches.data().get(), min_dist, sewing_k, n);
+            pos_world.data().get(), vertices_obj.data().get(),
+            obj_data.data().get(), vertex_proxy.data().get(),
+            stitches_status.data().get(), stitches.data().get(),
+            min_dist, sewing_k, n);
     }
 }

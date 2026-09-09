@@ -4,73 +4,7 @@
 #include "solver_base.cuh"
 #include "contact/collision_type.cuh"
 
-static __global__ void compute_stitch_constraint(
-    Mat3* __restrict__ Jx,
-    Mat3* __restrict__ Jx_diag,
-    float3* __restrict__ forces,
-    float* __restrict__ enerys,
-    const float3* __restrict__ vertices,
-    const int* __restrict__ vertices_obj,
-    const ObjectDataInput* __restrict__ obj_data,
-    const char* __restrict__ mask,
-    const int2* __restrict__ stitches,
-    float min_dist,
-    float k_input,
-    int n // stitches size
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if ( idx >= n ) return;
-    auto s = stitches[idx];
-    auto [p0_i, p1_i] = s;
-    if ( mask[p0_i] && mask[p1_i] ) return;
-    float3 p0 = vertices[p0_i], p1 = vertices[p1_i];
-    float3 e = p0 - p1;
-    float length = norm(e);
-    if ( length > 1e-7f ) {
-        //
-        float3 normal = e / length;
-        // float force_max_mag = dot(rel_v, normal) / dt * 0.45f;
-        float force_max_mag = 100000.f;
 
-        float spring_length = max(min_dist, 1e-6f);
-        float length_diff = length - spring_length;
-        float factor = min(obj_data[vertices_obj[p0_i]].granularity, obj_data[vertices_obj[p1_i]].granularity) * 0.05f;
-        float k = k_input * factor;
-        k = min(k, abs(force_max_mag / length_diff));
-        float3 force = normal * (length_diff * k);
-        if ( enerys ) {
-            atomicAdd(&enerys[p0_i], 0.5f * k * length_diff * length_diff);
-        }
-        // zero spring_length
-        // float k = 1e4f;
-        // float3 force = e * k;
-        atomicAddFloat3(&forces[p0_i], -force);
-        atomicAddFloat3(&forces[p1_i], force);
-        if ( Jx || Jx_diag ) {
-            // auto dxtdx = Mat3::outer_product(e, e);
-            // auto I = Mat3::identity();
-            // float l_inv = 1.0f / length;
-            // Mat3 K = -(I - (I - dxtdx * l_inv * l_inv) * spring_length * l_inv) * k;
-            // if ( Jx_diag ) {
-            //     atomicAddMat3(&Jx_diag[p0_i], K);
-            //     atomicAddMat3(&Jx_diag[p1_i], K);
-            // }
-            // if ( Jx ) {
-            //     atomicAddMat3(&Jx[idx], -K);
-            // }
-            // zero spring_length
-            Mat3 K = Mat3::identity(k);
-
-            if ( Jx_diag ) {
-                atomicAddMat3(&Jx_diag[p0_i], K);
-                atomicAddMat3(&Jx_diag[p1_i], K);
-            }
-            if ( Jx ) {
-                atomicAddMat3(&Jx[idx], -K);
-            }
-        }
-    }
-}
 static __global__ void compute_q_safe_constraint(
     Mat3* __restrict__ Jx_diag,
     float3* __restrict__ forces,
