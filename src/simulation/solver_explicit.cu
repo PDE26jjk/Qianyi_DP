@@ -95,7 +95,6 @@ void SolverExplicit::step(float h) {
     int2* edges = geo->edges.data().get();
     int2* e2t = geo->e2t.data().get();
     int2* eop = geo->edge_opposite_points.data().get();
-    float* rest_thetas = geo->rest_thetas.data().get();
     int3* tri_edges = geo->triangles.data().get();
     int3* tris = geo->triangle_indices.data().get();
     char* mask = geo->vertices_mask.data().get();
@@ -180,24 +179,30 @@ void SolverExplicit::step(float h) {
     //     geo->Dms.data().get(),
     //     n);
 
-    n = params.nb_all_cloth_edges;
+    n = params.nb_all_cloth_edges + params.nb_all_stitches;
     if ( geo->bending_model == BendingModel::IBM_quadratic )
         compute_quadratic_bending_IBM<<< (n + block - 1) / block, block>>>(
-            nullptr, nullptr, nullptr,
+            nullptr, nullptr,
             f, nullptr,
             geo->IBM_q.data().get(),
-            q, edges, e2t, tri_edges, eop,
+            q,
+            geo->bend_points.data().get(),
+            geo->bend_valid.data().get(),
+            geo->bend_cross_rows.data().get(),
             n, 0.2f);
     else if ( geo->bending_model == BendingModel::DiscreteShells_GN
         || geo->bending_model == BendingModel::DiscreteShells_AOGS )
         // The forces are the same
-        compute_dihedral_bending_GN<<<(n + block - 1), block>>>(
-            nullptr, nullptr, nullptr,
-            f, q, edges, e2t, rest_thetas,
-            tri_edges, eop,
-            geo->bending_factor.data().get(),
-            n, 0.2);
-    geo->accumulate_sewing_force(nullptr, nullptr);
+        compute_dihedral_bending_GN<<<(n + block - 1) / block, block>>>(
+            nullptr, nullptr,
+            f, q,
+            geo->bend_points.data().get(),
+            geo->bend_rest_theta.data().get(),
+            geo->bend_factor.data().get(),
+            geo->bend_valid.data().get(),
+            geo->bend_cross_rows.data().get(),
+            n, 0.2f);
+    geo->accumulate_sewing_force(nullptr);
     geo->get_contact().accumulate_contact_force(f, nullptr, h);
     // update substep end
 

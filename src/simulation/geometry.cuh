@@ -71,7 +71,6 @@ public:
     thrust::device_vector<int2> dir_edges; // size = 2 * nb_all_edges,  [target, edge_id] per element
     thrust::device_vector<int2> edge_lookup; // size = nb_all_vertices, [offset, count] per vertex
     thrust::device_vector<int2> e2t;
-    thrust::device_vector<float> rest_thetas;
     thrust::device_vector<int2> edge_opposite_points;
     thrust::device_vector<Mat2> Dms;
     thrust::device_vector<float> areas;
@@ -97,11 +96,36 @@ public:
     thrust::device_vector<int2> stitches;
     thrust::device_vector<int> stitch_sewing; // stitch to sewing
     thrust::device_vector<int> vertex_proxy; // if proxy is valid, copy position from proxy on the end of updating.
-    thrust::device_vector<int2> sewing_edges;
-    thrust::device_vector<int2> sewing_e2t;
-    thrust::device_vector<int2> sewing_edge_opposite_points;
+    // thrust::device_vector<int2> sewing_edges;
+    // thrust::device_vector<int2> sewing_e2t;
+    // thrust::device_vector<int2> sewing_edge_opposite_points;
     thrust::device_vector<int> stitches_done_count;
     thrust::device_vector<char> stitches_status;
+    
+    // Stitch cluster subsystem. Buffers are allocated once at worst-case
+    // size; build_stitch_clusters() is allocation-free so it can run per
+    // frame on tear/zipper events.
+    thrust::device_vector<int>  stitch_cluster_id;      // per vertex: root id or -1
+    thrust::device_vector<int2> stitch_cluster_lookup;  // per vertex [offset, count]
+    thrust::device_vector<int>  stitch_cluster_members; // sorted by (root, id)
+    thrust::device_vector<int>  stitch_cluster_locked;  // indexed by root id
+
+    // Scratch (worst-case sized, reused across rebuilds).
+    thrust::device_vector<int2> cluster_scratch_active;     // ns
+    thrust::device_vector<int>  cluster_scratch_label;      // n
+    thrust::device_vector<char> cluster_scratch_endpoint;   // n
+    thrust::device_vector<unsigned long long> cluster_scratch_keys_a; // 2*ns
+    thrust::device_vector<unsigned long long> cluster_scratch_keys_b; // 2*ns
+    thrust::device_vector<char> cluster_scratch_sort_temp;  // cub temp
+    thrust::device_vector<int>  cluster_scratch_counts;     // 2: active, unresolved
+    size_t cluster_sort_temp_bytes = 0;
+
+
+    void init_stitch_cluster_buffers();
+    void build_stitch_clusters();
+    void project_stitches();
+    void average_stitch_cluster_velocities();
+
     bool sewing_done;
 
     bool need_update_inv_mass;
@@ -112,7 +136,32 @@ public:
 
     // bending
     BendingModel bending_model;
+    // Unified solver row table: [0, nb_all_cloth_edges) is a copy of the
+    // natural edges (spring/FEM keep writing rows by edge id); the tail
+    // collects every other vertex pair referenced by bend entries,
+    // normalized (min, max), sorted, deduplicated. Jx_nondiag is sized
+    // to this table and the matvec couples it directly.
+    thrust::device_vector<int2> valid_pairs;
+    // Row indices into valid_pairs, six per entry in fixed order:
+    // (x0x1, x0x2, x1x2, x0x3, x1x3, x2x3).
+    thrust::device_vector<int>  bend_cross_rows;   // 6 * N
+
     thrust::device_vector<float4> IBM_q;
+    // Unified bending structure. Entry k in [0, nb_all_cloth_edges) is the
+    // mesh edge k (hinge from edges[k], apexes from edge_opposite_points);
+    // entry nb_all_cloth_edges + i is the seam hinge of the consecutive
+    // stitch pair (i, i+1). Validity is refreshed on cluster rebuilds
+    // (tear events); the static parts are built once.
+    thrust::device_vector<int4>  bend_points;         // (x0, x1, x2, x3)
+    thrust::device_vector<float> bend_factor;         // dihedral factor
+    thrust::device_vector<float> bend_rest_theta;     // 0 / SewingData.angle /
+                                                      // internal lines later
+    thrust::device_vector<char>  bend_valid;          // N
+    thrust::device_vector<char>  seam_bend_static_ok; // ns (apexes found etc.)
+
+    void init_bend_structure();   // once, after init_triangle_data
+    void update_seam_state();     // areas + bend validity, on cluster rebuilds
+    
     bool need_record_interpolation_this_frame;
     bool need_update_interpolation_vertices_this_frame;
     bool has_pin_attached;
@@ -175,6 +224,7 @@ public:
     void init_sewing();
     void init_pin();
     void init_picker();
+    void init_bending();
 
     int add_pick_triangle(int mesh_index, int tri_index, float3 position);
     void update_pick_triangle(int index, float3 position);
@@ -190,8 +240,8 @@ public:
     // run in update function
     void check_picker();
 
-    void check_sewing(bool forced_connect = false);
-    void accumulate_sewing_force(Mat3* Jx_diag, Mat3* Jx_nondiag);
+    void check_sewing();
+    void accumulate_sewing_force(Mat3* Jx_diag);
 
     void update_pin(float3* q);
 

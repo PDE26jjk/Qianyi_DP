@@ -21,7 +21,7 @@ class SolverInfo:
 PDNEWTON_PARAMETERS: dict[str, float] = {
     "smooth_times": 5,
     "step_h": 0.003,
-    "sewing_k": 2e3,
+    "sewing_k": 1e5,
     "query_radius": 1e-3,
     "sewing_forced_connect_frame": 80,
     "vf_force_k": 0.5,
@@ -55,7 +55,7 @@ PDNEWTON_PARAMETERS: dict[str, float] = {
 VBD_PARAMETERS: dict[str, float] = {
     "smooth_times": 5,
     "step_h": 0.01,
-    "sewing_k": 2e3,
+    "sewing_k": 1e5,
     "sewing_forced_connect_frame": 80,
     "query_radius": 0.5e-3,
     "avbd_contact_beta": 1e3,
@@ -97,7 +97,7 @@ XPBD_PARAMETERS: dict[str, float] = {
 EXPLICIT_PARAMETERS: dict[str, float] = {
     "smooth_times": 5,
     "step_h": 0.00025,
-    "sewing_k": 2e3,
+    "sewing_k": 1e5,
     "sewing_forced_connect_frame": 80,
     "vf_force_k": 0.02,
     "ee_force_k": 0.002,

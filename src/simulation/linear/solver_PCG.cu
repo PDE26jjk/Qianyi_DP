@@ -179,7 +179,9 @@ void SolverPCG::print_debug(const float3* rhs) {
     thrust::host_vector<Mat3> Jx_diag_host = Jx_diag;
     thrust::host_vector<Mat3> Jx_nondiag_host = Jx_nondiag;
     auto geo = simulator->get_geo();
-    thrust::host_vector<int2> edges_host = geo->edges;
+    // The row space is valid_pairs (natural edges + bend pairs), not the
+    // mesh edges; m_edge_size matches its size.
+    thrust::host_vector<int2> edges_host = geo->valid_pairs;
     std::cout << "edges = [ ";
     for ( int i = 0; i < m_edge_size; ++i ) {
         std::cout << "(" << edges_host[i].x << ", " << edges_host[i].y << ")";

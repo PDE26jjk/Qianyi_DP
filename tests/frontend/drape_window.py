@@ -50,7 +50,7 @@ CONFIG = {
     # applied on top of the preset before input_data.
     "solver": "PDNewton",
     "param_overrides": {},
-    "dt": 0.03,
+    "dt": 0.003,
     # Blow-up detection (design D6): auto-pause when any vertex is
     # non-finite or moves further than this in one rendered frame.
     "blowup_displacement_m": 0.5,

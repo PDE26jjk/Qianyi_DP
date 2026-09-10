@@ -127,7 +127,7 @@ void Geometry::init(const GeoDataInput& geo) {
         constitutive_model = ConstitutiveModel::FEM_BW;
         break;
     }
-    switch ( int bending_model_ = (int)get_global_parameter("bending_model", 0) ) {
+    switch ( int bending_model_ = (int)get_global_parameter("bending_model", 2) ) {
     case 0:
         bending_model = BendingModel::IBM_quadratic;
         break;
@@ -142,23 +142,7 @@ void Geometry::init(const GeoDataInput& geo) {
         bending_model = BendingModel::DiscreteShells_GN;
         break;
     }
-    precompute_bending_factor();
-    if ( bending_model == BendingModel::IBM_quadratic ) {
-        // precompute bending
-        IBM_q.assign(params.nb_all_cloth_edges, make_float4(0.0f, 0.0f, 0.0f, 0.f));
-        int threadsPerBlock = 256;
-        int n = params.nb_all_cloth_edges;
-        int blocksPerGrid = (n + threadsPerBlock - 1) / threadsPerBlock;
-        precompute_IBM_Q<<<blocksPerGrid, threadsPerBlock>>>(
-            thrust::raw_pointer_cast(IBM_q.data()),
-            thrust::raw_pointer_cast(edges.data()),
-            thrust::raw_pointer_cast(e2t.data()),
-            thrust::raw_pointer_cast(pos_2D.data()),
-            thrust::raw_pointer_cast(edge_opposite_points.data()),
-            thrust::raw_pointer_cast(Dms.data()),
-            n
-            );
-    }
+
     need_update_inv_mass = true;
     need_update_interpolation_vertices_this_frame = false;
     need_record_interpolation_this_frame = true;
@@ -169,6 +153,9 @@ void Geometry::init(const GeoDataInput& geo) {
     init_pin();
     init_picker();
     init_sewing();
+    init_bending();
+    build_stitch_clusters();
+    init_bend_structure();
     CUDA_CHECK(cudaDeviceSynchronize());
 }
 
@@ -301,7 +288,6 @@ void Geometry::init_edge_data() {
         dir_edges.data().get(), edge_lookup.data().get());
 
     calc_edge_length();
-    rest_thetas.assign(num_edges, 0.f); // TODO
 }
 
 static __device__ int get_opposite_point(const int2& edge, const int3& tri, const int2* edges) {
@@ -852,8 +838,7 @@ void Geometry::update_for_frame() {
             n * sizeof(float3), cudaMemcpyDeviceToDevice);
     }
 
-    int sewing_forced_connect_frame = max(0, (int)get_global_parameter("sewing_forced_connect_frame", 80));
-    check_sewing(simulator->frame > sewing_forced_connect_frame);
+    check_sewing();
 }
 
 static __global__ void update_interpolated_position(
@@ -997,6 +982,28 @@ __global__ void calc_offsets_kernel(
     }
 }
 
+void Geometry::init_bending() {
+    int num_edges = params.nb_all_cloth_edges;
+    int num_stitches = params.nb_all_stitches;
+    precompute_bending_factor();
+    if ( bending_model == BendingModel::IBM_quadratic ) {
+        // precompute bending; sized to the bend entry space so seam slots
+        // stay zero (IBM gets no seam bending - use AOGS/GN for seams)
+        IBM_q.assign(num_edges + num_stitches, make_float4(0.0f, 0.0f, 0.0f, 0.f));
+        int threadsPerBlock = 256;
+        int n = params.nb_all_cloth_edges;
+        int blocksPerGrid = (n + threadsPerBlock - 1) / threadsPerBlock;
+        precompute_IBM_Q<<<blocksPerGrid, threadsPerBlock>>>(
+            thrust::raw_pointer_cast(IBM_q.data()),
+            thrust::raw_pointer_cast(edges.data()),
+            thrust::raw_pointer_cast(e2t.data()),
+            thrust::raw_pointer_cast(pos_2D.data()),
+            thrust::raw_pointer_cast(edge_opposite_points.data()),
+            thrust::raw_pointer_cast(Dms.data()),
+            n
+            );
+    }
+}
 void Geometry::color_graph() {
     // Collect valid edges in graph
     int num_edges = params.nb_all_cloth_edges;
@@ -1082,6 +1089,7 @@ __global__ void tris_fill_keys_and_values(
     d_values[base + 1] = make_int2(tid, 1);
     d_values[base + 2] = make_int2(tid, 2);
 }
+
 void Geometry::build_adj_data() {
     // bending 
     int num_edges = params.nb_all_cloth_edges;
@@ -1114,4 +1122,35 @@ void Geometry::build_adj_data() {
     calc_offsets_kernel<<< (num_pairs + 1 + blockSize - 1) / blockSize, blockSize>>>(
         d_keys, num_pairs, v_adj_tris_offsets.data().get());
 
+}
+
+// Mesh-edge slots of the unified bending arrays: hinge from the edge,
+// apexes from edge_opposite_points, factor from the precomputed
+// per-edge dihedral factor, and the four solver edge rows for the
+// cross couplings resolved once via the CSR.
+static __global__ void fill_mesh_bend_entries_kernel(
+    int4* __restrict__ bend_points,
+    int4* __restrict__ bend_cross_rows,
+    float* __restrict__ bend_factor,
+    const int2* __restrict__ edges,
+    const int2* __restrict__ edge_opposite_points,
+    const float* __restrict__ bending_factor,
+    const int2* __restrict__ edge_lookup,
+    const int2* __restrict__ dir_edges,
+    int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if ( i >= n ) return;
+    int2 e = edges[i];
+    int2 op = edge_opposite_points[i];
+    bend_points[i] = make_int4(e.x, e.y, op.x, op.y);
+    bend_factor[i] = bending_factor[i];
+    if ( op.x != -1 && op.y != -1 )
+        bend_cross_rows[i] = make_int4(
+            v2e(e.x, op.x, edge_lookup, dir_edges),
+            v2e(e.y, op.x, edge_lookup, dir_edges),
+            v2e(e.x, op.y, edge_lookup, dir_edges),
+            v2e(e.y, op.y, edge_lookup, dir_edges));
+    else
+        bend_cross_rows[i] = make_int4(-1, -1, -1, -1);
 }

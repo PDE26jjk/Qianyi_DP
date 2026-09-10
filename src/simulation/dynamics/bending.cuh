@@ -73,78 +73,64 @@ static __device__ void get_theta_dpk(
 // When the fabric undergoes severe bending, intense folding, or inversion due to large-scale self-penetration, the value of ∂E/∂θ becomes very large.
 // At this point, the geometric stiffness term ∂E/∂θ ∇²θ, which discarded, actually dominates the total stiffness.
 // Discarding it will cause the curvature information obtained by the solver to be severely distorted, and the number of Newton iteration steps will increase exponentially.
+// Unified bending entry interface: entry i < num_mesh_edges is the mesh
+// edge i; entries beyond are seam hinges of consecutive stitch pairs.
+// The four points, rest angle, factor and validity come from the unified
+// bend arrays; all six solver rows are precomputed in bend_cross_rows
+// (indices into valid_pairs, stored normalized).
 static __global__ void compute_dihedral_bending_GN(
     Mat3* Jx,
     Mat3* Jx_diag,
-    Mat3* Jx_bend_cross,
     float3* forces,
     const float3* __restrict__ vertices,
-    const int2* __restrict__ edges,
-    const int2* __restrict__ e2t,
-    const float* __restrict__ rest_thetas,
-    const int3* __restrict__ triangles,
-    const int2* __restrict__ edge_opposite_points,
-    const float* __restrict__ bending_factor,
-    int num_edges, float kb
+    const int4* __restrict__ bend_points,
+    const float* __restrict__ bend_rest_theta,
+    const float* __restrict__ bend_factor,
+    const char* __restrict__ bend_valid,
+    const int* __restrict__ bend_cross_rows,
+    int n, float kb
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if ( i >= num_edges ) return;
+    if ( i >= n ) return;
+    if ( !bend_valid[i] ) return; // boundary / collapsed / torn
 
-    int2 p_op = edge_opposite_points[i];
-    if ( p_op.x == -1 || p_op.y == -1 ) return; // No need to calculate bending force at the boundary.
-
-    int2 e_i = edges[i];
-    int x0_idx = e_i.x, x1_idx = e_i.y;
-    int x2_idx = p_op.x, x3_idx = p_op.y;
+    int4 p = bend_points[i];
+    int x0_idx = p.x, x1_idx = p.y, x2_idx = p.z, x3_idx = p.w;
 
     float3 theta_dp0, theta_dp1, theta_dp2, theta_dp3;
     float theta;
     get_theta_dpk(vertices[x0_idx], vertices[x1_idx], vertices[x2_idx], vertices[x3_idx],
         theta_dp0, theta_dp1, theta_dp2, theta_dp3, theta);
 
-    float coef = kb * bending_factor[i];
+    float coef = kb * bend_factor[i];
     if ( Jx_diag != nullptr ) {
         atomicAddMat3(&Jx_diag[x0_idx], Mat3::outer_product(theta_dp0, theta_dp0 * coef));
         atomicAddMat3(&Jx_diag[x1_idx], Mat3::outer_product(theta_dp1, theta_dp1 * coef));
         atomicAddMat3(&Jx_diag[x2_idx], Mat3::outer_product(theta_dp2, theta_dp2 * coef));
         atomicAddMat3(&Jx_diag[x3_idx], Mat3::outer_product(theta_dp3, theta_dp3 * coef));
         if ( Jx != nullptr ) {
-            auto [t1_i, t2_i] = e2t[i];
-            auto tri1 = triangles[t1_i];
-            auto tri2 = triangles[t2_i];
+            const int* rows = bend_cross_rows + 6 * i;
+            // Every row exists in valid_pairs, stored normalized (min,max):
+            // one orientation rule covers natural and extension rows alike.
             auto f0d1 = Mat3::outer_product(theta_dp0, theta_dp1 * coef);
-            atomicAddMat3(&Jx[i], f0d1);
-
             auto f2d0 = Mat3::outer_product(theta_dp2, theta_dp0 * coef);
             auto f2d1 = Mat3::outer_product(theta_dp2, theta_dp1 * coef);
-            if ( x2_idx < x0_idx ) {
-                atomicAddMat3(&Jx[tri1.x], f2d0);
-                atomicAddMat3(&Jx[tri1.y], f2d1);
-            }
-            else {
-                atomicAddMat3(&Jx[tri1.y], f2d0.transpose());
-                atomicAddMat3(&Jx[tri1.z], x2_idx < x1_idx ? f2d1 : f2d1.transpose());
-            }
             auto f3d0 = Mat3::outer_product(theta_dp3, theta_dp0 * coef);
             auto f3d1 = Mat3::outer_product(theta_dp3, theta_dp1 * coef);
-            if ( x3_idx < x0_idx ) {
-                atomicAddMat3(&Jx[tri2.y], f3d0);
-                atomicAddMat3(&Jx[tri2.x], f3d1);
-            }
-            else {
-                atomicAddMat3(&Jx[tri2.x], f3d0.transpose());
-                atomicAddMat3(&Jx[tri2.z], x3_idx < x1_idx ? f3d1 : f3d1.transpose());
-            }
             auto f2d3 = Mat3::outer_product(theta_dp2, theta_dp3 * coef);
-            // atomicAddMat3(&Jx_bend_cross[i],p0_idx < p3_idx ? f0d3 : f0d3.transpose());
-            atomicAddMat3(&Jx_bend_cross[i], f2d3);
+            atomicAddMat3(&Jx[rows[0]], x0_idx < x1_idx ? f0d1 : f0d1.transpose());
+            atomicAddMat3(&Jx[rows[1]], x0_idx < x2_idx ? f2d0 : f2d0.transpose());
+            atomicAddMat3(&Jx[rows[2]], x1_idx < x2_idx ? f2d1 : f2d1.transpose());
+            atomicAddMat3(&Jx[rows[3]], x0_idx < x3_idx ? f3d0 : f3d0.transpose());
+            atomicAddMat3(&Jx[rows[4]], x1_idx < x3_idx ? f3d1 : f3d1.transpose());
+            atomicAddMat3(&Jx[rows[5]], x2_idx < x3_idx ? f2d3 : f2d3.transpose());
         }
     }
-    coef *= -(theta - rest_thetas[i]);
+    coef *= -(theta - bend_rest_theta[i]);
     if ( forces != nullptr ) {
-        atomicAddFloat3(&forces[x0_idx], theta_dp1 * coef);
-        atomicAddFloat3(&forces[x1_idx], theta_dp2 * coef);
-        atomicAddFloat3(&forces[x2_idx], theta_dp0 * coef);
+        atomicAddFloat3(&forces[x0_idx], theta_dp0 * coef);
+        atomicAddFloat3(&forces[x1_idx], theta_dp1 * coef);
+        atomicAddFloat3(&forces[x2_idx], theta_dp2 * coef);
         atomicAddFloat3(&forces[x3_idx], theta_dp3 * coef);
     }
 }
@@ -321,30 +307,25 @@ static __device__ void aogs_fp_diag(
 static __global__ void compute_dihedral_bending_AOGS(
     Mat3* Jx,
     Mat3* Jx_diag,
-    Mat3* Jx_bend_cross,
     float3* forces,
     const float3* __restrict__ vertices,
-    const int2* __restrict__ edges,
-    const int2* __restrict__ e2t,
-    const float* __restrict__ rest_thetas,
-    const int3* __restrict__ triangles,
-    const int2* __restrict__ edge_opposite_points,
-    const float* __restrict__ bending_factor,
-    int num_edges, float kb
+    const int4* __restrict__ bend_points,
+    const float* __restrict__ bend_rest_theta,
+    const float* __restrict__ bend_factor,
+    const char* __restrict__ bend_valid,
+    const int* __restrict__ bend_cross_rows,
+    int n, float kb
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if ( i >= num_edges ) return;
+    if ( i >= n ) return;
+    if ( !bend_valid[i] ) return; // boundary: no bending element
 
-    int2 p_op = edge_opposite_points[i];
-    if ( p_op.x == -1 || p_op.y == -1 ) return; // boundary: no bending element
-
-    int2 e_i = edges[i];
-    int x0_idx = e_i.x, x1_idx = e_i.y;   // hinge endpoints 
-    int x2_idx = p_op.x, x3_idx = p_op.y; // off-hinge vertices 
+    int4 pts = bend_points[i];
+    int x0_idx = pts.x, x1_idx = pts.y;   // hinge endpoints
+    int x2_idx = pts.z, x3_idx = pts.w;   // off-hinge vertices
 
     // ---- theta, gradient, and geometry in one pass ----
-    AOGSGeo geo;
-    float3 th_dp0, th_dp1, th_dp2, th_dp3;
+    AOGSGeo geo;    float3 th_dp0, th_dp1, th_dp2, th_dp3;
     float theta;
     get_theta_dpk_aogs(
         vertices[x0_idx], vertices[x1_idx], vertices[x2_idx], vertices[x3_idx],
@@ -352,8 +333,8 @@ static __global__ void compute_dihedral_bending_AOGS(
 
     // ---- forces: unchanged from the GN kernel ----
     // g = d psi / d theta = theta - rest_theta
-    float g = theta - rest_thetas[i];
-    float bending_k = kb * bending_factor[i];
+    float g = theta - bend_rest_theta[i];
+    float bending_k = kb * bend_factor[i];
     if ( forces != nullptr ) {
         float coef = -bending_k * g;
         atomicAddFloat3(&forces[x0_idx], th_dp0 * coef);
@@ -408,32 +389,19 @@ static __global__ void compute_dihedral_bending_AOGS(
     atomicAddMat3(&Jx_diag[x3_idx], calc_B(3, 3));
 
     if ( Jx ) {
-        auto [t1_i, t2_i] = e2t[i];
-        auto tri1 = triangles[t1_i]; // triangle (x0,x1,x2)
-        auto tri2 = triangles[t2_i]; // triangle (x0,x1,x3)
-
-        atomicAddMat3(&Jx[i], calc_B(0, 1));          // hinge (x0,x1)
-        atomicAddMat3(&Jx_bend_cross[i], calc_B(2, 3)); // cross (x2,x3)
-
-        Mat3 B20 = calc_B(2, 0), B21 = calc_B(2, 1);   // left triangle
-        if ( x2_idx < x0_idx ) {
-            atomicAddMat3(&Jx[tri1.x], B20);
-            atomicAddMat3(&Jx[tri1.y], B21);
-        }
-        else {
-            atomicAddMat3(&Jx[tri1.y], B20.transpose());
-            atomicAddMat3(&Jx[tri1.z], x2_idx < x1_idx ? B21 : B21.transpose());
-        }
-
-        Mat3 B30 = calc_B(3, 0), B31 = calc_B(3, 1);   // right triangle
-        if ( x3_idx < x0_idx ) {
-            atomicAddMat3(&Jx[tri2.y], B30);
-            atomicAddMat3(&Jx[tri2.x], B31);
-        }
-        else {
-            atomicAddMat3(&Jx[tri2.x], B30.transpose());
-            atomicAddMat3(&Jx[tri2.z], x3_idx < x1_idx ? B31 : B31.transpose());
-        }
+        const int* rows = bend_cross_rows + 6 * i;
+        // Every row exists in valid_pairs, stored normalized (min,max):
+        // one orientation rule covers natural and extension rows alike.
+        Mat3 B01 = calc_B(0, 1); // hinge (x0, x1)
+        Mat3 B20 = calc_B(2, 0), B21 = calc_B(2, 1);
+        Mat3 B30 = calc_B(3, 0), B31 = calc_B(3, 1);
+        Mat3 B23 = calc_B(2, 3); // apex pair (x2, x3)
+        atomicAddMat3(&Jx[rows[0]], x0_idx < x1_idx ? B01 : B01.transpose());
+        atomicAddMat3(&Jx[rows[1]], x0_idx < x2_idx ? B20 : B20.transpose());
+        atomicAddMat3(&Jx[rows[2]], x1_idx < x2_idx ? B21 : B21.transpose());
+        atomicAddMat3(&Jx[rows[3]], x0_idx < x3_idx ? B30 : B30.transpose());
+        atomicAddMat3(&Jx[rows[4]], x1_idx < x3_idx ? B31 : B31.transpose());
+        atomicAddMat3(&Jx[rows[5]], x2_idx < x3_idx ? B23 : B23.transpose());
     }
 
 }
@@ -486,25 +454,20 @@ static __global__ void precompute_IBM_Q(
 static __global__ void compute_quadratic_bending_IBM(
     Mat3* __restrict__ Jx,
     Mat3* __restrict__ Jx_diag,
-    Mat3* __restrict__ Jx_bend_cross,
     float3* __restrict__ forces,
     float* __restrict__ energys,
     const float4* __restrict__ IBM_q,
     const float3* __restrict__ vertices,
-    const int2* __restrict__ edges,
-    const int2* __restrict__ e2t,
-    const int3* __restrict__ triangles,
-    const int2* __restrict__ edge_opposite_points,
-    int num_edges, float kb
+    const int4* __restrict__ bend_points,
+    const char* __restrict__ bend_valid,
+    const int* __restrict__ bend_cross_rows,
+    int n, float kb
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if ( i >= num_edges ) return;
-    int2 p_op = edge_opposite_points[i];
-    if ( p_op.x == -1 || p_op.y == -1 ) return; // No need to calculate bending force at the boundary.
-    int2 e_i = edges[i];
-
-    int p0_idx = e_i.x, p1_idx = e_i.y;
-    int p2_idx = p_op.x, p3_idx = p_op.y;
+    if ( i >= n ) return;
+    if ( !bend_valid[i] ) return; // No need to calculate bending force at the boundary.
+    int4 p = bend_points[i];
+    int p0_idx = p.x, p1_idx = p.y, p2_idx = p.z, p3_idx = p.w;
     float3 x0 = vertices[p0_idx], x1 = vertices[p1_idx], x2 = vertices[p2_idx], x3 = vertices[p3_idx];
     float4 q = IBM_q[i];
     float3 qtX = x0 * q.x + x1 * q.y + x2 * q.z + x3 * q.w;
@@ -520,7 +483,6 @@ static __global__ void compute_quadratic_bending_IBM(
         atomicAddFloat3(&forces[p3_idx], -qtX * q.w);
     }
 
-    // These should be precomputed and are written here for completeness.
     if ( Jx_diag ) {
         atomicAddMat3(&Jx_diag[p0_idx], Mat3::identity(q.x * q.x * kb));
         atomicAddMat3(&Jx_diag[p1_idx], Mat3::identity(q.y * q.y * kb));
@@ -528,34 +490,20 @@ static __global__ void compute_quadratic_bending_IBM(
         atomicAddMat3(&Jx_diag[p3_idx], Mat3::identity(q.w * q.w * kb));
     }
     if ( Jx ) {
-        auto [t1_i, t2_i] = e2t[i];
-        auto t1 = triangles[t1_i];
-        auto t2 = triangles[t2_i];
+        const int* rows = bend_cross_rows + 6 * i;
+        // Every row exists in valid_pairs, stored normalized (min,max):
+        // one orientation rule covers natural and extension rows alike.
         auto f0d1 = Mat3::identity(q.x * q.y * kb);
-        atomicAddMat3(&Jx[i], f0d1);
-
-        auto f2d3 = Mat3::identity(q.z * q.w * kb);
-        atomicAddMat3(&Jx_bend_cross[i], f2d3);
-
         auto f0d2 = Mat3::identity(q.x * q.z * kb);
         auto f1d2 = Mat3::identity(q.y * q.z * kb);
         auto f0d3 = Mat3::identity(q.x * q.w * kb);
         auto f1d3 = Mat3::identity(q.y * q.w * kb);
-        if ( p0_idx > p2_idx ) {
-            atomicAddMat3(&Jx[t1.x], f0d2);
-            atomicAddMat3(&Jx[t1.y], f1d2);
-        }
-        else {
-            atomicAddMat3(&Jx[t1.y], f0d2);
-            atomicAddMat3(&Jx[t1.z], f1d2);
-        }
-        if ( p3_idx < p0_idx ) {
-            atomicAddMat3(&Jx[t2.y], f0d3);
-            atomicAddMat3(&Jx[t2.x], f1d3);
-        }
-        else {
-            atomicAddMat3(&Jx[t2.x], f0d3);
-            atomicAddMat3(&Jx[t2.z], f1d3);
-        }
+        auto f2d3 = Mat3::identity(q.z * q.w * kb);
+        atomicAddMat3(&Jx[rows[0]], p0_idx < p1_idx ? f0d1 : f0d1.transpose());
+        atomicAddMat3(&Jx[rows[1]], p0_idx < p2_idx ? f0d2 : f0d2.transpose());
+        atomicAddMat3(&Jx[rows[2]], p1_idx < p2_idx ? f1d2 : f1d2.transpose());
+        atomicAddMat3(&Jx[rows[3]], p0_idx < p3_idx ? f0d3 : f0d3.transpose());
+        atomicAddMat3(&Jx[rows[4]], p1_idx < p3_idx ? f1d3 : f1d3.transpose());
+        atomicAddMat3(&Jx[rows[5]], p2_idx < p3_idx ? f2d3 : f2d3.transpose());
     }
 }

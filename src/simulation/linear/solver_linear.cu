@@ -78,18 +78,18 @@ struct DotProductIterator {
         return ptr_a != other.ptr_a;
     }
 };
-void LinearSolver::init(int diag_size, int edge_size, bool Jx_nondiag_identity_only_) {
-    m_edge_size = edge_size;
+void LinearSolver::init(int diag_size, int nondiag_size, bool Jx_nondiag_identity_only_) {
+    m_edge_size = nondiag_size;
     m_diag_size = diag_size;
     Jx_nondiag_identity_only = Jx_nondiag_identity_only_;
     Jx_diag.resize(diag_size);
     if ( Jx_nondiag_identity_only ) {
-        Jx_nondiag_identity.resize(edge_size);
-        Jx_bend_cross_identity.resize(edge_size);
+        Jx_nondiag_identity.resize(nondiag_size);
+        Jx_bend_cross_identity.resize(nondiag_size);
     }
     else {
-        Jx_nondiag.resize(edge_size);
-        Jx_bend_cross.resize(edge_size);
+        Jx_nondiag.resize(nondiag_size);
+        // Jx_bend_cross.resize(nondiag_size);
     }
     M_inv.resize(diag_size);
 
@@ -167,50 +167,48 @@ __global__ void Jx_mult_x_diag_kernel(
 __global__ void A_mul_x_offdiag_kernel(
     float3* __restrict__ res,
     const Mat3* __restrict__ Jx_nondiag,
-    const Mat3* __restrict__ Jx_bend_cross,
     const float3* __restrict__ x,
-    const int2* __restrict__ edges,
-    const int2* __restrict__ edge_opposite_points,
+    const int2* __restrict__ valid_pairs,
     int n // edge size
 ) {
     for ( int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
           i += blockDim.x * gridDim.x ) {
-        auto [v0_i,v1_i] = edges[i];
+        auto [v0_i,v1_i] = valid_pairs[i];
 
         atomicAddFloat3(&res[v0_i], Jx_nondiag[i] * x[v1_i]);
         atomicAddFloat3(&res[v1_i], Jx_nondiag[i].transpose() * x[v0_i]);
 
-        auto p_op = edge_opposite_points[i];
-        if ( p_op.x != -1 && p_op.y != -1 ) {
-            atomicAddFloat3(&res[p_op.x], Jx_bend_cross[i] * x[p_op.y]);
-            atomicAddFloat3(&res[p_op.y], Jx_bend_cross[i].transpose() * x[p_op.x]);
-        }
+        // auto p_op = edge_opposite_points[i];
+        // if ( p_op.x != -1 && p_op.y != -1 ) {
+        //     atomicAddFloat3(&res[p_op.x], Jx_bend_cross[i] * x[p_op.y]);
+        //     atomicAddFloat3(&res[p_op.y], Jx_bend_cross[i].transpose() * x[p_op.x]);
+        // }
     }
 }
 
-__global__ void A_mul_x_offdiag_kernel(
-    float3* __restrict__ res,
-    const float* __restrict__ Jx_nondiag,
-    const float* __restrict__ Jx_bend_cross,
-    const float3* __restrict__ x,
-    const int2* __restrict__ edges,
-    const int2* __restrict__ edge_opposite_points,
-    int n // edge size
-) {
-    for ( int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
-          i += blockDim.x * gridDim.x ) {
-        auto [v0_i,v1_i] = edges[i];
-
-        atomicAddFloat3(&res[v0_i], Jx_nondiag[i] * x[v1_i]);
-        atomicAddFloat3(&res[v1_i], Jx_nondiag[i] * x[v0_i]);
-
-        auto p_op = edge_opposite_points[i];
-        if ( p_op.x != -1 && p_op.y != -1 ) {
-            atomicAddFloat3(&res[p_op.x], Jx_bend_cross[i] * x[p_op.y]);
-            atomicAddFloat3(&res[p_op.y], Jx_bend_cross[i] * x[p_op.x]);
-        }
-    }
-}
+// __global__ void A_mul_x_offdiag_kernel(
+//     float3* __restrict__ res,
+//     const float* __restrict__ Jx_nondiag,
+//     const float* __restrict__ Jx_bend_cross,
+//     const float3* __restrict__ x,
+//     const int2* __restrict__ edges,
+//     const int2* __restrict__ edge_opposite_points,
+//     int n // edge size
+// ) {
+//     for ( int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+//           i += blockDim.x * gridDim.x ) {
+//         auto [v0_i,v1_i] = edges[i];
+//
+//         atomicAddFloat3(&res[v0_i], Jx_nondiag[i] * x[v1_i]);
+//         atomicAddFloat3(&res[v1_i], Jx_nondiag[i] * x[v0_i]);
+//
+//         auto p_op = edge_opposite_points[i];
+//         if ( p_op.x != -1 && p_op.y != -1 ) {
+//             atomicAddFloat3(&res[p_op.x], Jx_bend_cross[i] * x[p_op.y]);
+//             atomicAddFloat3(&res[p_op.y], Jx_bend_cross[i] * x[p_op.x]);
+//         }
+//     }
+// }
 
 void LinearSolver::A_mult_x(
     float3* __restrict__ dst,
@@ -228,23 +226,21 @@ void LinearSolver::A_mult_x(
 
     n = m_edge_size;
     if ( Jx_nondiag_identity_only ) {
-        A_mul_x_offdiag_kernel<<<(n + threadsPerBlock - 1) / threadsPerBlock, threadsPerBlock>>>(
-            dst,
-            Jx_nondiag_identity.data().get(),
-            Jx_bend_cross_identity.data().get(),
-            src,
-            geo->edges.data().get(),
-            geo->edge_opposite_points.data().get(),
-            n);
+        // A_mul_x_offdiag_kernel<<<(n + threadsPerBlock - 1) / threadsPerBlock, threadsPerBlock>>>(
+        //     dst,
+        //     Jx_nondiag_identity.data().get(),
+        //     Jx_bend_cross_identity.data().get(),
+        //     src,
+        //     geo->edges.data().get(),
+        //     geo->edge_opposite_points.data().get(),
+        //     n);
     }
     else {
         A_mul_x_offdiag_kernel<<<(n + threadsPerBlock - 1) / threadsPerBlock, threadsPerBlock>>>(
             dst,
             Jx_nondiag.data().get(),
-            Jx_bend_cross.data().get(),
             src,
-            geo->edges.data().get(),
-            geo->edge_opposite_points.data().get(),
+            geo->valid_pairs.data().get(),
             n);
     }
 

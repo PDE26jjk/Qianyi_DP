@@ -16,7 +16,7 @@ struct LinearSolver {
     
     LinearSolver(Simulator* simulator): simulator(simulator) {}
     virtual void solve(float3* dx, const float3* rhs, int max_iters = 1000) = 0;
-    virtual void init(int diag_size, int edge_size, bool Jx_nondiag_identity_only);
+    virtual void init(int diag_size, int nondiag_size, bool Jx_nondiag_identity_only);
     void vector_field_dot(const float3* a, const float3* b, float* result);
     float vector_field_dot_sync(const float3* a, const float3* b);
 
@@ -28,7 +28,7 @@ struct LinearSolver {
     // 
     thrust::device_vector<Mat3> M_inv;
     // for bending opposite point pairs
-    thrust::device_vector<Mat3> Jx_bend_cross;
+    // thrust::device_vector<Mat3> Jx_bend_cross;
 
     thrust::device_vector<float> Jx_nondiag_identity;
     thrust::device_vector<float> Jx_bend_cross_identity;

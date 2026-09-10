@@ -5,6 +5,33 @@
 #include "common/geometric_algorithms.h"
 #include "lbvh.cuh"
 
+// True when triangle vertex f belongs to the exclusion set of vertex v's
+// stitch cluster: a cluster member, or 1-ring edge-adjacent to one.
+static __device__ __forceinline__ bool seam_cluster_excludes(
+    int v, int f,
+    const int* __restrict__ cluster_id,
+    const int2* __restrict__ cluster_lookup,
+    const int* __restrict__ cluster_members,
+    const int2* __restrict__ edge_lookup,
+    const int2* __restrict__ dir_edges
+) {
+    int cid = cluster_id[v];
+    if ( cid < 0 ) return false;
+    if ( cluster_id[f] == cid ) return true;
+    int2 range = cluster_lookup[cid];
+    for ( int k = range.x; k < range.x + range.y; k++ ) {
+        int2 er = edge_lookup[cluster_members[k]];
+        for ( int d = 0; d < er.y; d++ )
+            if ( dir_edges[er.x + d].x == f ) return true;
+    }
+    return false;
+}
+static __device__ __forceinline__ bool same_stitch_cluster(
+    int u, int v, const int* __restrict__ cluster_id
+) {
+    return cluster_id[u] >= 0 && cluster_id[u] == cluster_id[v];
+}
+
 static __global__ void query_vf_pairs_simple_kernel(
     const unsigned int* __restrict__ sorted_indices,
     unsigned int num_queries,
@@ -168,6 +195,11 @@ static __global__ void query_vf_pairs_capsule_kernel(
     const int* __restrict__ vertices_obj,
     const float query_radius,
     const float3* __restrict__ pos_target,
+    const int* __restrict__ cluster_id,
+    const int2* __restrict__ cluster_lookup,
+    const int* __restrict__ cluster_members,
+    const int2* __restrict__ edge_lookup,
+    const int2* __restrict__ dir_edges,
     int* __restrict__ query_results,
     const int active_vertices_size,
     int result_size
@@ -191,7 +223,13 @@ static __global__ void query_vf_pairs_capsule_kernel(
         int3 f = faces[prim_idx];
         if ( f.x == i || f.y == i || f.z == i ) continue;
         if (!is_active && f.x >= active_vertices_size) continue;
-
+        // Seam exclusion: skip triangles adjacent (cluster members or
+        // their 1-ring) to the query vertex's stitch cluster.
+        if ( is_active && cluster_id[i] >= 0 && (
+             seam_cluster_excludes(i, f.x, cluster_id, cluster_lookup, cluster_members, edge_lookup, dir_edges) ||
+             seam_cluster_excludes(i, f.y, cluster_id, cluster_lookup, cluster_members, edge_lookup, dir_edges) ||
+             seam_cluster_excludes(i, f.z, cluster_id, cluster_lookup, cluster_members, edge_lookup, dir_edges)) )
+            continue;
         float3 A0 = pos[f.x], A1 = pos_target[f.x];
         float3 B0 = pos[f.y], B1 = pos_target[f.y];
         float3 C0 = pos[f.z], C1 = pos_target[f.z];
@@ -234,6 +272,7 @@ static __global__ void query_ee_pairs_capsule_kernel(
     const float3* __restrict__ pos_target,
     const float3* __restrict__ edge_normals,
     const int active_vertices_size,
+    const int* __restrict__ cluster_id,
     int* __restrict__ query_results,
     int result_size
 ) {
@@ -279,6 +318,10 @@ static __global__ void query_ee_pairs_capsule_kernel(
         bool is_e_active = e.x < active_vertices_size;
         if (!is_active && !is_e_active) continue;
         if (edge.x == e.x || edge.x == e.y || edge.y == e.x || edge.y == e.y) continue;
+        if ( is_active && is_e_active && (
+         same_stitch_cluster(edge.x, e.x, cluster_id) || same_stitch_cluster(edge.x, e.y, cluster_id) ||
+         same_stitch_cluster(edge.y, e.x, cluster_id) || same_stitch_cluster(edge.y, e.y, cluster_id)) )
+                continue;
         int e_obj = vertices_obj[e.x];
         const auto& od_e2 = obj_data[e_obj];
         
@@ -323,9 +366,11 @@ static __global__ void query_ef_pairs_kernel(
     const ObjectDataInput* __restrict__ obj_data,
     const int* __restrict__ vertices_obj,
     const int3* __restrict__ tris,
+    const int* __restrict__ cluster_id,
     unsigned int root_idx,
     float query_radius,
     int*__restrict__ query_results,
+    int active_vertices_size,
     int result_size
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -342,6 +387,10 @@ static __global__ void query_ef_pairs_kernel(
         int3 tri = tris[prim_idx];
         if (edge.x == tri.x || edge.x == tri.y || edge.x == tri.z ||
             edge.y == tri.x || edge.y == tri.y || edge.y == tri.z) continue;
+        if ( edge.x < active_vertices_size && (
+             same_stitch_cluster(edge.x, tri.x, cluster_id) || same_stitch_cluster(edge.x, tri.y, cluster_id) || same_stitch_cluster(edge.x, tri.z, cluster_id) ||
+             same_stitch_cluster(edge.y, tri.x, cluster_id) || same_stitch_cluster(edge.y, tri.y, cluster_id) || same_stitch_cluster(edge.y, tri.z, cluster_id)) )
+            continue;
         query_result[++query_count] = prim_idx;
         );
 }

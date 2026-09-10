@@ -2,7 +2,7 @@
 #include "common/vec_math.h"
 #include "common/atomic_utils.cuh"
 
-constexpr float base_spring_stiffness = 4e2; // empirical global stiffness factor
+constexpr float base_spring_stiffness = 8e2; // empirical global stiffness factor
 constexpr float base_fem_stiffness = base_spring_stiffness * 3.4641f; // 2*3^0.5, Approximation of an equilateral triangle
 
 
@@ -153,6 +153,7 @@ static __global__ void compute_BW_FEM(
     const int3* __restrict__ triangle_edges,
     const int2* __restrict__ edges,
     const Mat2* __restrict__ Dms,
+    const float* __restrict__ areas,
     const ObjectDataInput* __restrict__ obj_data,
     const int* __restrict__ vertices_obj,
     int num_triangles
@@ -160,10 +161,12 @@ static __global__ void compute_BW_FEM(
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if ( i >= num_triangles )
         return;
+    float area = areas[i];
+    if ( area <= 0.f ) return; // collapsed dart triangle (seam cluster)
 
     Mat2 Dm = Dms[i];
     float Dm_det = Dm.det();
-    float area = fabs(Dm_det) * 0.5f;
+    // float area = fabs(Dm_det) * 0.5f;
     Mat2 Dm_inv = Dm.inverse();
 
     auto tri_edges = triangle_edges[i];

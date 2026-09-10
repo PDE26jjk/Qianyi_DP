@@ -218,7 +218,7 @@ void SolverPDNewton::init() {
     }
     auto& params = *simulator->get_geo_params();
     auto* geo = simulator->get_geo();
-    linear->init(params.nb_all_cloth_vertices, params.nb_all_cloth_edges, false);
+    linear->init(params.nb_all_cloth_vertices, (int)geo->valid_pairs.size(), false);
 
     dx.resize(params.nb_all_vertices);
 
@@ -309,7 +309,6 @@ void SolverPDNewton::step(float h) {
     int3* tris = geo->triangle_indices.data().get();
     int2* e2t = geo->e2t.data().get();
     int2* eop = geo->edge_opposite_points.data().get();
-    float* rest_thetas = geo->rest_thetas.data().get();
     char* mask = geo->vertices_mask.data().get();
     float* mass = geo->masses.data().get();
     float* mass_inv = geo->mass_inv.data().get();
@@ -320,7 +319,6 @@ void SolverPDNewton::step(float h) {
     Mat3* Jx_diag = linear->Jx_diag.data().get();
     Mat3* M_inv = linear->M_inv.data().get();
     Mat3* Jx_nondiag = linear->Jx_nondiag.data().get();
-    Mat3* Jx_bending_cross = linear->Jx_bend_cross.data().get();
     float* static_diags = geo->static_diags.data().get();
     cudaMemcpyAsync(static_diags, Jx_diag_pd, n * sizeof(float), cudaMemcpyDeviceToDevice);
     float mask_stiff = max(0.f, get_global_parameter("mask_stiff", 1e2f));
@@ -350,14 +348,12 @@ void SolverPDNewton::step(float h) {
             f, Jx_diag, static_diags, max_force_scale, n);
 
         step_begin_pd<<<(n + block - 1) / block, block>>>(f, q_inertia, q, mass, h, n);
+        // Row space = valid_pairs (natural edges + deduped bend pairs);
+        // clear the whole table every iteration, not just the edge part.
+        cudaMemsetAsync(Jx_nondiag, 0,
+            sizeof(Mat3) * geo->valid_pairs.size());
         n = params.nb_all_cloth_edges;
-        cudaMemsetAsync(Jx_nondiag, 0, sizeof(Mat3) * n);
-        cudaMemsetAsync(Jx_bending_cross, 0, sizeof(Mat3) * n);
-        // preprocessing_nondiag<<<(n + block - 1) / block, block>>>(
-        //     Jx_nondiag, Jx_nondiag_pd, n);
-        // cudaMemsetAsync(Jx_bend_cross, 0, sizeof(Mat3) * n);
-        // compute_constraint();
-        geo->accumulate_sewing_force(Jx_diag, Jx_nondiag);
+        geo->accumulate_sewing_force(Jx_diag);
         if ( geo->constitutive_model == ConstitutiveModel::SpringMass ) {
             accumulate_spring_forces<<<(n + block - 1) / block, block>>>(
                 Jx_nondiag, Jx_diag, f_elastic, nullptr, q, edges,
@@ -369,32 +365,41 @@ void SolverPDNewton::step(float h) {
             n = params.nb_all_cloth_triangles;
             compute_BW_FEM<<<(n + block - 1) / block, block>>>(
                 Jx_nondiag, Jx_diag, f_elastic, nullptr, q, tri_edges,
-                edges,geo->Dms.data().get(),
+                edges, geo->Dms.data().get(), geo->areas.data().get(),
                 obj_data, vertices_obj,
                 n);
         }
 
-        n = params.nb_all_cloth_edges;
+        n = params.nb_all_cloth_edges + params.nb_all_stitches;
         if ( geo->bending_model == BendingModel::IBM_quadratic )
             compute_quadratic_bending_IBM<<< (n + block - 1) / block, block>>>(
-                Jx_nondiag, Jx_diag, Jx_bending_cross,
+                Jx_nondiag, Jx_diag,
                 f, nullptr,
                 geo->IBM_q.data().get(),
-                q, edges, e2t, tri_edges, eop,
+                q,
+                geo->bend_points.data().get(),
+                geo->bend_valid.data().get(),
+                geo->bend_cross_rows.data().get(),
                 n, bending_k);
         else if ( geo->bending_model == BendingModel::DiscreteShells_GN )
-            compute_dihedral_bending_GN<<<(n + block - 1), block>>>(
-                Jx_nondiag, Jx_diag, Jx_bending_cross,
-                f, q, edges, e2t, rest_thetas,
-                tri_edges, eop,
-                geo->bending_factor.data().get(),
+            compute_dihedral_bending_GN<<<(n + block - 1) / block, block>>>(
+                Jx_nondiag, Jx_diag,
+                f, q,
+                geo->bend_points.data().get(),
+                geo->bend_rest_theta.data().get(),
+                geo->bend_factor.data().get(),
+                geo->bend_valid.data().get(),
+                geo->bend_cross_rows.data().get(),
                 n, bending_k);
         else if ( geo->bending_model == BendingModel::DiscreteShells_AOGS )
-            compute_dihedral_bending_AOGS<<<(n + block - 1), block>>>(
-                Jx_nondiag, Jx_diag, Jx_bending_cross,
-                f, q, edges, e2t, rest_thetas,
-                tri_edges, eop,
-                geo->bending_factor.data().get(),
+            compute_dihedral_bending_AOGS<<<(n + block - 1) / block, block>>>(
+                Jx_nondiag, Jx_diag,
+                f, q,
+                geo->bend_points.data().get(),
+                geo->bend_rest_theta.data().get(),
+                geo->bend_factor.data().get(),
+                geo->bend_valid.data().get(),
+                geo->bend_cross_rows.data().get(),
                 n, bending_k);
 
         n = params.nb_all_cloth_vertices;
@@ -407,7 +412,7 @@ void SolverPDNewton::step(float h) {
         linear->solve(dx, f, linear_iters);
         step_end_linear<<<(n + block - 1) / block, block>>>(
             q, dx, q_pred, q_prev, query_radius, mask, n);
-        // CUDA_CHECK(cudaDeviceSynchronize());
+        geo->project_stitches(); // seam coincidence projection (once per iter)
     }
     // try to do penetration correction
     iters = max(0, (int)get_global_parameter("pc_iters", 2));
@@ -444,5 +449,5 @@ void SolverPDNewton::step(float h) {
     cudaMemcpyAsync(v_prev, v, n * sizeof(float3), cudaMemcpyDeviceToDevice);
     step_end_kernel<<<(n + block - 1) / block, block>>>(
         q, v, q_prev, mask, obj_data, vertices_obj, h, max_vel, geo->ground, ground_f, n);
-    // CUDA_CHECK(cudaDeviceSynchronize());
+    // geo->average_stitch_cluster_velocities(); // drop the snap velocity kick
 }

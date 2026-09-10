@@ -100,6 +100,11 @@ void Contact::collision_detect_broad_phase(const float3* pos, const float3* pos_
         thrust::raw_pointer_cast(geo->vertices_obj.data()),
         query_radius,
         pos_target,
+        thrust::raw_pointer_cast(geo->stitch_cluster_id.data()),
+        thrust::raw_pointer_cast(geo->stitch_cluster_lookup.data()),
+        thrust::raw_pointer_cast(geo->stitch_cluster_members.data()),
+        thrust::raw_pointer_cast(geo->edge_lookup.data()),
+        thrust::raw_pointer_cast(geo->dir_edges.data()),
         thrust::raw_pointer_cast(broad_phase_vf.data()),
         params.nb_all_cloth_vertices,
         broad_phase_size
@@ -121,6 +126,7 @@ void Contact::collision_detect_broad_phase(const float3* pos, const float3* pos_
         pos_target,
         thrust::raw_pointer_cast(geo->edge_normals.data()),
         params.nb_all_cloth_vertices,
+        thrust::raw_pointer_cast(geo->stitch_cluster_id.data()),
         thrust::raw_pointer_cast(broad_phase_ee.data()),
         broad_phase_size
         );
@@ -136,9 +142,11 @@ void Contact::collision_detect_broad_phase(const float3* pos, const float3* pos_
             thrust::raw_pointer_cast(geo->obj_data.data()),
             thrust::raw_pointer_cast(geo->vertices_obj.data()),
             thrust::raw_pointer_cast(geo->triangle_indices.data()),
+            thrust::raw_pointer_cast(geo->stitch_cluster_id.data()),
             tri_bvh.root_idx,
             query_radius,
             thrust::raw_pointer_cast(broad_phase_ef.data()),
+            params.nb_all_cloth_vertices,
             broad_phase_size
             );
 }
