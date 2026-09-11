@@ -150,6 +150,7 @@ void Simulator::clear_picker() {
 }
 void Simulator::set_parameter(const std::string& key, float value) {
     m_parameters[key] = value;
+    m_parameter_version += 1;
 }
 float Simulator::get_parameter(const std::string& key, float default_value) const {
     auto it = m_parameters.find(key);

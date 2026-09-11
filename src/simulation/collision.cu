@@ -73,6 +73,9 @@ void Contact::init() {
     lbvh3d::initialize(max(params.nb_all_triangles, params.nb_all_edges));
     // rebuild_bvh();
     do_collision_detect_broad_phase_before_step = true;
+    // Query streams are created lazily on first use (see
+    // collision_detect_broad_phase) so runs that never enable the
+    // overlap path pay nothing.
     int h_debug_e_id = (int)geo->get_global_parameter("debug_e_id", -1);
     int h_debug_v_id = (int)geo->get_global_parameter("debug_v_id", -1);
     cudaMemcpyToSymbol((const void*)&debug_e_id, &h_debug_e_id, sizeof(int));
@@ -87,8 +90,34 @@ void Contact::collision_detect_broad_phase(const float3* pos, const float3* pos_
     auto& params = geo->params;
     int num_queries = params.nb_all_vertices;
     int threadsPerBlock = 256;
+    // Overlap the three broad-phase queries on separate streams: they read
+    // the same BVHs but write disjoint candidate buffers, and each query
+    // alone leaves the SMs under-utilized (measured 30-35% achieved
+    // occupancy with 2-29% L1 throughput), so co-scheduling them hides a
+    // large part of the traversal latency. `bvh_streams=0` restores the
+    // sequential launches for A/B comparison.
+    const bool overlap_queries = ef && geo->get_global_parameter("bvh_streams", 1.f) > 0.5f;
+    const int query_count = ef ? 3 : 2;
+    if ( overlap_queries && query_streams[0] == nullptr ) {
+        for ( int i = 0; i < 3; ++i )
+            CUDA_CHECK(cudaStreamCreateWithFlags(&query_streams[i], cudaStreamNonBlocking));
+        CUDA_CHECK(cudaEventCreateWithFlags(&query_fork, cudaEventDisableTiming));
+        for ( int i = 0; i < 3; ++i )
+            CUDA_CHECK(cudaEventCreateWithFlags(&query_join[i], cudaEventDisableTiming));
+    }
+    if ( overlap_queries ) {
+        // Fork: every query stream waits for work queued so far on the
+        // default stream (refits, position updates).
+        CUDA_CHECK(cudaEventRecord(query_fork, 0));
+        for ( int i = 0; i < query_count; ++i )
+            CUDA_CHECK(cudaStreamWaitEvent(query_streams[i], query_fork, 0));
+    }
+    const cudaStream_t s_vf = overlap_queries ? query_streams[0] : (cudaStream_t)0;
+    const cudaStream_t s_ee = overlap_queries ? query_streams[1] : (cudaStream_t)0;
+    const cudaStream_t s_ef = overlap_queries ? query_streams[2] : (cudaStream_t)0;
 
-    query_vf_pairs_capsule_kernel<<<(num_queries + threadsPerBlock - 1) / threadsPerBlock, threadsPerBlock>>>(
+    const auto vf_grid = (num_queries + threadsPerBlock - 1) / threadsPerBlock;
+    query_vf_pairs_capsule_kernel<<<vf_grid, threadsPerBlock, 0, s_vf>>>(
         point_sorted_indices.data().get(),
         num_queries,
         thrust::raw_pointer_cast(tri_bvh.nodes.data()),
@@ -111,7 +140,8 @@ void Contact::collision_detect_broad_phase(const float3* pos, const float3* pos_
         );
     num_queries = params.nb_all_edges;
 
-    query_ee_pairs_capsule_kernel<<<(num_queries + threadsPerBlock - 1) / threadsPerBlock, threadsPerBlock>>>(
+    const auto ee_grid = (num_queries + threadsPerBlock - 1) / threadsPerBlock;
+    query_ee_pairs_capsule_kernel<<<ee_grid, threadsPerBlock, 0, s_ee>>>(
         pos,
         thrust::raw_pointer_cast(geo->pos_2D.data()),
         edge_sorted_rank.data().get(),
@@ -129,10 +159,11 @@ void Contact::collision_detect_broad_phase(const float3* pos, const float3* pos_
         thrust::raw_pointer_cast(geo->stitch_cluster_id.data()),
         thrust::raw_pointer_cast(broad_phase_ee.data()),
         broad_phase_size
+        , (int)geo->get_global_parameter("bvh_query_order", 1.f)
         );
     // edges vs faces
     if ( ef )
-        query_ef_pairs_kernel<<<(num_queries + threadsPerBlock - 1) / threadsPerBlock, threadsPerBlock>>>(
+        query_ef_pairs_kernel<<<ee_grid, threadsPerBlock, 0, s_ef>>>(
             thrust::raw_pointer_cast(edge_bvh.aabbs.data()),
             thrust::raw_pointer_cast(edge_bvh.nodes.data()),
             num_queries,
@@ -149,6 +180,14 @@ void Contact::collision_detect_broad_phase(const float3* pos, const float3* pos_
             params.nb_all_cloth_vertices,
             broad_phase_size
             );
+    if ( overlap_queries ) {
+        // Join: make the candidate buffers visible to the default stream
+        // before the narrow phase consumes them.
+        for ( int i = 0; i < query_count; ++i ) {
+            CUDA_CHECK(cudaEventRecord(query_join[i], query_streams[i]));
+            CUDA_CHECK(cudaStreamWaitEvent((cudaStream_t)0, query_join[i], 0));
+        }
+    }
 }
 void Contact::collision_detect_prepare() {
     if ( geo->simulator->frame % 20 == 0 ) {
@@ -726,7 +765,8 @@ __global__ void solve_untangling_kernel(
         }
     }
 }
-void Contact::accumulate_contact_force(float3* forces, Mat3* Jx_diag, float h) {
+void Contact::accumulate_contact_force(float3* forces, Mat3* Jx_diag, float h,
+    cudaStream_t stream) {
     auto& params = geo->params;
     int num_vertices = params.nb_all_vertices;
     int num_edges = params.nb_all_edges;
@@ -748,7 +788,7 @@ void Contact::accumulate_contact_force(float3* forces, Mat3* Jx_diag, float h) {
     // CHECK(edge_opposite_points, int2);
     // #undef CHECK
     int cloth_vertices = params.nb_all_cloth_vertices;
-    compute_vf_force<<<(num_vertices + threadsPerBlock - 1) / threadsPerBlock, threadsPerBlock>>>(
+    compute_vf_force<<<(num_vertices + threadsPerBlock - 1) / threadsPerBlock, threadsPerBlock, 0, stream>>>(
         forces,
         Jx_diag,
         broad_phase_vf.data().get(),
@@ -767,7 +807,7 @@ void Contact::accumulate_contact_force(float3* forces, Mat3* Jx_diag, float h) {
         friction_slip_eps,
         num_vertices
         );
-    compute_ee_force<<<(num_edges + threadsPerBlock - 1) / threadsPerBlock, threadsPerBlock>>>(
+    compute_ee_force<<<(num_edges + threadsPerBlock - 1) / threadsPerBlock, threadsPerBlock, 0, stream>>>(
         forces,
         Jx_diag,
         broad_phase_ee.data().get(),
@@ -783,7 +823,7 @@ void Contact::accumulate_contact_force(float3* forces, Mat3* Jx_diag, float h) {
         ee_force_k, friction_slip_eps, num_edges
         );
 
-    solve_untangling_kernel<<<(num_edges + threadsPerBlock - 1) / threadsPerBlock, threadsPerBlock>>>(
+    solve_untangling_kernel<<<(num_edges + threadsPerBlock - 1) / threadsPerBlock, threadsPerBlock, 0, stream>>>(
         geo->pos_world.data().get(),
         geo->triangle_indices.data().get(),
         geo->edges.data().get(),

@@ -120,7 +120,8 @@ void LinearSolver::vector_field_dot(const float3* a, const float3* b, float* res
         temp_bytes,
         iter,
         result,
-        n);
+        n,
+        m_work_stream);
 
 }
 
@@ -218,7 +219,7 @@ void LinearSolver::A_mult_x(
     int threadsPerBlock = 256;
     int n = m_diag_size;
 
-    Jx_mult_x_diag_kernel<<<(n + threadsPerBlock - 1) / threadsPerBlock, threadsPerBlock>>>(
+    Jx_mult_x_diag_kernel<<<(n + threadsPerBlock - 1) / threadsPerBlock, threadsPerBlock, 0, m_work_stream>>>(
         dst,
         Jx_diag.data().get(),
         src,
@@ -236,7 +237,7 @@ void LinearSolver::A_mult_x(
         //     n);
     }
     else {
-        A_mul_x_offdiag_kernel<<<(n + threadsPerBlock - 1) / threadsPerBlock, threadsPerBlock>>>(
+        A_mul_x_offdiag_kernel<<<(n + threadsPerBlock - 1) / threadsPerBlock, threadsPerBlock, 0, m_work_stream>>>(
             dst,
             Jx_nondiag.data().get(),
             src,

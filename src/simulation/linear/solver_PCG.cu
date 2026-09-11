@@ -8,6 +8,16 @@
 
 #include "simulation/geometry.cuh"
 
+// Device-side replacement for the per-solve blocking residual read: a solve
+// that produced a non-finite coefficient raises a sticky flag instead of
+// synchronising the stream, which keeps the solve capturable by a CUDA graph.
+static __global__ void raise_failure_flag_if_nan_kernel(
+    const float* __restrict__ value,
+    int* __restrict__ flag
+) {
+    if ( isnan(*value) || isinf(*value) ) *flag = 1;
+}
+
 
 void SolverPCG::init(int diag_size, int edge_size,bool Jx_nondiag_identity_only, bool use_preconditioner_) {
     use_preconditioner = use_preconditioner_;
@@ -18,6 +28,7 @@ void SolverPCG::init(int diag_size, int edge_size,bool Jx_nondiag_identity_only,
     z.resize(diag_size);
 
     temp1.resize(6);
+    failure_flag.assign(1, 0);
 
 }
 template<bool UsePreprocessingDiag>
@@ -247,7 +258,7 @@ void SolverPCG::solve_impl(float3* dx, const float3* rhs, int max_iters) {
 
     A_mult_x(Ax, x);
     // r = b - A @ x; d = r || r = b - A @ x; z = M^{-1} @ r; d = z;
-    before_ite_kernel<UsePreprocessingDiag> <<<blocksPerGrid, block >>>(
+    before_ite_kernel<UsePreprocessingDiag> <<<blocksPerGrid, block, 0, work_stream() >>>(
         r, d, z, b, M_inv, Ax, n);
 
     float delta_new_host;
@@ -258,10 +269,15 @@ void SolverPCG::solve_impl(float3* dx, const float3* rhs, int max_iters) {
     int max_try = 10;
     for ( ; iter < max_iters; ++iter ) {
         cudaMemcpyAsync(d_delta_old_ptr, d_delta_new_ptr, sizeof(float),
-            cudaMemcpyDeviceToDevice);
+            cudaMemcpyDeviceToDevice, work_stream());
         // Ad = A @ d
         A_mult_x(Ad, d);
-        if ( iter > 5 && iter % check_interval == 0 ) {
+        // The diagnostics read scalars back to the host, which a capture
+        // region cannot contain; skip them while the stream is capturing.
+        cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+        cudaStreamIsCapturing(work_stream(), &capture_status);
+        if ( capture_status == cudaStreamCaptureStatusNone
+            && iter > 5 && iter % check_interval == 0 ) {
             cudaMemcpy(&delta_new_host, d_delta_new_ptr, sizeof(float), cudaMemcpyDeviceToHost);
             if ( delta_new_host < 1e-5f || isnan(delta_new_host) ) {
                 break;
@@ -316,32 +332,44 @@ void SolverPCG::solve_impl(float3* dx, const float3* rhs, int max_iters) {
         vector_field_dot(d, Ad, d_dot_Ad_ptr);
 
         // alpha = (r^T * r || z) / dot(d, Ad)
-        compute_alpha_kernel<<<1, 1>>>(d_alpha_ptr, d_delta_old_ptr, d_dot_Ad_ptr);
+        compute_alpha_kernel<<<1, 1, 0, work_stream()>>>(d_alpha_ptr, d_delta_old_ptr, d_dot_Ad_ptr);
 
         // x^{i+1} = x^{i} + alpha * d
         // r^{i+1} = r^{i} + alpha * Ad
         // || z^{i+1} = M^{-1} @ r^{i+1}
-        ite_kernel1<UsePreprocessingDiag> <<<blocksPerGrid, block >>>(
+        ite_kernel1<UsePreprocessingDiag> <<<blocksPerGrid, block, 0, work_stream() >>>(
             r, x, z, d, Ad, M_inv, d_alpha_ptr, n);
 
         vector_field_dot(r, UsePreprocessingDiag ? z : r, d_delta_new_ptr);
 
         // beta = delta_new / delta_old
-        compute_beta_kernel<<<1, 1>>>(d_beta_ptr, d_delta_new_ptr, d_delta_old_ptr);
+        compute_beta_kernel<<<1, 1, 0, work_stream()>>>(d_beta_ptr, d_delta_new_ptr, d_delta_old_ptr);
 
         // d^{i+1} = r^{i+1} + beta * d^{i} || d^{i+1} = z^{i+1} + beta * d^{i}
-        ite_kernel2<<<blocksPerGrid, block>>>(
+        ite_kernel2<<<blocksPerGrid, block, 0, work_stream()>>>(
             d, UsePreprocessingDiag ? z : r, d_beta_ptr, n);
 
     }
 
-    cudaMemcpy(&delta_new_host, d_delta_new_ptr, sizeof(float), cudaMemcpyDeviceToHost);
-
-    if ( isnan(delta_new_host) ) {
-        print_debug(rhs);
-        std::cout << "PCG ended with NaN residual." << std::endl;
-        throw std::exception("PCG nan");
+    // The residual check is deferred to the device: a blocking read here would
+    // drain the stream once per solve and make the solve uncapturable. The
+    // caller consumes the sticky flag once per frame instead.
+    if ( !failure_flag.empty() ) {
+        raise_failure_flag_if_nan_kernel<<<1, 1, 0, work_stream()>>>(
+            d_delta_new_ptr, failure_flag.data().get());
     }
+}
+
+bool SolverPCG::consume_failure_flag() {
+    if ( failure_flag.empty() ) return false;
+    int host_flag = 0;
+    cudaMemcpy(&host_flag, failure_flag.data().get(), sizeof(int),
+        cudaMemcpyDeviceToHost);
+    if ( host_flag != 0 ) {
+        cudaMemsetAsync(failure_flag.data().get(), 0, sizeof(int));
+        return true;
+    }
+    return false;
 }
 template void SolverPCG::solve_impl<true>(float3* dx, const float3* rhs, int max_iters);
 template void SolverPCG::solve_impl<false>(float3* dx, const float3* rhs, int max_iters);

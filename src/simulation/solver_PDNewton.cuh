@@ -1,6 +1,8 @@
 #pragma once
 #include "solver_base.cuh"
 
+#include <cstdint>
+#include <cuda_runtime.h>
 #include <thrust/device_vector.h>
 
 #include "linear/solver_linear.cuh"
@@ -24,6 +26,15 @@ private:
     thrust::device_vector<float3> subspace_rhs;
     thrust::device_vector<float3> subspace_dy;
     SolverSubspace* subspace_solver = nullptr;
+    // Captured Projective-Dynamics iteration (`pd_cuda_graph`), plus the key
+    // that says when the capture still matches the buffers and parameters it
+    // was recorded with. See SolverPDNewton::step.
+    cudaGraphExec_t iter_graph_exec = nullptr;
+    uint64_t iter_graph_key = 0;
+    bool iter_graph_broken = false;
+    // Fork/join between the legacy stream and the iteration's own stream.
+    cudaEvent_t stream_fork = nullptr;
+    cudaEvent_t stream_join = nullptr;
 };
 struct SolverSubspace : SolverPCG {
     SolverSubspace(Simulator* simulator): SolverPCG(simulator) {}

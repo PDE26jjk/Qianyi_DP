@@ -130,6 +130,10 @@ public:
     // set parameters
     void set_parameter(const std::string& key, float value);
     float get_parameter(const std::string& key, float default_value) const;
+    // Bumped by every set_parameter call. Callers that bake host parameters
+    // into a captured CUDA graph (see pd_cuda_graph) watch this to know when
+    // the capture has to be rebuilt.
+    uint64_t parameter_version() const { return m_parameter_version; }
     void update_world_matrix(int obj_index, const std::vector<float>& matrix);
     std::vector<std::string> get_all_solver();
     void update_local_vertices(int obj_index, const std::vector<float>& vertices);
@@ -145,6 +149,7 @@ private:
     SolverBase* m_solver;
     Geometry* m_geo;
     std::unordered_map<std::string, float> m_parameters;
+    uint64_t m_parameter_version = 0;
     std::string m_last_solver_name;
     std::string m_solver_name = "PDNewton";
     void create_solver();

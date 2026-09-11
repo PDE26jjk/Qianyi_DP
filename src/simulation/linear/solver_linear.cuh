@@ -19,6 +19,18 @@ struct LinearSolver {
     virtual void init(int diag_size, int nondiag_size, bool Jx_nondiag_identity_only);
     void vector_field_dot(const float3* a, const float3* b, float* result);
     float vector_field_dot_sync(const float3* a, const float3* b);
+    // True when solve() issues no blocking host read, so the launch sequence
+    // can be recorded into a CUDA graph. See SolverPDNewton's pd_cuda_graph.
+    virtual bool graph_capture_safe() const { return false; }
+    // Sticky device-side failure flag, raised instead of throwing mid-solve.
+    // Returns true (and clears the flag) if a solve has failed since the last
+    // call. Read once per frame, outside any capture region.
+    virtual bool consume_failure_flag() { return false; }
+    // Stream the solve's kernels are issued on. SolverPDNewton sets this to
+    // the iteration's own stream so the whole iteration can be recorded as a
+    // CUDA graph (the legacy stream cannot be captured on this driver).
+    cudaStream_t work_stream() const { return m_work_stream; }
+    void set_work_stream(cudaStream_t s) { m_work_stream = s; }
 
     Simulator* simulator;
     // second derivative (Hessian matrix) of constraints/energy or negative Jacobian matrix of forces, stored per edge, excluding diagonal. It should be symmetrical, so only half of matrix is stored.
@@ -36,6 +48,7 @@ struct LinearSolver {
 protected:
     int m_edge_size;
     int m_diag_size;
+    cudaStream_t m_work_stream = 0;
     bool Jx_nondiag_identity_only;
     virtual void A_mult_x(
         float3* __restrict__ dst,
@@ -71,8 +84,13 @@ struct SolverPCG : LinearSolver {
     thrust::device_vector<float3> z;
 
     thrust::device_vector<float> temp1;
+    // size: 1 -- sticky NaN flag, set on device, read by the caller
+    thrust::device_vector<int> failure_flag;
     float extra_stiff;
     float projection_limit;
+
+    bool graph_capture_safe() const override { return true; }
+    bool consume_failure_flag() override;
 
 private:
     bool use_preconditioner;
@@ -91,3 +109,4 @@ struct SolverJacobi : LinearSolver {
     thrust::device_vector<float3> r;
     thrust::device_vector<float3> Ax;
 };
+

@@ -111,8 +111,12 @@ python tests/frontend/drape_window.py --scene gcd:<element_id> --frames 120 \
 - All settings are code constants in the `CONFIG` block (solver, parameter
   overrides, dt, blow-up threshold); there is no settings UI. The window calls
   `update(CONFIG['dt'])` once per frame; the engine subdivides each call
-  internally by `step_h` (set in the solver preset). A large `dt` (for example
-  `update(0.01)`) can tunnel through collisions.
+  internally by `step_h` (from the scene parameter block, or the solver preset
+  when a scene does not pass one). The measured cost is per substep, so `dt`
+  and `step_h` have to move together, or the frame gets slower per simulated
+  second; both default to 0.0045 s, the round-1 recommendation (see the
+  `real-time-broadphase` change, "Recommended defaults after round 1"). A large
+  `dt` (for example `update(0.01)`) can tunnel through collisions.
 - Right-drag picks/pulls the cloth (engine `pick_triangle`); left-drag
   orbits, scroll zooms, WASD pans (Warp built-ins). Keys: `Space` pause,
   `N` single frame, `R` reset, `K` screenshot, `Esc` close.

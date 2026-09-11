@@ -108,13 +108,13 @@ static __global__ void compute_stitch_constraint(
     }
 }
 
-void Geometry::accumulate_sewing_force(Mat3* Jx_diag) {
+void Geometry::accumulate_sewing_force(Mat3* Jx_diag, cudaStream_t stream) {
     const int n = params.nb_all_stitches;
     if ( n <= 0 ) return;
     float sewing_k = max(0.f, get_global_parameter("sewing_k", 1e5f));
     float force_cap = max(0.f, get_global_parameter("sewing_max_force", 1e5f));
     int block = 256;
-    compute_stitch_constraint<<<(n + block - 1) / block, block>>>(
+    compute_stitch_constraint<<<(n + block - 1) / block, block, 0, stream>>>(
         Jx_diag, elastic_forces.data().get(),
         pos_world.data().get(), stitches_status.data().get(),
         stitches.data().get(), sewing_k, force_cap, n);
@@ -390,7 +390,7 @@ static __global__ void project_stitch_clusters_kernel(
     }
 }
 
-void Geometry::project_stitches() {
+void Geometry::project_stitches(cudaStream_t stream) {
     if ( stitch_cluster_members.empty() || stitch_cluster_lookup.empty() ) return;
     const int n = params.nb_all_vertices;
     // Projection activates after the assembly window; the gate then
@@ -402,8 +402,8 @@ void Geometry::project_stitches() {
     snap_dist = min(snap_dist * powf(1.5f, (float)(simulator->frame - activation)), 5e-2f);
     float envelope_radius = max(0.f, get_global_parameter("query_radius", 1e-3f));
     int block = 256;
-    cudaMemsetAsync(stitch_cluster_locked.data().get(), 0, sizeof(int) * n);
-    project_stitch_clusters_kernel<<<(n + block - 1) / block, block>>>(
+    cudaMemsetAsync(stitch_cluster_locked.data().get(), 0, sizeof(int) * n, stream);
+    project_stitch_clusters_kernel<<<(n + block - 1) / block, block, 0, stream>>>(
         pos_world.data().get(), mass_inv.data().get(),
         stitch_cluster_locked.data().get(),
         stitch_cluster_lookup.data().get(),

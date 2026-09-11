@@ -156,7 +156,16 @@ static __global__ void compute_BW_FEM(
     const float* __restrict__ areas,
     const ObjectDataInput* __restrict__ obj_data,
     const int* __restrict__ vertices_obj,
-    int num_triangles
+    int num_triangles,
+    // 1 = clamp the lateral eigenvalue of the stretch Hessian to >= -eps.
+    // The exact value is ku * (1 - 1/|wu|), which is negative in compression;
+    // the assembled operator then loses positive definiteness and the linear
+    // solve stops converging (see the SPD_CLAMP regularization used by the
+    // spring element below).
+    float psd_clamp,
+    // 1 = add the (positive semidefinite) rank-one part of the shear Hessian,
+    // which the force terms already use but the operator was missing.
+    float shear_hessian
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if ( i >= num_triangles )
@@ -211,16 +220,49 @@ static __global__ void compute_BW_FEM(
     float3 Cudp2 = wu_ * wudp2;
     float3 Cvdp2 = wv_ * wvdp2;
 
+    // ---- shear ----
+    float wu_dot_wv = dot(wu_, wv_);
+    float Cshear = wu_dot_wv; // cos angle
+
+    // Derivatives of the shear constraint w.r.t. the two material directions,
+    // used by both the force and the (optional) shear Hessian below.
+    float3 dCs_dx1 = (wv_ - wu_ * wu_dot_wv) * (wu_norm > 1e-6f ? 1.0f / wu_norm : 0.0f) * wudp1
+        + (wu_ - wv_ * wu_dot_wv) * (wv_norm > 1e-6f ? 1.0f / wv_norm : 0.0f) * wvdp1;
+    float3 dCs_dx2 = (wv_ - wu_ * wu_dot_wv) * (wu_norm > 1e-6f ? 1.0f / wu_norm : 0.0f) * wudp2
+        + (wu_ - wv_ * wu_dot_wv) * (wv_norm > 1e-6f ? 1.0f / wv_norm : 0.0f) * wvdp2;
+
     // ---- forces (negative gradient of energy) ----
     // energy = 0.5 * area * (ku * Cu^2 + kv * Cv^2 + ks * Cs^2)
     // => f = -area * (ku * Cu * dCu/dp + kv * Cv * dCv/dp + ks * Cs * dCs/dp)
     float3 f1 = -area * (ku * Cu * Cudp1 + kv * Cv * Cvdp1);
     float3 f2 = -area * (ku * Cu * Cudp2 + kv * Cv * Cvdp2);
-    
+    float shear_coef = -area * ks * Cshear;
+    float3 f1_s = dCs_dx1 * shear_coef;
+    float3 f2_s = dCs_dx2 * shear_coef;
+    float3 f0 = (f1_s + f2_s + f1 + f2) * -1.0f;
+    atomicAddFloat3(&forces[v0_idx], f0);
+    atomicAddFloat3(&forces[v1_idx], f1 + f1_s);
+    atomicAddFloat3(&forces[v2_idx], f2 + f2_s);
+    if ( enerys ) {
+        float energy = 0.5f * area * (ku * Cu * Cu + kv * Cv * Cv + ks * Cshear * Cshear);
+        atomicAdd(&enerys[v0_idx], energy);
+    }
+
     // ---- Hessian blocks ----
     Mat3 I = Mat3::identity();
-    Mat3 wu_proj_mat = (I - Mat3::outer_product(wu_, wu_)) * (wu_norm > 1e-12f ? 1.0f / wu_norm : 0.0f);
-    Mat3 wv_proj_mat = (I - Mat3::outer_product(wv_, wv_)) * (wv_norm > 1e-12f ? 1.0f / wv_norm : 0.0f);
+    // Lateral eigenvalue factor of 0.5 * area * k * (|w| - 1)^2: it is
+    // (|w| - 1) / |w| = 1 - 1/|w|, positive in tension and negative in
+    // compression. Clamping it (to the same -1e-3 floor the spring element
+    // uses) keeps the element Hessian positive semidefinite.
+    const float lat_eps = -1.0e-3f;
+    float lat_u = 1.0f - 1.0f / max(wu_norm, 1e-12f);
+    float lat_v = 1.0f - 1.0f / max(wv_norm, 1e-12f);
+    if ( psd_clamp > 0.5f ) {
+        lat_u = fmaxf(lat_u, lat_eps);
+        lat_v = fmaxf(lat_v, lat_eps);
+    }
+    Mat3 wu_lat = I - Mat3::outer_product(wu_, wu_);
+    Mat3 wv_lat = I - Mat3::outer_product(wv_, wv_);
 
     float coef = area;
     // Hessian of stretch energy (w.r.t. material coords)
@@ -228,13 +270,24 @@ static __global__ void compute_BW_FEM(
     //                          kv * (Cvdp1 Cvdp1ᵀ + Cv * wv_proj * wvdp1²) ]
     // (similarly for p2 and cross term)
     Mat3 f1d1 = (Mat3::outer_product(Cudp1, Cudp1 * ku) + Mat3::outer_product(Cvdp1, Cvdp1 * kv) +
-        wu_proj_mat * (Cu * wudp1 * wudp1 * ku) + wv_proj_mat * (Cv * wvdp1 * wvdp1 * kv)) * coef;
+        wu_lat * (lat_u * wudp1 * wudp1 * ku) + wv_lat * (lat_v * wvdp1 * wvdp1 * kv)) * coef;
 
     Mat3 f2d2 = (Mat3::outer_product(Cudp2, Cudp2 * ku) + Mat3::outer_product(Cvdp2, Cvdp2 * kv) +
-        wu_proj_mat * (Cu * wudp2 * wudp2 * ku) + wv_proj_mat * (Cv * wvdp2 * wvdp2 * kv)) * coef;
+        wu_lat * (lat_u * wudp2 * wudp2 * ku) + wv_lat * (lat_v * wvdp2 * wvdp2 * kv)) * coef;
 
     Mat3 f1d2 = (Mat3::outer_product(Cudp1, Cudp2 * ku) + Mat3::outer_product(Cvdp1, Cvdp2 * kv) +
-        wu_proj_mat * (Cu * wudp1 * wudp2 * ku) + wv_proj_mat * (Cv * wvdp1 * wvdp2 * kv)) * coef;
+        wu_lat * (lat_u * wudp1 * wudp2 * ku) + wv_lat * (lat_v * wvdp1 * wvdp2 * kv)) * coef;
+
+    // Rank-one part of the shear Hessian, d²E_s / d p_i d p_j with
+    // E_s = 0.5 * area * ks * Cs². Jx holds the energy Hessian, so the
+    // coefficient is +area * ks (the disabled block below used the opposite
+    // sign, which is the force Jacobian convention).
+    if ( shear_hessian > 0.5f ) {
+        float s_coef = area * ks;
+        f1d1 += Mat3::outer_product(dCs_dx1, dCs_dx1 * s_coef);
+        f2d2 += Mat3::outer_product(dCs_dx2, dCs_dx2 * s_coef);
+        f1d2 += Mat3::outer_product(dCs_dx1, dCs_dx2 * s_coef);
+    }
     if ( Jx_diag ) {
         atomicAddMat3(&Jx_diag[v1_idx], f1d1);
         atomicAddMat3(&Jx_diag[v2_idx], f2d2);
@@ -257,26 +310,8 @@ static __global__ void compute_BW_FEM(
         atomicAddMat3(&Jx[e1_ii], f0d1);
     }
 
-    // shear 
-    float wu_dot_wv = dot(wu_, wv_);
-    float Cshear = wu_dot_wv; // cos angle
-
-    float3 wv_proj_ = (wv_ - wu_ * wu_dot_wv) * (wu_norm > 1e-6f ? 1.0f / wu_norm : 0.0f);
-    float3 wu_proj_ = (wu_ - wv_ * wu_dot_wv) * (wv_norm > 1e-6f ? 1.0f / wv_norm : 0.0f);
-
-    float shear_coef = -area * ks * Cshear;
-
-    float3 f1_s = (wv_proj_ * wudp1 + wu_proj_ * wvdp1) * shear_coef;
-    float3 f2_s = (wv_proj_ * wudp2 + wu_proj_ * wvdp2) * shear_coef;
-    float3 f0 = (f1_s + f2_s + f1 + f2) * -1.0f;
-    atomicAddFloat3(&forces[v0_idx], f0);
-    atomicAddFloat3(&forces[v1_idx], f1 + f1_s);
-    atomicAddFloat3(&forces[v2_idx], f2 + f2_s);
-    if ( enerys ) {
-        float energy = 0.5f * area * (ku * Cu * Cu + kv * Cv * Cv + ks * Cshear * Cshear);
-        atomicAdd(&enerys[v0_idx], energy);
-    }
-    #if 0 // Hessian of shear, only SPD part.
+    #if 0 // Hessian of shear, only SPD part (superseded by `shear_hessian`
+           // above; kept for reference - note its coefficient sign).
     float3 dCs_dx1 = wv_proj_ * wudp1 + wu_proj_ * wvdp1;
     float3 dCs_dx2 = wv_proj_ * wudp2 + wu_proj_ * wvdp2;
 

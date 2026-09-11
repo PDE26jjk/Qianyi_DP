@@ -531,6 +531,15 @@ void Geometry::init_triangle_data() {
 float Geometry::get_global_parameter(const std::string& key, float default_value) const {
     return simulator->get_parameter(key, default_value);
 }
+
+cudaStream_t sim_work_stream() {
+    static cudaStream_t stream = []() {
+        cudaStream_t created = nullptr;
+        cudaStreamCreateWithFlags(&created, cudaStreamNonBlocking);
+        return created;
+    }();
+    return stream;
+}
 void Geometry::copy_vertices(float* ptr, bool world_space = false) {
     CUDA_CHECK(cudaMemcpy(
         ptr,

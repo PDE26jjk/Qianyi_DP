@@ -49,8 +49,17 @@ CONFIG = {
     # Solver + parameter block from tests/harness/presets.py; overrides are
     # applied on top of the preset before input_data.
     "solver": "PDNewton",
-    "param_overrides": {},
-    "dt": 0.003,
+    # The recommended step length for the built-in scenes. It has to travel
+    # with `dt` above: the engine runs one substep per `update()` only while
+    # `step_h >= dt`, and the measured cost is per substep.
+    "param_overrides": {"step_h": 0.0045},
+    # Frame time step. 0.0045 s is the round-1 recommendation for the
+    # garment-scale scenes: the engine runs one substep per call as long as
+    # `step_h` matches, and the measured cost is per substep, so the simulated
+    # seconds per wall second scale almost linearly with this value while the
+    # drape keeps its invariants. See the `real-time-broadphase` change,
+    # "Recommended defaults after round 1".
+    "dt": 0.0045,
     # Blow-up detection (design D6): auto-pause when any vertex is
     # non-finite or moves further than this in one rendered frame.
     "blowup_displacement_m": 0.5,

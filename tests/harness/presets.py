@@ -33,11 +33,17 @@ PDNEWTON_PARAMETERS: dict[str, float] = {
     "ee_force_type": 0,
     "max_vel": 100.0,
     "gravity": -9.8,
+    # 0 = PCG, 1 = Jacobi. Jacobi was the earlier choice here, but cutting the
+    # PCG iteration count reaches the same frame cost with a better drape:
+    # PCG with 2 iterations is 1.10-1.31x faster than PCG with 5 across five
+    # dataset elements and keeps the area ratio within 0.005 of it, while
+    # Jacobi at 5 iterations is stretchier (1.205 vs 1.132 on the mid-size
+    # element). See the real-time-broadphase change for the measurements.
     "linear_solver_type": 0,
     "pd_iters": 5,
     "pc_iters": 0,
     "subspace_iters": 0,
-    "linear_iters": 5,
+    "linear_iters": 2,
     "mask_stiff": 2000,
     "max_force_scale": 0.1,
     "average_mass_by_cloth": 0,

@@ -275,10 +275,11 @@ static __global__ void query_ee_pairs_capsule_kernel(
     const int* __restrict__ cluster_id,
     int* __restrict__ query_results,
     int result_size
+    , int query_order // 1 = i-th leaf in BVH (Morton) order, 0 = natural edge order
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if ( i >= num_queries ) return;
-    i = nodes[i].x - 1;
+    if ( query_order ) i = nodes[i].x - 1;
 
     int2 edge = edges[i];
     float3 A0 = pos[edge.x];

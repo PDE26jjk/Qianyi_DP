@@ -8,6 +8,12 @@
 #include "contact/contact.cuh"
 // #include <thrust/universal_vector.h>
 
+// Stream the Projective-Dynamics iteration runs on. The legacy stream cannot
+// be captured into a CUDA graph on the drivers this project targets, so the
+// iteration is issued on a stream the engine owns and the frame forks and
+// joins around it. Created on first use.
+cudaStream_t sim_work_stream();
+
 struct Picker {
     int tri_idx;
 };
@@ -123,7 +129,7 @@ public:
 
     void init_stitch_cluster_buffers();
     void build_stitch_clusters();
-    void project_stitches();
+    void project_stitches(cudaStream_t stream = 0);
     void average_stitch_cluster_velocities();
 
     bool sewing_done;
@@ -241,7 +247,7 @@ public:
     void check_picker();
 
     void check_sewing();
-    void accumulate_sewing_force(Mat3* Jx_diag);
+    void accumulate_sewing_force(Mat3* Jx_diag, cudaStream_t stream = 0);
 
     void update_pin(float3* q);
 

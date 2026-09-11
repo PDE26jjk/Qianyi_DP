@@ -210,6 +210,7 @@ static __global__ void k_generate_interior(
     int idx = y * p.max_size + x;
 
     if ( grid_status[idx] == 4 ) {
+        // Stratified sampling: one jittered point per interior cell.
         int tid = y * p.grid_size + x;
         curandState localState = states[tid];
         float r1 = curand_uniform(&localState) - 0.5f;
@@ -495,6 +496,30 @@ void Sampler::sample(
     float raw_radius,
     float f1, int t1, float f2, int t2
 ) {
+    // Pattern-mesh sampling pipeline. This is the mesh source the Blender
+    // frontend uses (pattern_mesh.py -> qydp.geometry.sample_points), so the
+    // solver's triangle quality comes from here.
+    //
+    //   1. normalise by the bounding box, so the cell grid below does not
+    //      depend on the pattern scale;
+    //   2. rasterise the closed boundary curves (and holes) into an
+    //      inside/outside mask;
+    //   3. upload the input boundary points and the edge midpoints and place
+    //      them on the grid as fixed obstacles;
+    //   4. stratified sampling: one jittered point per interior cell, using a
+    //      cell length of radius / sqrt(2). This is NOT Poisson-disc sampling
+    //      - there is no dart throwing, no active list and no minimum-distance
+    //      rejection here;
+    //   5. repulsion relaxation: a uniform grid (at most 4 points per cell)
+    //      provides the neighbours, every interior point is pushed away from
+    //      the neighbours within `radius`, and the boundary points stay fixed.
+    //      The caller issues two passes with decreasing gain - f1=0.02 for t1
+    //      iterations, then f2=0.01 for t2 (see sample_points_impl);
+    //   6. validate the interior points (the caps in step 5 mean the spacing
+    //      guarantee is radius / sqrt(2), not radius; see
+    //      tests/algo/test_sampling.py), then constrained Delaunay (gDel2D)
+    //      with every boundary and hole edge as a constraint, then drop the
+    //      triangles that failed validation.
     if ( all_points.empty() || edge_indices.empty() ) return;
 
     int num_input_points = all_points.size();

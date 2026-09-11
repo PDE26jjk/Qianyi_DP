@@ -7,6 +7,11 @@
 #include "dynamics/bending.cuh"
 #include "dynamics/planar.cuh"
 
+#include <cstdint>
+#include <cstring>
+#include <exception>
+#include <iostream>
+
 // Adapted from Newton's style3d solver
 
 static __global__ void prepare_linear_step_kernel(
@@ -336,7 +341,25 @@ void SolverPDNewton::step(float h) {
         static_diags,
         h, mask_stiff, geo->gravity, true, n);
     contact.refit_bvh_with_target(q_prev, q_pred);
-    contact.collision_detect_broad_phase(q_prev, q_pred, query_radius, true);
+    // Tight, non-swept broad phase (the Warp / Style3D arrangement): the tree
+    // and the query boxes are inflated only by the contact radius, so the
+    // traversal covers far fewer nodes. It is only conservative when the
+    // per-substep motion stays inside that radius, which is why it is meant
+    // to be paired with smaller substeps. `tight_broad_phase=0` keeps the
+    // conservative-CCD behavior.
+    // Default on: measured x1.27 at the configured substep size (21.11 vs
+    // 26.86 ms/frame on the study-1 scene) with no penetration regression over
+    // 300 frames, better seam closure and ~8% more cloth stretch. Set
+    // `tight_broad_phase=0` for the conservative-CCD behavior.
+    const bool tight_broad_phase = get_global_parameter("tight_broad_phase", 1.f) > 0.5f;
+    if ( tight_broad_phase ) {
+        contact.refit_bvh_with_target(q_prev, q_prev);
+        contact.collision_detect_broad_phase(q_prev, q_prev, query_radius, true);
+    }
+    else {
+        contact.refit_bvh_with_target(q_prev, q_pred);
+        contact.collision_detect_broad_phase(q_prev, q_pred, query_radius, true);
+    }
 
     int iters = max(1, (int)get_global_parameter("pd_iters", 10));
     int linear_iters = max(1, (int)get_global_parameter("linear_iters", 10));
@@ -344,24 +367,82 @@ void SolverPDNewton::step(float h) {
     // int subspace_iters = max(0, (int)get_global_parameter("subspace_iters", 1));
     float max_force_scale = max(0.f, get_global_parameter("max_force_scale", 100.f));
     float bending_k = max(0.f, get_global_parameter("bending_k", 0.2f));
-    for ( int i = 0; i < iters; i++ ) {
+    // Planar FEM operator fixes (see compute_BW_FEM): clamping the lateral
+    // eigenvalue of the stretch Hessian keeps the assembled matrix positive
+    // definite when a fold compresses the membrane, and the shear Hessian is
+    // the rank-one term the operator was missing entirely.
+    const float fem_psd_clamp = get_global_parameter("fem_psd_clamp", 1.f) > 0.5f ? 1.f : 0.f;
+    const float fem_shear_hessian = get_global_parameter("fem_shear_hessian", 1.f) > 0.5f ? 1.f : 0.f;
+    // The iteration runs on the engine's own stream so the loop can be
+    // captured: the legacy stream cannot be captured on the drivers this
+    // project targets (cudaErrorStreamCaptureUnsupported). The fork below
+    // orders that stream after everything the frame has queued so far on the
+    // legacy stream - the refits and the three broad-phase queries - and the
+    // join after the loop hands the result back.
+    cudaStream_t work_stream = sim_work_stream();
+    if ( stream_fork == nullptr ) {
+        cudaEventCreateWithFlags(&stream_fork, cudaEventDisableTiming);
+        cudaEventCreateWithFlags(&stream_join, cudaEventDisableTiming);
+    }
+    cudaEventRecord(stream_fork, 0);
+    cudaStreamWaitEvent(work_stream, stream_fork, 0);
+    linear->set_work_stream(work_stream);
+    // One Projective-Dynamics iteration, minus the seam projection: the
+    // projection's host-side ramp changes from frame to frame, so it stays
+    // outside the captured region and runs after every replayed iteration.
+    // Bending model dispatch.
+    const int n_bend = params.nb_all_cloth_edges + params.nb_all_stitches;
+    auto launch_bending = [&](Mat3* Jx, Mat3* Jx_diag) {
+        if ( geo->bending_model == BendingModel::IBM_quadratic )
+            compute_quadratic_bending_IBM<<< (n_bend + block - 1) / block, block, 0, work_stream>>>(
+                Jx, Jx_diag,
+                f, nullptr,
+                geo->IBM_q.data().get(),
+                q,
+                geo->bend_points.data().get(),
+                geo->bend_valid.data().get(),
+                geo->bend_cross_rows.data().get(),
+                n_bend, bending_k);
+        else if ( geo->bending_model == BendingModel::DiscreteShells_GN )
+            compute_dihedral_bending_GN<<<(n_bend + block - 1) / block, block, 0, work_stream>>>(
+                Jx, Jx_diag,
+                f, q,
+                geo->bend_points.data().get(),
+                geo->bend_rest_theta.data().get(),
+                geo->bend_factor.data().get(),
+                geo->bend_valid.data().get(),
+                geo->bend_cross_rows.data().get(),
+                n_bend, bending_k);
+        else if ( geo->bending_model == BendingModel::DiscreteShells_AOGS )
+            compute_dihedral_bending_AOGS<<<(n_bend + block - 1) / block, block, 0, work_stream>>>(
+                Jx, Jx_diag,
+                f, q,
+                geo->bend_points.data().get(),
+                geo->bend_rest_theta.data().get(),
+                geo->bend_factor.data().get(),
+                geo->bend_valid.data().get(),
+                geo->bend_cross_rows.data().get(),
+                n_bend, bending_k);
+    };
+
+    auto run_pd_iteration = [&]() {
         n = params.nb_all_cloth_vertices;
-        cudaMemsetAsync(f, 0, sizeof(float3) * n);
-        cudaMemsetAsync(f_elastic, 0, sizeof(float3) * n);
-        cudaMemsetAsync(Jx_diag, 0, sizeof(Mat3) * n);
-        contact.accumulate_contact_force(f, Jx_diag, h);
-        truncate_forces_kernel<<<(n + block - 1) / block, block>>>(
+        cudaMemsetAsync(f, 0, sizeof(float3) * n, work_stream);
+        cudaMemsetAsync(f_elastic, 0, sizeof(float3) * n, work_stream);
+        cudaMemsetAsync(Jx_diag, 0, sizeof(Mat3) * n, work_stream);
+        // Row space = valid_pairs (natural edges + deduped bend pairs); clear
+        // the whole table every iteration, not just the edge part.
+        cudaMemsetAsync(Jx_nondiag, 0,
+            sizeof(Mat3) * geo->valid_pairs.size(), work_stream);
+        contact.accumulate_contact_force(f, Jx_diag, h, work_stream);
+        truncate_forces_kernel<<<(n + block - 1) / block, block, 0, work_stream>>>(
             f, Jx_diag, static_diags, max_force_scale, n);
 
-        step_begin_pd<<<(n + block - 1) / block, block>>>(f, q_inertia, q, mass, h, n);
-        // Row space = valid_pairs (natural edges + deduped bend pairs);
-        // clear the whole table every iteration, not just the edge part.
-        cudaMemsetAsync(Jx_nondiag, 0,
-            sizeof(Mat3) * geo->valid_pairs.size());
+        step_begin_pd<<<(n + block - 1) / block, block, 0, work_stream>>>(f, q_inertia, q, mass, h, n);
         n = params.nb_all_cloth_edges;
-        geo->accumulate_sewing_force(Jx_diag);
+        geo->accumulate_sewing_force(Jx_diag, work_stream);
         if ( geo->constitutive_model == ConstitutiveModel::SpringMass ) {
-            accumulate_spring_forces<<<(n + block - 1) / block, block>>>(
+            accumulate_spring_forces<<<(n + block - 1) / block, block, 0, work_stream>>>(
                 Jx_nondiag, Jx_diag, f_elastic, nullptr, q, edges,
                 geo->edge_lengths.data().get(),
                 obj_data, vertices_obj,
@@ -369,57 +450,179 @@ void SolverPDNewton::step(float h) {
         }
         else if ( geo->constitutive_model == ConstitutiveModel::FEM_BW ) {
             n = params.nb_all_cloth_triangles;
-            compute_BW_FEM<<<(n + block - 1) / block, block>>>(
+            compute_BW_FEM<<<(n + block - 1) / block, block, 0, work_stream>>>(
                 Jx_nondiag, Jx_diag, f_elastic, nullptr, q, tri_edges,
                 edges, geo->Dms.data().get(), geo->areas.data().get(),
                 obj_data, vertices_obj,
-                n);
+                n, fem_psd_clamp, fem_shear_hessian);
         }
 
-        n = params.nb_all_cloth_edges + params.nb_all_stitches;
-        if ( geo->bending_model == BendingModel::IBM_quadratic )
-            compute_quadratic_bending_IBM<<< (n + block - 1) / block, block>>>(
-                Jx_nondiag, Jx_diag,
-                f, nullptr,
-                geo->IBM_q.data().get(),
-                q,
-                geo->bend_points.data().get(),
-                geo->bend_valid.data().get(),
-                geo->bend_cross_rows.data().get(),
-                n, bending_k);
-        else if ( geo->bending_model == BendingModel::DiscreteShells_GN )
-            compute_dihedral_bending_GN<<<(n + block - 1) / block, block>>>(
-                Jx_nondiag, Jx_diag,
-                f, q,
-                geo->bend_points.data().get(),
-                geo->bend_rest_theta.data().get(),
-                geo->bend_factor.data().get(),
-                geo->bend_valid.data().get(),
-                geo->bend_cross_rows.data().get(),
-                n, bending_k);
-        else if ( geo->bending_model == BendingModel::DiscreteShells_AOGS )
-            compute_dihedral_bending_AOGS<<<(n + block - 1) / block, block>>>(
-                Jx_nondiag, Jx_diag,
-                f, q,
-                geo->bend_points.data().get(),
-                geo->bend_rest_theta.data().get(),
-                geo->bend_factor.data().get(),
-                geo->bend_valid.data().get(),
-                geo->bend_cross_rows.data().get(),
-                n, bending_k);
+        n = n_bend;
+        launch_bending(Jx_nondiag, Jx_diag);
 
         n = params.nb_all_cloth_vertices;
 
-        prepare_linear_step_kernel<<<(n + block - 1) / block, block>>>(
+        prepare_linear_step_kernel<<<(n + block - 1) / block, block, 0, work_stream>>>(
             dx, f, Jx_diag, M_inv, f_elastic, static_diags, mask, q, q_prev, mask_stiff, n);
 
         // Subspace acceleration disabled (see SolverPDNewton::init).
         // if ( i < subspace_iters ) solve_subspace(dx, f);
 
         linear->solve(dx, f, linear_iters);
-        step_end_linear<<<(n + block - 1) / block, block>>>(
+        step_end_linear<<<(n + block - 1) / block, block, 0, work_stream>>>(
             q, dx, q_pred, q_prev, query_radius, mask, n);
-        geo->project_stitches(); // seam coincidence projection (once per iter)
+    };
+
+    // A frame issues ~690 kernels, and on this driver a launch that has to
+    // follow another one costs ~12 us of GPU idle time, so several
+    // milliseconds of the frame are launch gaps rather than work. Replaying
+    // the whole iteration loop from a captured graph removes them - one graph
+    // launch per frame instead of ~690 kernel launches. The capture is only
+    // valid while every host value baked into the recorded launch arguments
+    // is unchanged, which is what the key covers; `pd_cuda_graph=0` disables
+    // the whole path, and any capture failure falls back to direct launches.
+    //
+    // The loop, not a single iteration, is what gets recorded: the seam
+    // projection runs between iterations, and its arguments change from frame
+    // to frame.
+    auto run_pd_loop = [&]() {
+        for ( int i = 0; i < iters; i++ ) {
+            run_pd_iteration();
+            geo->project_stitches(work_stream); // seam projection, once per iter
+        }
+    };
+
+    // The seam projection's host-side ramp is a captured argument, so the key
+    // has to carry it: the gate can be off in the first frames, and snap_dist
+    // grows until it saturates.
+    const int sewing_activation =
+        max(0, (int)get_global_parameter("sewing_forced_connect_frame", 80.f));
+    const bool projection_active = simulator->frame > sewing_activation;
+    const float projection_snap_dist = projection_active
+        ? min(max(0.f, get_global_parameter("sewing_snap_dist", 3e-3f))
+              * powf(1.5f, (float)(simulator->frame - sewing_activation)), 5e-2f)
+        : 0.f;
+    const bool graph_enabled = get_global_parameter("pd_cuda_graph", 1.f) > 0.5f;
+    if ( graph_enabled && !iter_graph_broken && linear->graph_capture_safe() ) {
+        uint64_t key = 1469598103934665603ull;
+        auto mix = [&key](uint64_t v) { key = (key ^ v) * 1099511628211ull; };
+        mix((uint64_t)(uintptr_t)Jx_diag);
+        mix((uint64_t)(uintptr_t)Jx_nondiag);
+        mix((uint64_t)(uintptr_t)M_inv);
+        mix((uint64_t)(uintptr_t)f);
+        mix((uint64_t)(uintptr_t)f_elastic);
+        mix((uint64_t)(uintptr_t)q);
+        mix((uint64_t)(uintptr_t)dx);
+        mix((uint64_t)(uintptr_t)static_diags);
+        mix((uint64_t)(uintptr_t)mask);
+        mix((uint64_t)params.nb_all_cloth_vertices);
+        mix((uint64_t)params.nb_all_cloth_edges);
+        mix((uint64_t)params.nb_all_cloth_triangles);
+        mix((uint64_t)params.nb_all_stitches);
+        mix((uint64_t)params.nb_all_vertices);
+        mix((uint64_t)geo->valid_pairs.size());
+        mix((uint64_t)(int)geo->constitutive_model);
+        mix((uint64_t)(int)geo->bending_model);
+        mix((uint64_t)linear_iters);
+        mix((uint64_t)simulator->parameter_version());
+        auto mix_float = [&mix](float v) {
+            float f = v;
+            uint32_t bits = 0;
+            memcpy(&bits, &f, sizeof(bits));
+            mix((uint64_t)bits);
+        };
+        mix_float(h);
+        mix_float(mask_stiff);
+        mix_float(max_force_scale);
+        mix_float(bending_k);
+        mix_float(query_radius);
+        mix_float(projection_snap_dist);
+        mix((uint64_t)projection_active);
+        // Every array the captured loop reads, by identity and size: a
+        // rest-shape refresh (cloth plasticity) or any other rebuild that
+        // moves or resizes one of them has to invalidate the capture even if
+        // its values are the only thing that changed.
+        auto mix_buffer = [&mix](const void* ptr, size_t count) {
+            mix((uint64_t)(uintptr_t)ptr);
+            mix((uint64_t)count);
+        };
+        mix_buffer(geo->bend_points.data().get(), geo->bend_points.size());
+        mix_buffer(geo->bend_rest_theta.data().get(), geo->bend_rest_theta.size());
+        mix_buffer(geo->bend_factor.data().get(), geo->bend_factor.size());
+        mix_buffer(geo->bend_valid.data().get(), geo->bend_valid.size());
+        mix_buffer(geo->bend_cross_rows.data().get(), geo->bend_cross_rows.size());
+        mix_buffer(geo->IBM_q.data().get(), geo->IBM_q.size());
+        mix_buffer(geo->edges.data().get(), geo->edges.size());
+        mix_buffer(geo->triangles.data().get(), geo->triangles.size());
+        mix_buffer(geo->triangle_indices.data().get(), geo->triangle_indices.size());
+        mix_buffer(geo->edge_opposite_points.data().get(),
+            geo->edge_opposite_points.size());
+        mix_buffer(geo->Dms.data().get(), geo->Dms.size());
+        mix_buffer(geo->areas.data().get(), geo->areas.size());
+        mix_buffer(geo->edge_lengths.data().get(), geo->edge_lengths.size());
+        mix_buffer(geo->obj_data.data().get(), geo->obj_data.size());
+        mix_buffer(geo->vertices_obj.data().get(), geo->vertices_obj.size());
+        mix_buffer(geo->pos_world.data().get(), geo->pos_world.size());
+        mix_buffer(geo->pos_pred.data().get(), geo->pos_pred.size());
+        mix_buffer(geo->pos_step_prev.data().get(), geo->pos_step_prev.size());
+        mix_buffer(geo->pos_inertia.data().get(), geo->pos_inertia.size());
+        mix_buffer(geo->velocities.data().get(), geo->velocities.size());
+        mix_buffer(geo->masses.data().get(), geo->masses.size());
+        mix_buffer(geo->mass_inv.data().get(), geo->mass_inv.size());
+        mix_buffer(geo->forces.data().get(), geo->forces.size());
+        mix_buffer(geo->elastic_forces.data().get(), geo->elastic_forces.size());
+        mix_buffer(geo->static_diags.data().get(), geo->static_diags.size());
+        mix_buffer(geo->vertices_mask.data().get(), geo->vertices_mask.size());
+        mix_buffer(geo->vertex_normals.data().get(), geo->vertex_normals.size());
+        mix_buffer(geo->edge_normals.data().get(), geo->edge_normals.size());
+        mix_buffer(geo->stitches.data().get(), geo->stitches.size());
+        mix_buffer(geo->stitches_status.data().get(), geo->stitches_status.size());
+        mix_buffer(geo->stitch_cluster_lookup.data().get(),
+            geo->stitch_cluster_lookup.size());
+        mix_buffer(geo->stitch_cluster_members.data().get(),
+            geo->stitch_cluster_members.size());
+        mix_buffer(geo->stitch_cluster_locked.data().get(),
+            geo->stitch_cluster_locked.size());
+        mix_buffer(geo->valid_pairs.data().get(), geo->valid_pairs.size());
+        if ( iter_graph_exec != nullptr && key != iter_graph_key ) {
+            cudaGraphExecDestroy(iter_graph_exec);
+            iter_graph_exec = nullptr;
+        }
+        if ( iter_graph_exec == nullptr ) {
+            cudaGraph_t graph = nullptr;
+            cudaError_t begin_err = cudaStreamBeginCapture(
+                work_stream, cudaStreamCaptureModeThreadLocal);
+            run_pd_loop();
+            cudaError_t err = cudaStreamEndCapture(work_stream, &graph);
+            if ( begin_err != cudaSuccess ) err = begin_err;
+            if ( err == cudaSuccess && graph != nullptr ) {
+                err = cudaGraphInstantiate(&iter_graph_exec, graph, nullptr,
+                    nullptr, 0);
+            }
+            if ( graph != nullptr ) cudaGraphDestroy(graph);
+            if ( err != cudaSuccess ) {
+                std::cout << "PD iteration capture failed (" << cudaGetErrorString(err)
+                    << ", code " << (int)err
+                    << "); falling back to direct launches." << std::endl;
+                iter_graph_exec = nullptr;
+                iter_graph_broken = true;
+                cudaGetLastError();
+            }
+            else {
+                iter_graph_key = key;
+            }
+        }
+    }
+
+    if ( iter_graph_exec != nullptr ) cudaGraphLaunch(iter_graph_exec, work_stream);
+    else run_pd_loop();
+    cudaEventRecord(stream_join, work_stream);
+    cudaStreamWaitEvent(0, stream_join, 0);
+    // The linear solve reports a non-finite residual through a sticky device
+    // flag instead of blocking once per solve; consume it once per frame.
+    if ( linear->consume_failure_flag() ) {
+        std::cout << "PCG ended with NaN residual." << std::endl;
+        throw std::exception("PCG nan");
     }
     // try to do penetration correction
     iters = max(0, (int)get_global_parameter("pc_iters", 2));

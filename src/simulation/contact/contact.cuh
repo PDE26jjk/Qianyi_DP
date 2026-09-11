@@ -18,7 +18,8 @@ struct Contact {
     void collision_detect_prepare();
     void rebuild_bvh();
     void refit_bvh();
-    void accumulate_contact_force(float3* forces, Mat3* Jx_diag, float h);
+    void accumulate_contact_force(float3* forces, Mat3* Jx_diag, float h,
+        cudaStream_t stream = 0);
     void refit_bvh_with_target(const float3* pos_prev, const float3* pos_target);
     void ccd_truncation_traverse_bvh(const float3* pos_prev, const float3* pos_target);
     void check_truncation_traverse_bvh(const float3* pos_prev, float3* pos_target);
@@ -84,6 +85,13 @@ struct Contact {
 
     thrust::device_vector<int> broad_phase_ee;
     thrust::device_vector<int> broad_phase_ef;
+    // Optional stream set for overlapping the three broad-phase queries.
+    // The queries read the same BVHs but write disjoint candidate buffers,
+    // so they can run concurrently; events fork/join them against the
+    // (legacy default) stream the rest of the solver uses.
+    cudaStream_t query_streams[3] = { nullptr, nullptr, nullptr };
+    cudaEvent_t query_fork = nullptr;
+    cudaEvent_t query_join[3] = { nullptr, nullptr, nullptr };
     thrust::device_vector<int> broad_phase_vf;
 
     thrust::device_vector<float> truncation_t;
