@@ -696,14 +696,26 @@ __device__ inline bool compute_edge_edge_contact(
 
     // Direction correction based on layer difference and broad-phase sign
     if ( layer_diff == 0 ) {
-        // Same layer: use the sign stored during broad phase
-        // float sign_new = (dot(ba, edge_normal0) < 0.0f) ? 1.0f : -1.0f;
-        float sign_new = dot(C - A, cross(D - A, B - A)) < 0.0f ? 1 : -1;
-        sign_new *= contact_side_sign;
-        if ( sign_new < 0.0f ) {
-            normal = -normal;
-            dist = -dist;
-        }
+        // Same layer: `ba` is the closest-point difference, so it already
+        // points from the second edge to the first - the direction that
+        // separates the pair - and `dist = |ba|` is the unsigned separation.
+        //
+        // The former `determinant * contact_side_sign` test recomputed the
+        // tetrahedron orientation at force-evaluation time and multiplied it by
+        // the orientation recorded at detection time. For pairs whose two
+        // edges are nearly parallel that quantity is ~0 and its sign is noise,
+        // so the product flipped at random within a substep: a separated pair
+        // became `pen = thickness + |ba|` (the deepest possible penetration)
+        // with an inverted, attractive normal. In the two-layer stack every
+        // accepted edge-edge contact did that on the first substep, which is
+        // what produced the observed in-plane ringing (0.78 mm per substep at
+        // rest) and the local squeeze-through (gap 105 um instead of 190 um).
+        //
+        // Known limitation: with the unsigned separation a pair that crosses
+        // inside one substep is not pushed back out by this term (|ba| only
+        // grows). Crossing recovery is left to the untangling pass, which is
+        // orientation free.
+        (void)contact_side_sign;
     }
     else {
         // Select normal according to layers.

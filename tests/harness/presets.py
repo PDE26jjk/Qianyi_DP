@@ -45,7 +45,6 @@ PDNEWTON_PARAMETERS: dict[str, float] = {
     "subspace_iters": 0,
     "linear_iters": 2,
     "mask_stiff": 2000,
-    "max_force_scale": 0.1,
     "average_mass_by_cloth": 0,
     "debug_e_id": -7,
     "debug_v_id": -6,

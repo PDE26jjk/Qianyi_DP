@@ -55,8 +55,14 @@ class SimDriver:
         input_data: dict,
         solver: str | None = None,
         gravity: float | None = None,
+        params_overlay: dict[str, float] | None = None,
     ) -> SimRun:
-        """Run the configured simulation and return per-frame data."""
+        """Run the configured simulation and return per-frame data.
+
+        ``params_overlay`` is applied on top of the solver preset before
+        ``input_data`` (the frontend's ``sim_params_overlay`` semantics); it is
+        how a case deviates from the canonical block without editing it.
+        """
         solver = solver or self.solver
         if solver not in SOLVER_REGISTRY:
             raise ValueError(
@@ -68,6 +74,11 @@ class SimDriver:
         # creates the solver object from the solver name at input_data time, so
         # a set_solver call after input_data would keep the previous solver.
         params = apply_preset(sim, solver)
+        if params_overlay:
+            params = dict(params)
+            params.update(params_overlay)
+            for key, value in params_overlay.items():
+                sim.set_parameter(key, float(value))
         if gravity is not None:
             params = dict(params)
             params["gravity"] = gravity

@@ -256,31 +256,6 @@ void SolverPDNewton::init() {
     contact.do_collision_detect_broad_phase_before_step = false;
 }
 
-static __global__ void truncate_forces_kernel(
-    float3* __restrict__ forces,
-    Mat3* __restrict__ Jx_diag,
-    const float* __restrict__ static_diags,
-    float max_force_scale,
-    int num_vertices
-) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if ( i >= num_vertices ) return;
-
-    float3 f = forces[i];
-    float mag = norm(f);
-    if ( mag < 1e-12f ) return;
-
-    float max_force = static_diags[i] * max_force_scale;
-    // if (max_force <= 0.0f) {
-    //     max_force = 1e-6f;
-    // }
-    if ( mag > max_force ) {
-        float scale = max_force / mag;
-        forces[i] *= scale;
-        Jx_diag[i] *= scale;
-    }
-}
-
 __global__ void preprocessing_nondiag(
     Mat3* __restrict__ Jx_nondiag,
     const float* __restrict__ Jx_nondiag_pd,
@@ -360,12 +335,10 @@ void SolverPDNewton::step(float h) {
         contact.refit_bvh_with_target(q_prev, q_pred);
         contact.collision_detect_broad_phase(q_prev, q_pred, query_radius, true);
     }
-
     int iters = max(1, (int)get_global_parameter("pd_iters", 10));
     int linear_iters = max(1, (int)get_global_parameter("linear_iters", 10));
     // Subspace acceleration disabled (see SolverPDNewton::init).
     // int subspace_iters = max(0, (int)get_global_parameter("subspace_iters", 1));
-    float max_force_scale = max(0.f, get_global_parameter("max_force_scale", 100.f));
     float bending_k = max(0.f, get_global_parameter("bending_k", 0.2f));
     // Planar FEM operator fixes (see compute_BW_FEM): clamping the lateral
     // eigenvalue of the stretch Hessian keeps the assembled matrix positive
@@ -435,9 +408,6 @@ void SolverPDNewton::step(float h) {
         cudaMemsetAsync(Jx_nondiag, 0,
             sizeof(Mat3) * geo->valid_pairs.size(), work_stream);
         contact.accumulate_contact_force(f, Jx_diag, h, work_stream);
-        truncate_forces_kernel<<<(n + block - 1) / block, block, 0, work_stream>>>(
-            f, Jx_diag, static_diags, max_force_scale, n);
-
         step_begin_pd<<<(n + block - 1) / block, block, 0, work_stream>>>(f, q_inertia, q, mass, h, n);
         n = params.nb_all_cloth_edges;
         geo->accumulate_sewing_force(Jx_diag, work_stream);
@@ -533,7 +503,6 @@ void SolverPDNewton::step(float h) {
         };
         mix_float(h);
         mix_float(mask_stiff);
-        mix_float(max_force_scale);
         mix_float(bending_k);
         mix_float(query_radius);
         mix_float(projection_snap_dist);
@@ -645,8 +614,6 @@ void SolverPDNewton::step(float h) {
     //     cudaMemsetAsync(Jx_diag, 0, sizeof(Mat3) * n);
     //     contact.accumulate_contact_force(f, Jx_diag);
     //
-    //     truncate_forces_kernel<<<(n + block - 1), block>>>(
-    //         f, Jx_diag, static_diags, max_force_scale, n);
     //
     //     solve_diag<<<(n + block - 1) / block, block>>>(
     //         dx, f, Jx_diag, static_diags, mask, q, q_prev, mask_stiff, n);

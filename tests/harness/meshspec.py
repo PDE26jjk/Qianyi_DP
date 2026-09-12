@@ -169,3 +169,104 @@ def build_input_data(*specs: MeshSpec) -> dict:
     validate_mesh_list(mesh_list)
     return {"mesh_list": mesh_list, "sewings": []}
 
+
+def square_boundary(size_m: float, spacing_m: float) -> tuple[np.ndarray, np.ndarray]:
+    """Closed CCW square outline resampled at ~``spacing_m``.
+
+    This is the pattern-curve representation the Blender frontend hands to the
+    sampler: a list of boundary points plus the index pairs of the segments
+    connecting them (closing the loop).
+    """
+    if size_m <= 0 or spacing_m <= 0:
+        raise ValueError("size_m and spacing_m must be positive")
+    per_edge = max(1, int(round(size_m / spacing_m)))
+    points = []
+    corners = [(0.0, 0.0), (size_m, 0.0), (size_m, size_m), (0.0, size_m)]
+    for index, (ax, ay) in enumerate(corners):
+        bx, by = corners[(index + 1) % len(corners)]
+        for step in range(per_edge):
+            t = step / per_edge
+            points.append((ax + (bx - ax) * t, ay + (by - ay) * t))
+    boundary = np.asarray(points, dtype=np.float32)
+    count = len(boundary)
+    segments = np.asarray(
+        [[i, (i + 1) % count] for i in range(count)], dtype=np.int32)
+    return boundary, segments
+
+
+def sample_panel(
+    qydp,
+    boundary: np.ndarray,
+    segments: np.ndarray,
+    spacing_m: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Triangulate a closed pattern outline with the engine's own sampler.
+
+    Uses ``qydp.geometry.sample_points``: stratified (jittered-grid) sampling
+    with repulsion relaxation, then constrained Delaunay (gDel2D) - the
+    pattern-mesh pipeline the Blender frontend drives, not a structured grid
+    and not Poisson-disc sampling (see README.md, "Pattern meshing").
+    Returns ``(vertices, triangles)`` with ``vertices`` in the XY plane.
+    """
+    curve_sizes = np.asarray([len(boundary)], dtype=np.int32)
+    is_holes = np.asarray([0], dtype=np.int32)
+    points, triangles = qydp.geometry.sample_points(
+        boundary, segments, curve_sizes, is_holes, float(spacing_m))
+    points = np.asarray(points, dtype=np.float32).reshape(-1, 2)
+    triangles = np.asarray(triangles, dtype=np.int32).reshape(-1, 3)
+    vertices = np.hstack(
+        [points, np.zeros((len(points), 1), dtype=np.float32)])
+    return vertices, triangles
+
+
+def nearest_vertex(vertices: np.ndarray, target_xy: tuple[float, float]) -> int:
+    """Index of the vertex closest to ``target_xy`` in the XY plane."""
+    target = np.asarray(target_xy, dtype=np.float64)
+    offset = np.asarray(vertices, dtype=np.float64)[:, :2] - target
+    return int(np.argmin(np.einsum("ij,ij->i", offset, offset)))
+
+
+def panel_mesh_dict(
+    vertices: np.ndarray,
+    triangles: np.ndarray,
+    *,
+    spacing_m: float,
+    mass: float = 100.0,
+    thickness_mm: float = 0.1,
+    friction: float = 0.03,
+    collision_layer: int = 0,
+    grain_dir: float = 0.0,
+    fixed_vertex_indices: tuple[int, ...] = (),
+) -> dict:
+    """Wrap sampled geometry in the ``input_data`` mesh dict contract.
+
+    The key set mirrors ``MeshSpec.to_dict`` so a sampled panel and a grid
+    panel are interchangeable inputs for the harness and for the engine.
+    """
+    vertices = np.asarray(vertices, dtype=np.float32).reshape(-1, 3)
+    triangles = np.asarray(triangles, dtype=np.int32).reshape(-1, 3)
+    num_vertices = vertices.shape[0]
+    for idx in fixed_vertex_indices:
+        if not 0 <= idx < num_vertices:
+            raise ValueError(f"vertex index {idx} out of range [0, {num_vertices})")
+    pinned = np.zeros(num_vertices, dtype=np.float32)
+    for idx in fixed_vertex_indices:
+        pinned[idx] = 1.0
+    return {
+        "vertices": vertices.reshape(-1),
+        "vertices_sim": vertices.reshape(-1).copy(),
+        "edges": _derive_edges_from_triangles(triangles).reshape(-1),
+        "triangles": triangles.reshape(-1),
+        "world_matrix": _IDENTITY_WORLD_MATRIX.copy(),
+        "object_type": 0,
+        "collision_layer": collision_layer,
+        "grain_dir": grain_dir,
+        "mass": mass,
+        "granularity": spacing_m * 1e3,
+        "thickness": thickness_mm,
+        "friction": friction,
+        "stretch": np.asarray((1.0, 1.0, 1.0), dtype=np.float32),
+        "bending": np.asarray((1.0, 1.0, 1.0), dtype=np.float32),
+        "fixed_vertices": pinned,
+        "attached_vertices": np.zeros(num_vertices, dtype=np.float32),
+    }
