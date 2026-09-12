@@ -112,6 +112,103 @@ typedef lbvh3d::AABB3D AABB;
     } \
     query_result[0] = query_count
 
+// Squared distance between two AABBs (0 when they overlap). Used to prune
+// BVH subtrees that cannot contain anything closer than the current worst
+// entry of a full top-K list.
+__device__ __forceinline__ float aabb_sq_distance(const AABB& a, const AABB& b) {
+    float sum = 0.0f;
+    const float a_min[3] = { a.min.x, a.min.y, a.min.z };
+    const float a_max[3] = { a.max.x, a.max.y, a.max.z };
+    const float b_min[3] = { b.min.x, b.min.y, b.min.z };
+    const float b_max[3] = { b.max.x, b.max.y, b.max.z };
+#pragma unroll
+    for ( int axis = 0; axis < 3; ++axis ) {
+        const float gap = fmaxf(fmaxf(a_min[axis] - b_max[axis],
+                                      b_min[axis] - a_max[axis]), 0.0f);
+        sum += gap * gap;
+    }
+    return sum;
+}
+
+// Keeps the nearest `result_size - 1` primitives instead of the first ones
+// found: the traversal runs to completion and every visited primitive goes
+// through `topk_insert`, so a closer primitive discovered later still enters
+// the list. The caller owns `topk_dist` / `topk_key` / `topk_n`.
+#define BVH_QUERY_LOOP_TOPK(Q_AABB, STACK_SIZE, ...) \
+    unsigned int stack[STACK_SIZE]; \
+    int sp = 0; \
+    stack[sp++] = root_idx; \
+    while (sp > 0) { \
+        unsigned int node_idx = stack[--sp]; \
+        if (!aabb_overlap_3d(Q_AABB, aabbs[node_idx])) continue; \
+        int2 node = nodes[node_idx]; \
+        if (node.y == 0) { \
+            int prim_idx = node.x - 1; \
+            __VA_ARGS__ \
+        } else if (sp < STACK_SIZE - 2) { \
+            stack[sp++] = node.x - 1; \
+            stack[sp++] = node.y - 1; \
+        } \
+    }
+
+// Insert one candidate into a fixed-size list that keeps the nearest K.
+// The list is left unsorted (the consumer accumulates forces, so order does
+// not matter): append while there is room, afterwards replace the current
+// worst entry only when the candidate is closer. `worst` caches the largest
+// distance in the list so callers can prune with an O(1) test.
+__device__ __forceinline__ void topk_insert_unsorted(
+    float* dist, int* key, int& count, int capacity, float value, int entry,
+    float& worst) {
+    if ( capacity <= 0 ) return;
+    if ( count < capacity ) {
+        dist[count] = value;
+        key[count] = entry;
+        ++count;
+        if ( value > worst ) worst = value;
+        return;
+    }
+    if ( value < worst ) {
+        int slot = 0;
+#pragma unroll 4
+        for ( int i = 1; i < capacity; ++i ) {
+            if ( dist[i] > dist[slot] ) slot = i;
+        }
+        dist[slot] = value;
+        key[slot] = entry;
+        worst = dist[0];
+#pragma unroll 4
+        for ( int i = 1; i < capacity; ++i ) {
+            if ( dist[i] > worst ) worst = dist[i];
+        }
+    }
+}
+
+// Insert one candidate into a distance-sorted fixed-size list (K is small).
+__device__ __forceinline__ void topk_insert(
+    float* dist, int* key, int& count, int capacity, float value, int entry) {
+    if ( capacity <= 0 ) return;
+    if ( count < capacity ) {
+        int i = count++;
+        while ( i > 0 && dist[i - 1] > value ) {
+            dist[i] = dist[i - 1];
+            key[i] = key[i - 1];
+            --i;
+        }
+        dist[i] = value;
+        key[i] = entry;
+    }
+    else if ( value < dist[capacity - 1] ) {
+        int i = capacity - 1;
+        while ( i > 0 && dist[i - 1] > value ) {
+            dist[i] = dist[i - 1];
+            key[i] = key[i - 1];
+            --i;
+        }
+        dist[i] = value;
+        key[i] = entry;
+    }
+}
+
 #define BVH_TRAVERSE_LOOP(Q_AABB, STACK_SIZE, ...) \
     unsigned int stack[STACK_SIZE]; \
     int sp = 0; \

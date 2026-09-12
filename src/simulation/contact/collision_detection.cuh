@@ -218,18 +218,28 @@ static __global__ void query_vf_pairs_capsule_kernel(
     };
 
     bool is_active = i < active_vertices_size;
-    // @formatter:off
-    BVH_QUERY_LOOP(q_aabb, 64,0, {
+    // Nearest-first candidate selection. Pass 1 is the historical
+    // first-come-first-served traversal (early exit once the row is full), so
+    // sparse rows keep their original cost. Pass 2 runs only for rows that
+    // saturated and re-walks the tree with pruning, so a closer triangle found
+    // later can still displace a farther one.
+    float topk_dist[broad_phase_size];
+    int topk_key[broad_phase_size];
+    int topk_n = 0;
+    float topk_worst = -1e30f;
+    const int topk_cap = min(result_size - 1, (int)broad_phase_size);
+    bool stopped_full = false;
+    auto consider = [&](int prim_idx) {
         int3 f = faces[prim_idx];
-        if ( f.x == i || f.y == i || f.z == i ) continue;
-        if (!is_active && f.x >= active_vertices_size) continue;
+        if ( f.x == i || f.y == i || f.z == i ) return;
+        if ( !is_active && f.x >= active_vertices_size ) return;
         // Seam exclusion: skip triangles adjacent (cluster members or
         // their 1-ring) to the query vertex's stitch cluster.
         if ( is_active && cluster_id[i] >= 0 && (
              seam_cluster_excludes(i, f.x, cluster_id, cluster_lookup, cluster_members, edge_lookup, dir_edges) ||
              seam_cluster_excludes(i, f.y, cluster_id, cluster_lookup, cluster_members, edge_lookup, dir_edges) ||
              seam_cluster_excludes(i, f.z, cluster_id, cluster_lookup, cluster_members, edge_lookup, dir_edges)) )
-            continue;
+            return;
         float3 A0 = pos[f.x], A1 = pos_target[f.x];
         float3 B0 = pos[f.y], B1 = pos_target[f.y];
         float3 C0 = pos[f.z], C1 = pos_target[f.z];
@@ -245,13 +255,57 @@ static __global__ void query_vf_pairs_capsule_kernel(
 
         if ( !capsule_capsule_intersects(P0, P1, r_p,
                                          tri_cap_start, tri_cap_end, tri_cap_radius) )
-            continue;
+            return;
         float3 force_dir = cross(B0 - A0, C0 - A0);
         int sign = dot(force_dir, P0 - A0) >= 0.0f ? 1 : -1;
-        query_result[++query_count] = sign * prim_idx;
-    });
+        float3 closest;
+        topk_insert_unsorted(topk_dist, topk_key, topk_n, topk_cap,
+            point_triangle_sq_dist(P0, A0, B0, C0, closest), sign * prim_idx,
+            topk_worst);
+    };
+    // @formatter:off
+    {
+        unsigned int stack[64];
+        int sp = 0;
+        stack[sp++] = root_idx;
+        while (sp > 0) {
+            if (topk_n >= topk_cap) { stopped_full = true; break; }
+            unsigned int node_idx = stack[--sp];
+            if (!aabb_overlap_3d(q_aabb, aabbs[node_idx])) continue;
+            int2 node = nodes[node_idx];
+            if (node.y == 0) {
+                consider(node.x - 1);
+            } else if (sp < 62) {
+                stack[sp++] = node.x - 1;
+                stack[sp++] = node.y - 1;
+            }
+        }
+    }
+    if (stopped_full) {
+        unsigned int stack[64];
+        int sp = 0;
+        stack[sp++] = root_idx;
+        while (sp > 0) {
+            unsigned int node_idx = stack[--sp];
+            if (topk_n >= topk_cap
+                && aabb_sq_distance(q_aabb, aabbs[node_idx]) > topk_worst)
+                continue;
+            if (!aabb_overlap_3d(q_aabb, aabbs[node_idx])) continue;
+            int2 node = nodes[node_idx];
+            if (node.y == 0) {
+                consider(node.x - 1);
+            } else if (sp < 62) {
+                stack[sp++] = node.x - 1;
+                stack[sp++] = node.y - 1;
+            }
+        }
+    }
     // @formatter:on
-
+    int* query_result = &query_results[i * result_size];
+    query_result[0] = topk_n;
+    for ( int slot = 0; slot < topk_n; ++slot ) {
+        query_result[slot + 1] = topk_key[slot];
+    }
 }
 
 static __device__ int debug_e_id;
