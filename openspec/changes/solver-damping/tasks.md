@@ -594,5 +594,36 @@
       extra outer iterations expensive). The default stays 1 (inert), per 6.1's
       rule that an existing scene keeps its behavior until its own parameter
       block enables a mechanism.
+- [x] 2.23 The per-vertex force-balance instrument was attempted and does not yet
+      answer the tangential-drive question; recording it so the next attempt
+      starts from the right units.
+
+      `check_point_attributes` returns `force` (the step's accumulated force
+      buffer) and `force_elastic` (its elastic part), and the local probe
+      normalises both by `mass * g`. At the shipped material scale that yardstick
+      is meaningless: a vertex covers `0.1 kg/m^2 * (3.63 mm)^2 = 1.3e-6 kg`, so
+      its weight is `1.3e-5 N` while the membrane forces are of order 1 N - the
+      printed ratios are 1e4-1e8 and carry no information. **What does hold:** the
+      garment's whole weight is `0.42 m^2 * 0.1 kg/m^2 * 9.8 = 0.41 N` against
+      membrane forces four to five orders of magnitude larger, so gravity is
+      negligible in this scene.
+
+      That is the missing explanation for the maintainer's earlier "mass has no
+      effect" observation (task 2.7's mass x1000 row): at this stiffness even a
+      1000x mass leaves gravity 1-2 orders below the membrane force, so the mass
+      is not a lever on this motion, and residual forces must be read in units of
+      the local elastic force, not of the vertex weight.
+
+      Reading the aggregate residual in those terms: `newton_final` is a squared
+      norm over 25,956 vertices, so the RMS residual force after the substep is
+      `sqrt(228319 / 25956) = 2.97 N` per vertex, against sampled elastic forces
+      of order 0.1-1 N. The substep problem is therefore genuinely unsolved, not
+      converged-but-jittering - which is the same statement as 2.22's
+      `newton_relative` of 0.9, seen from the force side.
+
+      Still owed: residual per vertex in units of the local elastic force, and
+      the tangential contact force against the friction cap (the cap only ramps
+      up below `friction_epsilon * h` of slip, 45 um per substep, against the
+      observed 200 um).
 - [ ] 8.2 Update the spec requirement that still needs a maintainer decision
       (defaults on/off) if the decision changes the requirement text.
