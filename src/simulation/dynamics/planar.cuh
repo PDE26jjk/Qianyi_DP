@@ -2,8 +2,33 @@
 #include "common/vec_math.h"
 #include "common/atomic_utils.cuh"
 
-constexpr float base_spring_stiffness = 8e2; // empirical global stiffness factor
-constexpr float base_fem_stiffness = base_spring_stiffness * 3.4641f; // 2*3^0.5, Approximation of an equilateral triangle
+// Membrane stiffness: the force per unit strain of one mesh edge (N/m). One
+// value drives both planar models so the spring-mass and the FEM_BW paths
+// stay in correspondence; the FEM factor is the equilateral-triangle
+// approximation (2*sqrt(3)) this model has always used.
+//
+// The value comes from the `base_spring_stiffness` parameter (see
+// Geometry::init). The default is calibrated against low-load tensile data of
+// woven apparel fabric: the measured E*t of such fabric is 3-10 kN/m (FAST
+// E100 / KES) and a triangular spring lattice has E*t ~= 1.15 * k, which puts
+// the shipped value at 4 kN/m.
+constexpr float default_base_spring_stiffness = 4.0e3f;
+constexpr float fem_stiffness_factor = 3.4641f; // 2*sqrt(3)
+
+// Strain stiffening (X. Provot, Graphics Interface 1995): below `start` the
+// membrane keeps its calibrated modulus; above it the modulus grows
+// exponentially with the strain, so the cloth resists being pulled long while
+// a forced deformation (drag, pin) can still stretch it against a rapidly
+// growing force. Tension only - compression keeps the base modulus, so the
+// excess material still folds instead of pushing back.
+constexpr float default_strain_stiffen_start = 5.0e-2f; // 5% strain
+constexpr float default_strain_stiffen_rate = 2.0f;
+constexpr float strain_stiffen_max_factor = 1.0e3f;
+
+__device__ inline float strain_stiffen_factor(float strain, float start, float rate) {
+    if ( start <= 0.f || strain <= start ) return 1.f;
+    return fminf(expf(rate * (strain / start - 1.f)), strain_stiffen_max_factor);
+}
 
 
 // T. Liu, A. W. Bargteil, J. F. O’Brien, and L. Kavan, "Fast simulation of mass-spring systems," ACM Trans. Graph., vol. 32, no. 6, p. 214:1-214:7, Nov. 2013, doi: 10.1145/2508363.2508406.
@@ -13,14 +38,15 @@ static __global__ void pd_precompute_spring_forces(
     const int2* __restrict__ edges,
     const ObjectDataInput* __restrict__ obj_data,
     const int* __restrict__ vertices_obj,
-    const int n // edge size
+    const int n, // edge size
+    const float base_spring_k // membrane stiffness, N/m
 ) {
     for ( int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
           i += blockDim.x * gridDim.x ) {
         auto [v0,v1] = edges[i];
         float3 ks = obj_data[vertices_obj[v0]].stretch;
 
-        float k = base_spring_stiffness * (ks.x + ks.y + ks.z) * 0.333f;
+        float k = base_spring_k * (ks.x + ks.y + ks.z) * 0.333f;
         float weight = k;
         atomicAdd(&Jx_diag_scalar[v0], weight);
         atomicAdd(&Jx_diag_scalar[v1], weight);
@@ -112,7 +138,10 @@ static __global__ void accumulate_spring_forces(
     const float* __restrict__ edge_lengths,
     const ObjectDataInput* __restrict__ obj_data,
     const int* __restrict__ vertices_obj,
-    const int n // edge size
+    const int n, // edge size
+    const float base_spring_k, // membrane stiffness, N/m
+    const float stiffen_start, // strain where stiffening starts
+    const float stiffen_rate   // exponential stiffening rate
 ) {
     for ( int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
           i += blockDim.x * gridDim.x ) {
@@ -120,7 +149,10 @@ static __global__ void accumulate_spring_forces(
         float3 p0 = vertices[v0], p1 = vertices[v1];
         float3 ks = obj_data[vertices_obj[v0]].stretch;
         float rest_length = edge_lengths[i];
-        float k = base_spring_stiffness * (ks.x + ks.y + ks.z) * 0.333f;
+        float k = base_spring_k * (ks.x + ks.y + ks.z) * 0.333f;
+        const float strain = rest_length > 1e-12f
+            ? (norm(p0 - p1) - rest_length) / rest_length : 0.f;
+        k *= strain_stiffen_factor(strain, stiffen_start, stiffen_rate);
         float3 force;
         Mat3 K;
         float energy;
@@ -165,7 +197,12 @@ static __global__ void compute_BW_FEM(
     float psd_clamp,
     // 1 = add the (positive semidefinite) rank-one part of the shear Hessian,
     // which the force terms already use but the operator was missing.
-    float shear_hessian
+    float shear_hessian,
+    // Membrane stiffness of the spring-mass model (N/m); the planar
+    // finite-element stiffness is derived from it with `fem_stiffness_factor`.
+    const float base_spring_k,
+    const float stiffen_start, // strain where stiffening starts
+    const float stiffen_rate   // exponential stiffening rate
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if ( i >= num_triangles )
@@ -174,7 +211,7 @@ static __global__ void compute_BW_FEM(
     if ( area <= 0.f ) return; // collapsed dart triangle (seam cluster)
 
     Mat2 Dm = Dms[i];
-    float Dm_det = Dm.det();
+    // float Dm_det = Dm.det();
     // float area = fabs(Dm_det) * 0.5f;
     Mat2 Dm_inv = Dm.inverse();
 
@@ -194,9 +231,10 @@ static __global__ void compute_BW_FEM(
     float3 e2 = vertices[v2_idx] - v0;
 
     // stiffnesses from object data (stretch.x = u, .y = v, .z = shear)
-    const float3 stretch = obj_data[vertices_obj[v0_idx]].stretch * base_fem_stiffness;
-    const float ku = stretch.x;
-    const float kv = stretch.y;
+    const float3 stretch =
+        obj_data[vertices_obj[v0_idx]].stretch * (base_spring_k * fem_stiffness_factor);
+    float ku = stretch.x;
+    float kv = stretch.y;
     const float ks = stretch.z;
 
     float wudp1 = Dm_inv.r[0].x; // Dm_inv[0, 0]
@@ -213,6 +251,10 @@ static __global__ void compute_BW_FEM(
     // Constraint violations
     float Cu = wu_norm - 1.0f;
     float Cv = wv_norm - 1.0f;
+
+    // Strain stiffening, tension only (see accumulate_spring_forces).
+    ku *= strain_stiffen_factor(Cu, stiffen_start, stiffen_rate);
+    kv *= strain_stiffen_factor(Cv, stiffen_start, stiffen_rate);
 
     // Gradients w.r.t. material coordinates
     float3 Cudp1 = wu_ * wudp1;

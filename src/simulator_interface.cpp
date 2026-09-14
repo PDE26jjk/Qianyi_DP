@@ -110,7 +110,12 @@ void SimulatorInterface::input_data(py::dict input) {
         nb_all_e += (int)_edges.size();
         nb_all_f += (int)_triangles.size();
         if ( object_type == 0 ) {
-            obj_data[i].mass_densitys = mesh["mass"].cast<float>();
+            // Frontend contract: `mass` is the fabric weight in g/m^2 (the
+            // Blender fabric "weight" property, default 100 - a typical woven
+            // apparel weight). The solver works in kg/m^2, so convert it here
+            // the same way `granularity` and `thickness` are converted from
+            // millimetres just below.
+            obj_data[i].mass_densitys = mesh["mass"].cast<float>() * 0.001f;
             // mass_densitys[i] = mesh["mass"].cast<float>();
             obj_data[i].granularity = mesh["granularity"].cast<float>() * 0.001f; // mm->m
             obj_data[i].friction = mesh["friction"].cast<float>();

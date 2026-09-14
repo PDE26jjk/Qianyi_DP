@@ -444,6 +444,7 @@ __global__ void solve_elasticity_springs_kernel(
     const int* __restrict__ color_groups,
     const float kd,// damping
     float dt,
+    const float base_spring_k, // membrane stiffness, N/m
     int color_groups_size
 ) {
     int block_idx = blockIdx.x;
@@ -464,7 +465,7 @@ __global__ void solve_elasticity_springs_kernel(
     auto [offset ,count] = edge_lookup[pid];
     // ---------- accumulate contributions from all incident springs ----------
     float3 ks = obj_data[vertices_obj[pid]].stretch;
-    float k = base_spring_stiffness * (ks.x + ks.y + ks.z) * 0.333f;
+    float k = base_spring_k * (ks.x + ks.y + ks.z) * 0.333f;
     for ( int i = tid; i < count; i += block_size ) {
         int2 elem = dir_edges[offset + i];
 
@@ -1224,6 +1225,7 @@ void SolverVBD::step(float h) {
                 geo->edge_lookup.data().get(),
                 geo->dir_edges.data().get(),
                 color_group_begin, damping, h,
+                geo->get_global_parameter("base_spring_stiffness", default_base_spring_stiffness),
                 color_size);
 
             vbd_self_contact_kernel<<<(total_threads + block - 1) / block, block>>>(

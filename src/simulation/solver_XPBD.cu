@@ -102,6 +102,7 @@ __global__ void xpbd_solve_springs_kernel(
     const int* __restrict__ vertices_obj,
     const float damping,             // kd
     const float h,                                 // time step
+    const float base_spring_k,                     // membrane stiffness, N/m
     const int num_edges                            // number of distance constraints
 ) {
     int i = threadIdx.x + blockIdx.x * blockDim.x;
@@ -136,7 +137,7 @@ __global__ void xpbd_solve_springs_kernel(
     if ( denom <= 0.0f ) return;
 
     float3 ks = obj_data[vertices_obj[v0]].stretch;
-    const float ke = base_spring_stiffness * (ks.x + ks.y + ks.z) * 0.333f;
+    const float ke = base_spring_k * (ks.x + ks.y + ks.z) * 0.333f;
     const float kd = damping;
     if ( ke <= 0.0f ) return;
 
@@ -172,6 +173,7 @@ __global__ void xpbd_solve_triangle_fem_kernel(
     const float damping,                           // optional global material damping factor (0 = no damping)
     const float relaxation,                        // global relaxation factor
     const float dt,                                // time step
+    const float base_spring_k,                     // membrane stiffness, N/m
     const int num_triangles
 ) {
     int tid = threadIdx.x + blockIdx.x * blockDim.x;
@@ -191,7 +193,8 @@ __global__ void xpbd_solve_triangle_fem_kernel(
     const Mat2 Dm_inv = Dm.inverse();
 
     // stiffnesses from object data (stretch.x = u, .y = v, .z = shear)
-    const float3 stretch = obj_data[vertices_obj[v0]].stretch * base_fem_stiffness;
+    const float3 stretch =
+        obj_data[vertices_obj[v0]].stretch * (base_spring_k * fem_stiffness_factor);
     const float ku = stretch.x;
     const float kv = stretch.y;
     const float ks = stretch.z;
@@ -689,13 +692,15 @@ void SolverXPBD::step(float h) {
         if ( lambdas )
             cudaMemsetAsync(lambdas, 0, this->lambdas.size() * sizeof(float));
         for ( int j = 0; j < dynamics_iters; j++ ) {
+            const float base_spring_k = geo->get_global_parameter(
+                "base_spring_stiffness", default_base_spring_stiffness);
             if ( geo->constitutive_model == ConstitutiveModel::SpringMass ) {
                 n = params.nb_all_cloth_edges;
                 xpbd_solve_springs_kernel<<<(n + block - 1) / block, block>>>(lambdas, dx,
                     q, v, mass_inv, edges,
                     geo->edge_lengths.data().get(),
                     obj_data, vertices_obj,
-                    damping, h, n);
+                    damping, h, base_spring_k, n);
             }
             else if ( geo->constitutive_model == ConstitutiveModel::FEM_BW ) {
                 n = params.nb_all_cloth_triangles;
@@ -704,7 +709,7 @@ void SolverXPBD::step(float h) {
                     q, v, mass_inv, tris,
                     geo->Dms.data().get(),
                     obj_data, vertices_obj,
-                    damping, relaxation, h, n);
+                    damping, relaxation, h, base_spring_k, n);
             }
         }
         // contact.ccd_truncation_traverse_bvh(q_prev, q);

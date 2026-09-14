@@ -152,11 +152,17 @@ void SolverExplicit::step(float h) {
     // }
 
     n = params.nb_all_cloth_edges;
+    const float base_spring_k =
+        geo->get_global_parameter("base_spring_stiffness", default_base_spring_stiffness);
+    const float stiffen_start =
+        geo->get_global_parameter("strain_stiffen_start", default_strain_stiffen_start);
+    const float stiffen_rate =
+        geo->get_global_parameter("strain_stiffen_rate", default_strain_stiffen_rate);
     accumulate_spring_forces<<<(n + block - 1) / block, block>>>(nullptr, nullptr,
         f_elastic, nullptr, q, edges,
         geo->edge_lengths.data().get(),
         geo->obj_data.data().get(), geo->vertices_obj.data().get(),
-        n);
+        n, base_spring_k, stiffen_start, stiffen_rate);
     n = params.nb_all_cloth_triangles;
     // compute_ARAP_FEM<<<(n + block - 1) / block, block>>>(
     //     nullptr, nullptr,
