@@ -90,4 +90,8 @@ LOCAL_DEV.md
 build/artifacts/
 tests/artifacts/
 
+# Local profiling runs (profiler captures, harness scripts, reports): large and
+# machine-local, like the notes in LOCAL_DEV.md
+profile/
+
 study*.ipynb
