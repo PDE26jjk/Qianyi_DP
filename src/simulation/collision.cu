@@ -820,7 +820,8 @@ void Contact::accumulate_contact_force(float3* forces, Mat3* Jx_diag, float h,
         geo->vertices_obj.data().get(),
         geo->edge_normals.data().get(),
         ee_force_type, cloth_vertices,
-        ee_force_k, friction_slip_eps, num_edges
+        ee_force_k, friction_slip_eps,
+        num_edges
         );
 
     solve_untangling_kernel<<<(num_edges + threadsPerBlock - 1) / threadsPerBlock, threadsPerBlock, 0, stream>>>(

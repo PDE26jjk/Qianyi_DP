@@ -166,6 +166,7 @@ inline void edges_to_csr(
     cudaFree(d_sort_keys);
     cudaFree(d_sort_values);
 }
+
 __device__ inline float3 clamp_to_trajectory_envelope(
     const float3& A,        // pos_prev
     const float3& B,        // pos_target_initial
