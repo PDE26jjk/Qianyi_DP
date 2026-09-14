@@ -15,6 +15,7 @@
 
 #include "constraint.cuh"
 #include "geometric_operator.cuh"
+#include "common/atomic_utils.cuh"
 #include "color_graph/coloring.h"
 #include "common/cuda_utils.h"
 #include "contact/collision.cuh"
@@ -938,7 +939,10 @@ void Geometry::end_for_frame() {
     int smooth_times = max(0, (int)get_global_parameter("smooth_times", 5));
     if ( !sewing_done ) { smooth_times *= 2; } // TODO 
     for ( int i = 0; i < smooth_times; ++i ) {
-        laplacian_smoothing<<<n + block - 1, block>>>(
+        // Grid size is blocks-per-grid, not threads: the kernel bounds-checks
+        // every thread, so the old form launched 256x more blocks than the
+        // point count and made every extra thread retire on that check.
+        laplacian_smoothing<<<blocksPerGrid, block>>>(
             temp_vertices_f3.data().get(),
             velocities.data().get(),
             vertices_mask.data().get(),
