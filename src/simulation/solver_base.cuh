@@ -1,5 +1,6 @@
 #pragma once
 #include <mutex>
+#include <vector>
 
 #include "simulator.h"
 
@@ -33,6 +34,9 @@ struct SolverBase {
     Simulator* simulator;
 
 public:
+    // Observability hook: solvers that can report a convergence metric fill
+    // `out` with named values (see SimulatorInterface::get_residual_metrics).
+    virtual void fill_residual_metrics(std::vector<float>& out) {}
     // thrust::device_vector<float3> vertices_2D;
     // thrust::device_vector<float3> vertices_local;
     // thrust::device_vector<float3> vertices_local_new_frame;

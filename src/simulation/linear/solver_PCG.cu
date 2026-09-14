@@ -76,6 +76,21 @@ static __global__ void compute_beta_kernel(
         *beta = *delta_new / *delta_old;
     }
 }
+
+// { initial residual (r^T z), final residual, ratio } of this solve.
+static __global__ void store_residual_metrics_kernel(
+    float* __restrict__ out,
+    const float* __restrict__ delta_initial,
+    const float* __restrict__ delta_final
+) {
+    if ( blockIdx.x == 0 && threadIdx.x == 0 ) {
+        const float d0 = *delta_initial;
+        const float d1 = *delta_final;
+        out[0] = d0;
+        out[1] = d1;
+        out[2] = (d0 > 0.f && d0 == d0) ? d1 / d0 : 0.f;
+    }
+}
 template<bool UsePreprocessingDiag>
 static __global__ void ite_kernel1(
     float3* __restrict__ r,
@@ -84,9 +99,13 @@ static __global__ void ite_kernel1(
     const float3* __restrict__ d,
     const float3* __restrict__ Ad,
     const Mat3* __restrict__ M_inv,
-    const float* alpha,
+    // alpha is computed from these two scalars inside the kernel: a dedicated
+    // 1x1 launch per iteration costs ~2 us of pure launch latency, and every
+    // thread can do this division for free.
+    const float* delta_old,
+    const float* d_dot_Ad,
     int n) {
-    float a = *alpha;
+    float a = (*d_dot_Ad < 0.f) ? 0.f : (*delta_old / *d_dot_Ad);
     for ( int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
           i += blockDim.x * gridDim.x ) {
         x[i] = x[i] + a * d[i];
@@ -100,9 +119,12 @@ static __global__ void ite_kernel1(
 static __global__ void ite_kernel2(
     float3* __restrict__ d,
     const float3* __restrict__ r,
-    const float* beta,
+    // beta = delta_new / delta_old, computed in-kernel for the same reason as
+    // alpha above.
+    const float* delta_new,
+    const float* delta_old,
     int n) {
-    float b = *beta;
+    float b = *delta_new / *delta_old;
     for ( int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
           i += blockDim.x * gridDim.x ) {
         d[i] = r[i] + b * d[i];
@@ -263,6 +285,10 @@ void SolverPCG::solve_impl(float3* dx, const float3* rhs, int max_iters) {
 
     float delta_new_host;
     vector_field_dot(r, UsePreprocessingDiag ? z : r, d_delta_new_ptr);
+    // Keep the initial residual for the observability metric below.
+    float* d_delta_initial_ptr = temp + 5;
+    cudaMemcpyAsync(d_delta_initial_ptr, d_delta_new_ptr, sizeof(float),
+        cudaMemcpyDeviceToDevice, work_stream());
 
     int iter = 0;
     const int check_interval = 10;
@@ -331,23 +357,17 @@ void SolverPCG::solve_impl(float3* dx, const float3* rhs, int max_iters) {
 
         vector_field_dot(d, Ad, d_dot_Ad_ptr);
 
-        // alpha = (r^T * r || z) / dot(d, Ad)
-        compute_alpha_kernel<<<1, 1, 0, work_stream()>>>(d_alpha_ptr, d_delta_old_ptr, d_dot_Ad_ptr);
-
         // x^{i+1} = x^{i} + alpha * d
         // r^{i+1} = r^{i} + alpha * Ad
         // || z^{i+1} = M^{-1} @ r^{i+1}
         ite_kernel1<UsePreprocessingDiag> <<<blocksPerGrid, block, 0, work_stream() >>>(
-            r, x, z, d, Ad, M_inv, d_alpha_ptr, n);
+            r, x, z, d, Ad, M_inv, d_delta_old_ptr, d_dot_Ad_ptr, n);
 
         vector_field_dot(r, UsePreprocessingDiag ? z : r, d_delta_new_ptr);
 
-        // beta = delta_new / delta_old
-        compute_beta_kernel<<<1, 1, 0, work_stream()>>>(d_beta_ptr, d_delta_new_ptr, d_delta_old_ptr);
-
         // d^{i+1} = r^{i+1} + beta * d^{i} || d^{i+1} = z^{i+1} + beta * d^{i}
         ite_kernel2<<<blocksPerGrid, block, 0, work_stream()>>>(
-            d, UsePreprocessingDiag ? z : r, d_beta_ptr, n);
+            d, UsePreprocessingDiag ? z : r, d_delta_new_ptr, d_delta_old_ptr, n);
 
     }
 
@@ -357,6 +377,10 @@ void SolverPCG::solve_impl(float3* dx, const float3* rhs, int max_iters) {
     if ( !failure_flag.empty() ) {
         raise_failure_flag_if_nan_kernel<<<1, 1, 0, work_stream()>>>(
             d_delta_new_ptr, failure_flag.data().get());
+    }
+    if ( !residual_metrics.empty() ) {
+        store_residual_metrics_kernel<<<1, 1, 0, work_stream()>>>(
+            residual_metrics.data().get(), d_delta_initial_ptr, d_delta_new_ptr);
     }
 }
 

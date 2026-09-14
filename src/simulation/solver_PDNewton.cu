@@ -17,6 +17,11 @@
 static __global__ void prepare_linear_step_kernel(
     float3* __restrict__ dx,
     float3* __restrict__ rhs,
+    // `Jx_assembled` holds the element/contact diagonal only; `Jx_diags` is the
+    // solver's matrix and receives the fixed projective diagonal on top.
+    // Splitting them lets a chord iteration reuse the assembly and still write
+    // a clean solver diagonal.
+    const Mat3* __restrict__ Jx_assembled,
     Mat3* __restrict__ Jx_diags,
     Mat3* __restrict__ M_inv,
     const float3* __restrict__ f_elastic,
@@ -24,13 +29,14 @@ static __global__ void prepare_linear_step_kernel(
     const char*__restrict__ mask,
     const float3* __restrict__ pos_world,
     const float3* __restrict__ pos_prev,
+    const float* __restrict__ mass,
     const float mask_stiff,
     int n
 ) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if ( tid >= n ) return;
 
-    Mat3 diag = Jx_diags[tid];
+    Mat3 diag = Jx_assembled[tid];
     diag.add_diag(static_diags[tid]);
     Jx_diags[tid] = diag;
     // prepare_jacobi_preconditioner_kernel
@@ -46,6 +52,7 @@ static __global__ void prepare_linear_step_kernel(
     }
     rhs[tid] += f_elastic[tid];
 }
+
 static __global__ void step_begin_pd(
     float3* __restrict__ rhs,
     const float3* __restrict__ x_inertia,
@@ -163,6 +170,15 @@ static __global__ void step_end_kernel(
     const float max_velocity,
     const bool ground,
     const float ground_f,
+    const float damping_rate,
+    // Creep suppression: below `slow_threshold` the vertex is crawling (the
+    // measured residual motion of a garment pressed on a body moves ~0.2 mm per
+    // 4.5 ms substep and keeps one direction for ~100 substeps), and a linear
+    // velocity decay of `damping_rate` is far too weak to ever remove it.
+    // Damping the slow band harder removes the crawl without taking the
+    // momentum that a real motion - a fall, a drag release - needs.
+    const float slow_damping_rate,
+    const float slow_threshold,
     const int n
 ) {
     for ( int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
@@ -186,7 +202,10 @@ static __global__ void step_end_kernel(
                 x = x_old + v * h;
                 pos_world[i] = x;
             }
-            v = v * expf(-h * 0.5f);
+            const float speed = norm(v);
+            const float rate = ( slow_threshold > 0.0f && speed < slow_threshold )
+                ? slow_damping_rate : damping_rate;
+            v = v * expf(-h * rate);
             velocities[i] = v;
         }
         else {
@@ -226,6 +245,8 @@ void SolverPDNewton::init() {
     linear->init(params.nb_all_cloth_vertices, (int)geo->valid_pairs.size(), false);
 
     dx.resize(params.nb_all_vertices);
+    Jx_diag_assembled.assign(params.nb_all_vertices, Mat3::zero());
+    newton_residual.assign(2, 0.f);
 
     // Subspace (reduced-basis) acceleration is disabled: it measured slower
     // than the plain PCG path. The implementation stays in subspace.cu for
@@ -237,12 +258,14 @@ void SolverPDNewton::init() {
     linear->Jx_bend_cross_identity.assign(params.nb_all_edges, 0.f);
     int block = 256;
     int n = params.nb_all_cloth_edges;
+    const float base_spring_k =
+        geo->get_global_parameter("base_spring_stiffness", default_base_spring_stiffness);
     pd_precompute_spring_forces<<<(n + block - 1) / block, block>>>(
         Jx_diag_pd.data().get(),
         linear->Jx_nondiag_identity.data().get(),
         geo->edges.data().get(),
         geo->obj_data.data().get(), geo->vertices_obj.data().get(),
-        n);
+        n, base_spring_k);
     // Disabled together with the subspace path above: H_red / M_red are only
     // consumed by SolverSubspace::A_mult_x, so the reduction is dead work now.
     // geo->precompute_subspace_H(Jx_diag_pd.data().get(), linear->Jx_nondiag_identity.data().get());
@@ -302,13 +325,36 @@ void SolverPDNewton::step(float h) {
     const float* Jx_diag_pd = this->Jx_diag_pd.data().get();
     // const float* Jx_nondiag_pd = this->Jx_nondiag_pd.data().get();
     Mat3* Jx_diag = linear->Jx_diag.data().get();
+    Mat3* Jx_diag_assembled = this->Jx_diag_assembled.data().get();
+    const int hessian_every =
+        max(1, (int)get_global_parameter("pd_hessian_every", 1.f));
     Mat3* M_inv = linear->M_inv.data().get();
     Mat3* Jx_nondiag = linear->Jx_nondiag.data().get();
     float* static_diags = geo->static_diags.data().get();
     cudaMemcpyAsync(static_diags, Jx_diag_pd, n * sizeof(float), cudaMemcpyDeviceToDevice);
     float mask_stiff = max(0.f, get_global_parameter("mask_stiff", 1e2f));
+    const float base_spring_k =
+        geo->get_global_parameter("base_spring_stiffness", default_base_spring_stiffness);
+    const float stiffen_start =
+        geo->get_global_parameter("strain_stiffen_start", default_strain_stiffen_start);
+    const float stiffen_rate =
+        geo->get_global_parameter("strain_stiffen_rate", default_strain_stiffen_rate);
+    const float velocity_damping =
+        max(0.f, get_global_parameter("velocity_damping", 0.5f));
+    const float creep_damping =
+        max(0.f, get_global_parameter("creep_damping", 0.f));
+    const float creep_speed =
+        max(0.f, get_global_parameter("creep_speed", 0.03f));
     auto& contact = geo->get_contact();
     float query_radius = max(0.f, get_global_parameter("query_radius", 0.001f));
+    // The PD step clamps every vertex into a tube of this radius around the
+    // inertia segment, once per iteration. Decoupling this limiter from the
+    // contact band (pd_trajectory_margin) and replacing the tube with a
+    // per-iteration |dx| bound (pd_step_limit) were both measured and removed:
+    // a looser bound increased the wander (display-frame motion 0.91 -> 1.21 mm)
+    // without improving the Newton residual (0.970 -> 0.981 per substep), and
+    // the |dx| form was worse (1.41 mm). Neither is the residual bottleneck.
+    const float trajectory_margin = query_radius;
     forward_step<<<(n + block - 1) / block, block>>>(
         v, v_prev, mass_inv,
         nullptr, f_elastic,
@@ -398,49 +444,67 @@ void SolverPDNewton::step(float h) {
                 n_bend, bending_k);
     };
 
-    auto run_pd_iteration = [&]() {
+    // Chord / modified-Newton: when `assemble` is false the element and contact
+    // Hessians are not rebuilt and the linear solve reuses the previous
+    // assembly, while every force term is still evaluated at the current
+    // positions. The forces and the fixed projective diagonal are unchanged, so
+    // the fixed point of the substep is the same; only the Newton curvature is
+    // stale for the skipped iterations.
+    float* newton_residual_ptr = newton_residual.data().get();
+    auto run_pd_iteration = [&](bool assemble, int record_slot) {
+        Mat3* Jx_hess = assemble ? Jx_diag_assembled : nullptr;
+        Mat3* Jx_off = assemble ? Jx_nondiag : nullptr;
         n = params.nb_all_cloth_vertices;
         cudaMemsetAsync(f, 0, sizeof(float3) * n, work_stream);
         cudaMemsetAsync(f_elastic, 0, sizeof(float3) * n, work_stream);
-        cudaMemsetAsync(Jx_diag, 0, sizeof(Mat3) * n, work_stream);
-        // Row space = valid_pairs (natural edges + deduped bend pairs); clear
-        // the whole table every iteration, not just the edge part.
-        cudaMemsetAsync(Jx_nondiag, 0,
-            sizeof(Mat3) * geo->valid_pairs.size(), work_stream);
-        contact.accumulate_contact_force(f, Jx_diag, h, work_stream);
+        if ( assemble ) {
+            cudaMemsetAsync(Jx_diag_assembled, 0, sizeof(Mat3) * n, work_stream);
+            // Row space = valid_pairs (natural edges + deduped bend pairs);
+            // clear the whole table when assembling, not just the edge part.
+            cudaMemsetAsync(Jx_nondiag, 0,
+                sizeof(Mat3) * geo->valid_pairs.size(), work_stream);
+        }
+        contact.accumulate_contact_force(f, Jx_hess, h, work_stream);
         step_begin_pd<<<(n + block - 1) / block, block, 0, work_stream>>>(f, q_inertia, q, mass, h, n);
         n = params.nb_all_cloth_edges;
-        geo->accumulate_sewing_force(Jx_diag, work_stream);
+        geo->accumulate_sewing_force(Jx_hess, work_stream);
         if ( geo->constitutive_model == ConstitutiveModel::SpringMass ) {
             accumulate_spring_forces<<<(n + block - 1) / block, block, 0, work_stream>>>(
-                Jx_nondiag, Jx_diag, f_elastic, nullptr, q, edges,
+                Jx_off, Jx_hess, f_elastic, nullptr, q, edges,
                 geo->edge_lengths.data().get(),
                 obj_data, vertices_obj,
-                n);
+                n, base_spring_k, stiffen_start, stiffen_rate);
         }
         else if ( geo->constitutive_model == ConstitutiveModel::FEM_BW ) {
             n = params.nb_all_cloth_triangles;
             compute_BW_FEM<<<(n + block - 1) / block, block, 0, work_stream>>>(
-                Jx_nondiag, Jx_diag, f_elastic, nullptr, q, tri_edges,
+                Jx_off, Jx_hess, f_elastic, nullptr, q, tri_edges,
                 edges, geo->Dms.data().get(), geo->areas.data().get(),
                 obj_data, vertices_obj,
-                n, fem_psd_clamp, fem_shear_hessian);
+                n, fem_psd_clamp, fem_shear_hessian, base_spring_k,
+                stiffen_start, stiffen_rate);
         }
 
         n = n_bend;
-        launch_bending(Jx_nondiag, Jx_diag);
+        launch_bending(Jx_off, Jx_hess);
 
         n = params.nb_all_cloth_vertices;
 
         prepare_linear_step_kernel<<<(n + block - 1) / block, block, 0, work_stream>>>(
-            dx, f, Jx_diag, M_inv, f_elastic, static_diags, mask, q, q_prev, mask_stiff, n);
+            dx, f, Jx_diag_assembled, Jx_diag, M_inv, f_elastic, static_diags, mask, q, q_prev,
+            mass, mask_stiff, n);
+        if ( record_slot >= 0 ) {
+            // The Newton residual of this outer iteration: the force residual
+            // the linear solve is about to remove.
+            linear->vector_field_dot(f, f, newton_residual_ptr + record_slot);
+        }
 
         // Subspace acceleration disabled (see SolverPDNewton::init).
         // if ( i < subspace_iters ) solve_subspace(dx, f);
 
         linear->solve(dx, f, linear_iters);
         step_end_linear<<<(n + block - 1) / block, block, 0, work_stream>>>(
-            q, dx, q_pred, q_prev, query_radius, mask, n);
+            q, dx, q_pred, q_prev, trajectory_margin, mask, n);
     };
 
     // A frame issues ~690 kernels, and on this driver a launch that has to
@@ -457,7 +521,9 @@ void SolverPDNewton::step(float h) {
     // to frame.
     auto run_pd_loop = [&]() {
         for ( int i = 0; i < iters; i++ ) {
-            run_pd_iteration();
+            const int record_slot = (i == 0) ? 0 : ((i == iters - 1) ? 1 : -1);
+            run_pd_iteration(hessian_every <= 1 || (i % hessian_every) == 0,
+                record_slot);
             geo->project_stitches(work_stream); // seam projection, once per iter
         }
     };
@@ -468,9 +534,12 @@ void SolverPDNewton::step(float h) {
     const int sewing_activation =
         max(0, (int)get_global_parameter("sewing_forced_connect_frame", 80.f));
     const bool projection_active = simulator->frame > sewing_activation;
+    const float projection_snap_max =
+        max(0.f, get_global_parameter("sewing_snap_max_dist", 1.f));
     const float projection_snap_dist = projection_active
         ? min(max(0.f, get_global_parameter("sewing_snap_dist", 3e-3f))
-              * powf(1.5f, (float)(simulator->frame - sewing_activation)), 5e-2f)
+              * powf(1.5f, (float)(simulator->frame - sewing_activation)),
+              projection_snap_max)
         : 0.f;
     const bool graph_enabled = get_global_parameter("pd_cuda_graph", 1.f) > 0.5f;
     if ( graph_enabled && !iter_graph_broken && linear->graph_capture_safe() ) {
@@ -505,6 +574,8 @@ void SolverPDNewton::step(float h) {
         mix_float(mask_stiff);
         mix_float(bending_k);
         mix_float(query_radius);
+        mix_float(trajectory_margin);
+        mix((uint64_t)hessian_every);
         mix_float(projection_snap_dist);
         mix((uint64_t)projection_active);
         // Every array the captured loop reads, by identity and size: a
@@ -625,6 +696,24 @@ void SolverPDNewton::step(float h) {
     n = params.nb_all_vertices;
     cudaMemcpyAsync(v_prev, v, n * sizeof(float3), cudaMemcpyDeviceToDevice);
     step_end_kernel<<<(n + block - 1) / block, block>>>(
-        q, v, q_prev, mask, obj_data, vertices_obj, h, max_vel, geo->ground, ground_f, n);
-    // geo->average_stitch_cluster_velocities(); // drop the snap velocity kick
+        q, v, q_prev, mask, obj_data, vertices_obj, h, max_vel, geo->ground,
+        ground_f, velocity_damping, creep_damping, creep_speed, n);
+    // A locked seam cluster was merged by a hard position projection; without
+    // this pass the next substep reads that teleport as a velocity and injects
+    // it as momentum (the "snap velocity kick").
+    if ( get_global_parameter("seam_merge_velocity", 1.f) > 0.5f ) {
+        geo->average_stitch_cluster_velocities();
+    }
+}
+
+void SolverPDNewton::fill_residual_metrics(std::vector<float>& out) {
+    out.assign(6, 0.f);
+    if ( !newton_residual.empty() ) {
+        cudaMemcpy(out.data(), newton_residual.data().get(), 2 * sizeof(float),
+            cudaMemcpyDeviceToHost);
+        out[2] = (out[0] > 0.f) ? out[1] / out[0] : 0.f;
+    }
+    if ( linear != nullptr ) {
+        linear->read_residual_metrics(out.data() + 3);
+    }
 }

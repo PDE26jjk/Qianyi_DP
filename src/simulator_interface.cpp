@@ -301,6 +301,20 @@ py::dict SimulatorInterface::check_point_attributes(int index) {
     d["nearby_faces"] = data.nearby_faces;
     return d;
 }
+
+py::dict SimulatorInterface::get_residual_metrics() {
+    const auto values = Simulator::instance().get_residual_metrics();
+    py::dict d;
+    const char* names[] = {
+        "newton_initial", "newton_final", "newton_relative",
+        "linear_initial", "linear_final", "linear_relative",
+    };
+    for ( size_t i = 0; i < 6; ++i ) {
+        d[names[i]] = (i < values.size()) ? values[i] : 0.f;
+    }
+    return d;
+}
+
 py::dict SimulatorInterface::check_edge_attributes(int p0, int p1) {
     auto data = Simulator::instance().get_check_edge_data(p0, p1);
     py::dict d;

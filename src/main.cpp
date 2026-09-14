@@ -131,7 +131,10 @@ PYBIND11_MODULE(Qianyi_DP, m) {
             py::arg("p0"), py::arg("p1"))
         .def_static("check_edge_collision_data",
             &SimulatorInterface::check_edge_collision_data,
-            py::arg("p0"), py::arg("p1"));
+            py::arg("p0"), py::arg("p1"))
+        .def_static("get_residual_metrics",
+            &SimulatorInterface::get_residual_metrics,
+            "Solver convergence metrics of the last substep (see the header)");
 
     py::class_<PerfTiming>(m, "PerfTiming")
         .def_static("clear", []() { PerfTiming::global_timer().clear(); })

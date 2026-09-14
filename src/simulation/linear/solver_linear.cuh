@@ -19,6 +19,10 @@ struct LinearSolver {
     virtual void init(int diag_size, int nondiag_size, bool Jx_nondiag_identity_only);
     void vector_field_dot(const float3* a, const float3* b, float* result);
     float vector_field_dot_sync(const float3* a, const float3* b);
+    // Observability: { initial preconditioned residual, final preconditioned
+    // residual, final/initial } of the last linear solve. Diagnostics only.
+    thrust::device_vector<float> residual_metrics;
+    void read_residual_metrics(float* out) const;
     // True when solve() issues no blocking host read, so the launch sequence
     // can be recorded into a CUDA graph. See SolverPDNewton's pd_cuda_graph.
     virtual bool graph_capture_safe() const { return false; }

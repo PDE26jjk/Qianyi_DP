@@ -92,6 +92,7 @@ void LinearSolver::init(int diag_size, int nondiag_size, bool Jx_nondiag_identit
         // Jx_bend_cross.resize(nondiag_size);
     }
     M_inv.resize(diag_size);
+    residual_metrics.assign(3, 0.f);
 
     d_sum_result.resize(1);
 
@@ -123,6 +124,15 @@ void LinearSolver::vector_field_dot(const float3* a, const float3* b, float* res
         n,
         m_work_stream);
 
+}
+
+void LinearSolver::read_residual_metrics(float* out) const {
+    if ( residual_metrics.empty() ) {
+        out[0] = out[1] = out[2] = 0.f;
+        return;
+    }
+    cudaMemcpy(out, residual_metrics.data().get(), 3 * sizeof(float),
+        cudaMemcpyDeviceToHost);
 }
 
 // struct DotProductFunctor {

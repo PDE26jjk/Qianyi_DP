@@ -31,6 +31,12 @@ public:
     static void set_parameters(const std::unordered_map<std::string, float>& params);
     
     static py::dict check_point_attributes(int index);
+    // Observability: solver convergence metrics of the last substep.
+    // newton_initial / newton_final are the squared norms of the force
+    // residual at the first and last outer iteration; linear_initial /
+    // linear_final are the preconditioned residual of the last linear solve
+    // and linear_relative their ratio.
+    static py::dict get_residual_metrics();
     static py::dict check_edge_attributes(int p0, int p1);
     static py::dict check_edge_collision_data(int p0, int p1);
     static void on_exit();

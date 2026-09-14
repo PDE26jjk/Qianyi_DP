@@ -170,6 +170,14 @@ std::vector<std::string> Simulator::get_all_solver() {
     return { "Explicit", "PDNewton", "VBD", "XPBD" };
 }
 
+std::vector<float> Simulator::get_residual_metrics() {
+    std::vector<float> out;
+    if ( m_solver != nullptr ) {
+        m_solver->fill_residual_metrics(out);
+    }
+    return out;
+}
+
 void Simulator::set_solver(const std::string& string) {
     m_solver_name = string;
 }

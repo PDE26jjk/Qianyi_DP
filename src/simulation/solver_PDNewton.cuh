@@ -21,6 +21,17 @@ private:
     std::string m_last_linear_solver_name;
     std::string m_linear_solver_name = "PCG";
     thrust::device_vector<float3> dx;
+    // Observability: { Newton residual of the first outer iteration, of the
+    // last one } in this substep, i.e. the norm of the force residual the
+    // linear solve is asked to remove.
+    thrust::device_vector<float> newton_residual;
+    void fill_residual_metrics(std::vector<float>& out) override;
+    // Assembled (element + contact) diagonal of the tangent, without the
+    // fixed projective part `static_diags`. Kept separate from the solver's
+    // `Jx_diag` so a chord / modified-Newton run can reuse the assembly for
+    // several outer iterations without accumulating the fixed part or the
+    // per-iteration damping diagonal on top of it.
+    thrust::device_vector<Mat3> Jx_diag_assembled;
     thrust::device_vector<float> Jx_diag_pd;
     // thrust::device_vector<float> Jx_nondiag_pd;
     thrust::device_vector<float3> subspace_rhs;

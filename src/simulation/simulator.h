@@ -136,6 +136,9 @@ public:
     uint64_t parameter_version() const { return m_parameter_version; }
     void update_world_matrix(int obj_index, const std::vector<float>& matrix);
     std::vector<std::string> get_all_solver();
+    // Observability: the solver's convergence metrics (see
+    // SimulatorInterface::get_residual_metrics for the named layout).
+    std::vector<float> get_residual_metrics();
     void update_local_vertices(int obj_index, const std::vector<float>& vertices);
     void set_solver(const std::string& string);
 
