@@ -352,7 +352,9 @@ static __global__ void project_stitch_clusters_kernel(
     const float3* __restrict__ pos_prev,
     const float3* __restrict__ pos_target,
     float snap_dist,
-    float envelope_radius,
+    // 1 = force the merge: ignore the spread gate and the trajectory envelope
+    // for this call, i.e. put every free member on the cluster target.
+    int force_merge,
     int n
 ) {
     int c = blockIdx.x * blockDim.x + threadIdx.x;
@@ -379,14 +381,13 @@ static __global__ void project_stitch_clusters_kernel(
     float spread = 0.f;
     for ( int k = begin; k < end; k++ )
         spread = fmaxf(spread, norm(pos[cluster_members[k]] - target));
-    if ( spread > snap_dist ) return;
+    if ( !force_merge && spread > snap_dist ) return;
 
     cluster_locked[c] = 1;
     for ( int k = begin; k < end; k++ ) {
         int v = cluster_members[k];
         if ( inv_mass[v] <= 0.f ) continue;
-        pos[v] = clamp_to_trajectory_envelope(
-            pos_prev[v], pos_target[v], target, envelope_radius);
+        pos[v] = target;
     }
 }
 
@@ -399,8 +400,25 @@ void Geometry::project_stitches(cudaStream_t stream) {
     int activation = max(0, (int)get_global_parameter("sewing_forced_connect_frame", 80.f));
     if ( simulator->frame <= activation ) return;
     float snap_dist = max(0.f, get_global_parameter("sewing_snap_dist", 3e-3f));
-    snap_dist = min(snap_dist * powf(1.5f, (float)(simulator->frame - activation)), 5e-2f);
-    float envelope_radius = max(0.f, get_global_parameter("query_radius", 1e-3f));
+    // The ramp widens the gate as the assembly settles. Its ceiling has to be
+    // wide enough to admit the seam gaps that actually exist: a box-arranged
+    // element starts with stitch pairs tens of centimetres apart (181 mm mean,
+    // 552 mm max on the study-1 element), so a 5 cm ceiling made every such
+    // cluster permanently ineligible and left the stitch springs to drag the
+    // panels together - which is what stretches the fabric. The per-step
+    // motion is still bounded by the trajectory envelope below.
+    const float snap_max = max(0.f, get_global_parameter("sewing_snap_max_dist", 1.f));
+    snap_dist = min(
+        snap_dist * powf(1.5f, (float)(simulator->frame - activation)), snap_max);
+    // A forced merge runs for the first few frames after the activation gate:
+    // it puts every free stitch member on its cluster target exactly once, so
+    // the assembly does not have to be dragged there by the stitch springs
+    // (which is what leaves the panels stretched). Continuous teleporting
+    // would freeze the clusters, hence the short window.
+    const int force_window =
+        max(0, (int)get_global_parameter("sewing_force_merge_frames", 0.f));
+    const int force_merge =
+        (force_window > 0 && simulator->frame <= activation + force_window) ? 1 : 0;
     int block = 256;
     cudaMemsetAsync(stitch_cluster_locked.data().get(), 0, sizeof(int) * n, stream);
     project_stitch_clusters_kernel<<<(n + block - 1) / block, block, 0, stream>>>(
@@ -409,7 +427,7 @@ void Geometry::project_stitches(cudaStream_t stream) {
         stitch_cluster_lookup.data().get(),
         stitch_cluster_members.data().get(),
         pos_step_prev.data().get(), pos_pred.data().get(),
-        snap_dist, envelope_radius, n);
+        snap_dist, force_merge, n);
 }
 
 // Remove the relative velocity injected by the snap. The snap preserves
