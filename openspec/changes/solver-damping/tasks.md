@@ -516,6 +516,83 @@
       part consistent with the material model (or drop it and rely on the
       assembled tangent, with `fem_psd_clamp` keeping it definite) and watch
       `newton_relative` - that is the cheap route to more convergence, since it
-      adds no iterations at all.
+      adds no iterations at all. Measured in 2.21: the factor is real but
+      partial (`newton_relative` 0.965 -> 0.92), not the whole story.
+- [x] 2.21 The operator-consistency experiment of 2.20, run behind a new
+      parameter `pd_static_diag_scale` (default 1 = the shipped behavior) that
+      scales the fixed spring-lattice diagonal `prepare_linear_step_kernel`
+      adds on top of the assembled tangent.
+
+      Reported scene, 600 substeps, `pd_iters`/`linear_iters` = 5/2 unless
+      noted, two interleaved runs per configuration:
+
+      | `pd_static_diag_scale` | area (cm^2) | strain | newton_relative | linear_relative | display motion (mm) | excursion (mm) |
+      |---|---|---|---|---|---|---|
+      | 1 (shipped) | 4164 | 0.140 | 0.94-0.97 | 0.008 | 0.95-1.00 | 10.0-10.2 |
+      | 0.5 | 4063 | 0.125 | 0.97 | 0.011-0.013 | 0.93 | 7.9 |
+      | 0.25 | 4017 | 0.117 | 0.90-0.95 | 0.018-0.020 | 0.92 | 7.5-7.8 |
+      | 0 | 4033 | 0.119 | 0.91-0.93 | 0.042-0.051 | 0.95 | 7.3-7.6 |
+      | 2 | 4492 | 0.187 | 0.97-0.99 | 0.003 | 0.97-0.98 | 15.7-17.4 |
+
+      The response is monotone in the scale, so the fixed diagonal is not
+      neutral: it is a regulariser of the same order as the assembled diagonal,
+      and the shipped scale of 1 buys 3 % less strain, 25 % more wander and a
+      worse Newton residual than a material-consistent matrix. Dropping it
+      degrades the *linear* residual at 2 PCG iterations (8e-3 -> 4-5e-2) - the
+      regulariser was also propping up the block-Jacobi preconditioner - so the
+      scale-0 matrix needs an affordable `linear_iters`:
+
+      | config (600 substeps) | area | strain | newton_relative | linear_relative | display motion | excursion | stitch gap | non-finite |
+      |---|---|---|---|---|---|---|---|---|
+      | shipped 5/2, scale 1 | 4099-4152 | 0.130-0.138 | 0.96-0.97 | 0.008-0.011 | 0.93-0.94 | 10.6-11.0 | 0.000 mm | 0 |
+      | scale 0, 5/5 | 3801-3808 | 0.086-0.087 | 0.91-0.94 | 0.002-0.003 | 0.60-0.62 | 7.7 | 0.000 mm | 0 |
+      | scale 0.25, 5/5 | 3819-3821 | 0.089 | 0.95 | 4-5e-4 | 0.63-0.64 | 6.6-6.7 | 0.000 mm | 0 |
+      | scale 0, 10/5 | 3763-3764 | 0.081 | 0.92-0.96 | 0.0012 | 0.40-0.41 | 8.0 | 0.000 mm | 0 |
+
+      The material-consistent matrix with 5 PCG iterations takes the mean
+      membrane strain from 0.134 to 0.086 (-36 %), the visible per-display-frame
+      motion from 0.94 to 0.60 mm (-35 %) and the wander from 10.8 to 7.7 mm
+      (-30 %) with no non-finite frame and the seam still closed. The Newton
+      residual improves only 0.965 -> 0.92: a real but partial contributor.
+      The wall-clock column is deliberately absent - the machine drifted inside
+      the batch (one configuration measured 19.3 ms/substep on its first run and
+      28.7 ms on its last), so no RTS claim comes out of this batch.
+
+      Drag check (400 substeps of assembly, a low triangle lifted 0.2 m,
+      released, 400 substeps watched): the configurations are not comparable to
+      each other - the pre-drag state already differs by 3-4 cm of mean height
+      between them - so it serves only as a "the hem does not hang in the air"
+      check, which every configuration passes (the mean height moves by
+      2-10 mm over 1.8 s after release, in both directions).
+
+- [x] 2.22 Where the residual stops: `query_radius` sweep at the
+      material-consistent operator (reported scene, 400 substeps, scale 0,
+      5/5, all rows from the same window so they are comparable to each other):
+
+      | `query_radius` | newton_relative | linear_relative | area | strain | display motion | excursion |
+      |---|---|---|---|---|---|---|
+      | 1e-4 | 0.943 | 6.8e-4 | 3861 | 0.0946 | 0.20 mm | 14.2 mm |
+      | 1e-3 | 0.918-0.926 | 0.0040 | 3848 | 0.0932 | 0.76 mm | 17.3 mm |
+      | 1e-2 | 0.776 | 0.0120 | 3634 | 0.0613 | 0.70 mm | 30.1 mm |
+
+      `clamp_to_trajectory_envelope` caps a vertex to a capsule of radius
+      `query_radius` around the segment `pos_prev -> pos_target`, i.e. it bounds
+      the *whole* displacement of a substep, not the per-iteration correction.
+      With the material-consistent operator the residual is therefore
+      clamp-limited: loosening the tube 10x takes `newton_relative` from 0.92 to
+      0.78 and the strain from 0.093 to 0.061, while the wander grows from
+      17 mm to 30 mm - the same tube both throttles the creep and blocks the
+      solve. At the shipped scale of 1 the identical loosening changed nothing
+      (task 2.20) because the regulariser had already shrunk the step below the
+      tube.
+      Consequence: more operator accuracy alone does not stop the motion. What
+      still drives it is open - the next instrument is the per-vertex tangential
+      drive against the friction cap (2.7's next step, still not built).
+      Recommended working set for the reported scene:
+      `pd_static_diag_scale: 0`, `linear_iters: 5`, `pd_iters: 10`,
+      `pd_hessian_every: 2` (chord - the assembly, not the tube, is what makes
+      extra outer iterations expensive). The default stays 1 (inert), per 6.1's
+      rule that an existing scene keeps its behavior until its own parameter
+      block enables a mechanism.
 - [ ] 8.2 Update the spec requirement that still needs a maintainer decision
       (defaults on/off) if the decision changes the requirement text.

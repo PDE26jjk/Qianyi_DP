@@ -30,6 +30,11 @@ static __global__ void prepare_linear_step_kernel(
     const float3* __restrict__ pos_world,
     const float3* __restrict__ pos_prev,
     const float* __restrict__ mass,
+    // Scale on the fixed spring-lattice diagonal (`pd_static_diag_scale`). That
+    // diagonal is a regulariser on top of the assembled tangent, not part of
+    // the material model, and the shipped scale of 1 puts it at the same order
+    // as the assembled diagonal - so it also dominates the Newton step.
+    const float static_diag_scale,
     const float mask_stiff,
     int n
 ) {
@@ -37,7 +42,7 @@ static __global__ void prepare_linear_step_kernel(
     if ( tid >= n ) return;
 
     Mat3 diag = Jx_assembled[tid];
-    diag.add_diag(static_diags[tid]);
+    diag.add_diag(static_diags[tid] * static_diag_scale);
     Jx_diags[tid] = diag;
     // prepare_jacobi_preconditioner_kernel
     if ( diag.r[0].x > 0.0f ) {
@@ -333,6 +338,8 @@ void SolverPDNewton::step(float h) {
     float* static_diags = geo->static_diags.data().get();
     cudaMemcpyAsync(static_diags, Jx_diag_pd, n * sizeof(float), cudaMemcpyDeviceToDevice);
     float mask_stiff = max(0.f, get_global_parameter("mask_stiff", 1e2f));
+    const float static_diag_scale =
+        max(0.f, get_global_parameter("pd_static_diag_scale", 1.f));
     const float base_spring_k =
         geo->get_global_parameter("base_spring_stiffness", default_base_spring_stiffness);
     const float stiffen_start =
@@ -492,7 +499,7 @@ void SolverPDNewton::step(float h) {
 
         prepare_linear_step_kernel<<<(n + block - 1) / block, block, 0, work_stream>>>(
             dx, f, Jx_diag_assembled, Jx_diag, M_inv, f_elastic, static_diags, mask, q, q_prev,
-            mass, mask_stiff, n);
+            mass, static_diag_scale, mask_stiff, n);
         if ( record_slot >= 0 ) {
             // The Newton residual of this outer iteration: the force residual
             // the linear solve is about to remove.
@@ -575,6 +582,7 @@ void SolverPDNewton::step(float h) {
         mix_float(bending_k);
         mix_float(query_radius);
         mix_float(trajectory_margin);
+        mix_float(static_diag_scale);
         mix((uint64_t)hessian_every);
         mix_float(projection_snap_dist);
         mix((uint64_t)projection_active);
