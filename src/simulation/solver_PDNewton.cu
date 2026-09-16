@@ -253,10 +253,6 @@ void SolverPDNewton::init() {
     Jx_diag_assembled.assign(params.nb_all_vertices, Mat3::zero());
     newton_residual.assign(2, 0.f);
 
-    // Subspace (reduced-basis) acceleration is disabled: it measured slower
-    // than the plain PCG path. The implementation stays in subspace.cu for
-    // future use; restore the commented calls here and in step() to re-enable.
-    // geo->init_subspace();
     Jx_diag_pd.assign(params.nb_all_vertices, 0.f);
     // Jx_nondiag_pd.assign(params.nb_all_edges, 0.f);
     linear->Jx_nondiag_identity.assign(params.nb_all_edges, 0.f);
@@ -271,15 +267,6 @@ void SolverPDNewton::init() {
         geo->edges.data().get(),
         geo->obj_data.data().get(), geo->vertices_obj.data().get(),
         n, base_spring_k);
-    // Disabled together with the subspace path above: H_red / M_red are only
-    // consumed by SolverSubspace::A_mult_x, so the reduction is dead work now.
-    // geo->precompute_subspace_H(Jx_diag_pd.data().get(), linear->Jx_nondiag_identity.data().get());
-    // subspace_rhs.resize(geo->basis_size);
-    // subspace_dy.resize(geo->basis_size);
-    // if ( subspace_solver == nullptr ) {
-    //     subspace_solver = new SolverSubspace(simulator);
-    // }
-    // subspace_solver->init(geo->basis_size, 0, false);
     auto& contact = geo->get_contact();
     contact.do_collision_detect_broad_phase_before_step = false;
 }
@@ -391,7 +378,6 @@ void SolverPDNewton::step(float h) {
     int iters = max(1, (int)get_global_parameter("pd_iters", 10));
     int linear_iters = max(1, (int)get_global_parameter("linear_iters", 10));
     // Subspace acceleration disabled (see SolverPDNewton::init).
-    // int subspace_iters = max(0, (int)get_global_parameter("subspace_iters", 1));
     float bending_k = max(0.f, get_global_parameter("bending_k", 0.2f));
     // Planar FEM operator fixes (see compute_BW_FEM): clamping the lateral
     // eigenvalue of the stretch Hessian keeps the assembled matrix positive
@@ -505,9 +491,6 @@ void SolverPDNewton::step(float h) {
             // the linear solve is about to remove.
             linear->vector_field_dot(f, f, newton_residual_ptr + record_slot);
         }
-
-        // Subspace acceleration disabled (see SolverPDNewton::init).
-        // if ( i < subspace_iters ) solve_subspace(dx, f);
 
         linear->solve(dx, f, linear_iters);
         step_end_linear<<<(n + block - 1) / block, block, 0, work_stream>>>(
@@ -715,7 +698,7 @@ void SolverPDNewton::step(float h) {
 }
 
 void SolverPDNewton::fill_residual_metrics(std::vector<float>& out) {
-    out.assign(6, 0.f);
+    out.assign(9, 0.f);
     if ( !newton_residual.empty() ) {
         cudaMemcpy(out.data(), newton_residual.data().get(), 2 * sizeof(float),
             cudaMemcpyDeviceToHost);
