@@ -594,6 +594,9 @@
       extra outer iterations expensive). The default stays 1 (inert), per 6.1's
       rule that an existing scene keeps its behavior until its own parameter
       block enables a mechanism.
+      **Correction (2.24):** the scale-0 recommendation above is wrong as a
+      drop-in. It was read off per-vertex medians; the tail of the distribution
+      moves the other way.
 - [x] 2.23 The per-vertex force-balance instrument was attempted and does not yet
       answer the tangential-drive question; recording it so the next attempt
       starts from the right units.
@@ -625,5 +628,219 @@
       the tangential contact force against the friction cap (the cap only ramps
       up below `friction_epsilon * h` of slip, 45 um per substep, against the
       observed 200 um).
+- [x] 2.24 Maintainer report: "with `pd_static_diag_scale = 0` the cloth keeps
+      shaking where it touches the body". Reproduced, and the hypothesis I put
+      forward for it (the regulariser is what keeps `M_inv` from being zeroed on
+      ill-conditioned rows) is **falsified**.
+
+      Tried and removed (measured ineffective, so the code is gone): row
+      counters for zeroed preconditioner rows, non-positive assembled diagonals
+      and non-positive matrix diagonals, plus a
+      `pd_precond_regularized` switch that built the block-Jacobi preconditioner
+      from the regularised diagonal while the matrix used the scaled one. On the
+      reported scene every configuration - scale 1, scale 0, scale 0 with the
+      regularised preconditioner - reports **zero** degenerate rows, so there is
+      no zeroed row to blame, and the switch only improved the linear residual
+      (0.045 -> 0.024) without touching the tail chatter (reversal p99 0.621
+      against 0.626). Both were deleted; this entry is their only record.
+
+      The report is real, though, and it is a *tail* effect. Per-vertex
+      direction-reversal rate over the last 600 substeps, sampled every 8th
+      vertex (`QY_CONTACT_CORR` in the local probe), reported at the median and
+      the 90th percentile of the sampled population:
+
+      | configuration | strain | area | display motion (median) | reversal p90 | reversal p99 | reversal max |
+      |---|---|---|---|---|---|---|
+      | scale 1, 5/2 (shipped) | 0.137 | 4144 | 0.97 mm | 0.098 | 0.575 | 0.671 |
+      | scale 1, 5/5 | 0.115 | 3997 | 0.93 mm | 0.101 | 0.585 | 0.673 |
+      | scale 1, 10/5 | 0.096 | 3868 | 0.72 mm | 0.103 | 0.611 | 0.764 |
+      | scale 0, 5/2 | 0.120 | 4039 | 0.94 mm | **0.250** | 0.631 | 0.726 |
+      | scale 0, 5/5 | 0.087 | 3811 | 0.64 mm | **0.366** | 0.648 | 0.839 |
+
+      Three readings:
+      1. At scale 1, buying convergence with outer iterations (5/2 -> 5/5 ->
+         10/5) leaves the tail untouched (0.098 -> 0.101 -> 0.103) while taking
+         the strain from 0.137 to 0.096. That is the same drape quality the
+         scale-0 configuration reaches (0.087 at 5/5) with **3.5x less tail
+         chatter**. The drape improvement does not require the un-regularised
+         operator at all.
+      2. Scale 0 is what moves the tail: the reversal rate at the 90th percentile
+         goes 0.098 -> 0.250 (5/2) and 0.103 -> 0.366 (5/5) against the matched
+         scale-1 rows. The median gets quieter (0.97 -> 0.94 mm) while a small
+         population starts flipping direction on most substeps - which is what a
+         viewport shows as rubbery shaking at the contact.
+      3. The trajectory tube is not the cause either: at scale 0, 5/5 the
+         reversal p90 is 0.230 at `query_radius = 1e-4`, 0.366 at 1e-3 and 0.374
+         at 1e-2 - the chatter survives a 10x looser tube and a 10x tighter one.
+         (The same sweep does show that the *drape* depends on the limiter: mean
+         strain 0.0875 / 0.0859 / 0.0365 at 1e-4 / 1e-3 / 1e-2, so the state the
+         solve settles into is set by the clamp as much as by the material - a
+         defect worth its own entry.)
+
+      What is left as the mechanism: a small population of vertices in active
+      contact whose force balance flips sign every substep. It is present in the
+      shipped configuration too (reversal p99 0.58, max 0.67) and gets larger
+      when the Newton step at those rows becomes sharper, which is what removing
+      the regulariser does. Naming it needs the contact-state instrument that
+      2.23 still owes (per-substep normal sign and the friction cap branch), not
+      another operator knob.
+
+      Corrected recommendation for the reported scene: keep
+      `pd_static_diag_scale` at 1 and buy convergence with `pd_iters` (10/5, or
+      the chord 10/5 with `pd_hessian_every: 2` for the cost). Scale 0 stays
+      available for experiments but is not a drop-in improvement.
+- [ ] 2.25 Maintainer decision: preconditioners first (S4). Audited
+      `subspace.cu`, rebuilt it as a two-level preconditioner, and measured it.
+      **It is not usable in this form** - recorded here with the numbers, and the
+      code is left selectable (`linear_solver_type: 2`) but inert by default so
+      the decision "fix it further or delete it" can be made without redoing the
+      work.
+
+      Audit of the disabled path (all three are real):
+      1. `build_basis_kernel` left `basis_indices[vertex_offset + idx]`
+         uninitialised for every stencil slot outside the panel grid, and
+         `basis_to_new_index_kernel` then indexes `basis_new_indices` with that
+         garbage value. Fixed (write 0; the weight is 0 so the slot is masked).
+      2. The coarse solver was a `SolverPCG` initialised with
+         `use_preconditioner = false` *and* its `M_inv` was never filled, so the
+         coarse solve ran unpreconditioned.
+      3. `solve_subspace` **replaced** the fine solution with the prolongated
+         coarse one (`dx = P dy`) instead of adding a correction, and the coarse
+         operator was the PD spring scalar rather than the operator being solved.
+         Deleted together with its members (`subspace_rhs`, `subspace_dy`,
+         `subspace_solver`) and the transfer kernels only it used
+         (`restrict_kernel`, `prolongate_kernel`).
+
+      Rebuilt as `SolverTwoLevel` (additive:
+      `z = M_fine^-1 r + omega P (P^T A P)^-1 P^T r`, coarse solve by a short
+      PCG with the coarse diagonal as its preconditioner, `subspace_omega`
+      default 1, `subspace_coarse_iters` default 3). Two structural fixes were
+      needed to stop the NaNs: the coarse Laplacian's kernel is the constant
+      (rigid-translation) mode and the mass term only lifts it by ~10 against a
+      stiffness of ~2.4e4, so a net force residual was answered by a large
+      global translation - the mode is now projected out of both the coarse
+      right-hand side and the coarse solution.
+
+      Reported scene, 600 substeps, AOGS, scale 1 (`linear_plain_relative` is the
+      unpreconditioned residual ratio, added to `get_residual_metrics` because the
+      preconditioned ratio is not comparable between preconditioners):
+
+      | config | ms | area | strain | newton_relative | display motion | reversal p90 |
+      |---|---|---|---|---|---|---|
+      | PCG 5/2 (shipped) | 23.2 | 4220 | 0.148 | 1.000 | 0.94 mm | 0.093 |
+      | PCG 5/5 | 26.9 | 4019 | 0.118 | 0.968 | 0.85 mm | 0.113 |
+      | two-level, omega 0.2, 5/2 | 31.1 | 3930 | 0.106 | **0.604** | 1.33 mm | **0.392** |
+      | two-level, omega 0.2, 5/2, 5 coarse iterations | 32.7 | 3965 | 0.111 | **2.986** | 1.40 mm | 0.317 |
+      | two-level, omega 0.4, 5/5 | - | - | - | PCG NaN | - | - |
+
+      Reading: the correction does accelerate the *nonlinear* residual (0.604
+      against 1.000 - the substep problem is genuinely solved ~20x further), but
+      it is unstable (omega >= 0.4 NaNs, and omega 0.2 also NaNs on some runs -
+      two of the four configurations of a separate 200-substep batch died), it
+      makes the visible motion worse (1.33 mm and reversal p90 0.392 against
+      0.94/0.093 shipped - the same tail-chatter signature as the un-regularised
+      operator), and it costs 8-10 ms/substep more than the linear solve it is
+      meant to accelerate.
+
+      Why it cannot pay in this shape: (a) the coarse operator is reduced from
+      the PD spring scalar, not from the assembled operator the fine solve uses;
+      (b) the coarse solve is a truncated CG, so the preconditioner is an inexact
+      non-symmetric operator - outside CG's assumptions; (c) the linear solve is
+      only ~10 % of the frame (2.16), while the nested coarse solve with its
+      reductions costs more than that. **Conclusion: the preconditioner work
+      depends on the constant-matrix work (2.15/S1-S2) - on a rest-shape constant
+      operator the coarse matrix is constant, can be factorised once instead of
+      solved by a nested CG, and can be built from the operator actually being
+      solved.** Recommended order: S1/S2 first, then revisit the preconditioner.
+- [x] 2.26 The maintainer pointed at the source of this design: X. Li, Y. Fang,
+      L. Lan, H. Wang, Y. Yang, M. Li, C. Jiang, "Subspace-Preconditioned GPU
+      Projective Dynamics with Contact for Cloth Simulation", SIGGRAPH Asia 2023
+      Conference Papers. Comparing the paper with `subspace.cu` shows the paper
+      is not in question - our implementation is a different scheme. Point by
+      point:
+
+      | the paper | our engine |
+      |---|---|
+      | Basis is a per-patch 2D MPM quadratic B-spline grid, and it **satisfies partition of unity** (§4.2) | Same kernel, but the clipped panel-border stencil broke the sum - fixed in this pass (see 2.25) |
+      | The reduced matrix is `P^T A P`, **prefactorised with Cholesky and reused** (§4.3), because in PD `A = M/h^2 + L` is the *rest-shape constant* matrix | Our `A` is the tangent assembled **every outer iteration**, so the reduction would have to be rebuilt and is the assembled tangent, not a constant operator |
+      | The reduced solve is used as 1) the **exact initial guess** (one backsolve at the start of the substep) and 2) inside a **subspace L-BFGS** (2 iterations per global step, rest-shape reduced matrix as the initial Hessian) (§4.3, Algorithm 1) | Used as an additive, omega-damped correction inside **PCG** - neither an initial guess nor the paper's quasi-Newton scheme |
+      | High frequencies come from **5 modified block-Jacobi iterations** per global step, with an analytically tuned step size that guarantees energy decrease (§4.3) | High frequencies come from PCG on the assembled tangent |
+      | Contact enters the reduced matrix as `P^T (grad^2 E_contact) P` (§4.4, Eq. 11), tracked progressively by the BFGS updates | Contact is not in the reduced operator at all |
+      | Overall: subspace integration coupled with Jacobi-PD inside PD; 23 s/frame for 120K nodes, 6.5x faster than a GPU CIPC solver (Fig. 1) | A Newton/PCG solver with an unrelated damped coarse correction bolted on |
+
+      So the answer to "is the paper wrong?" is no. The measurements of 2.25
+      actually support the paper's premise - the coarse correction does move the
+      substep residual (0.604 against 1.000) - but the paper's structure is what
+      makes it work: a *constant* prefactorised reduced operator, the reduced
+      solve as an initial guess, a quasi-Newton history on top of it, and Jacobi
+      smoothing for the high frequencies.
+
+      What a faithful implementation needs, in order: (1) the constant PD global
+      matrix (`M/h^2 + L_rest`) as the system operator, which is S1/S2; (2) the
+      reduced factorisation built once from it; (3) the reduced solve as the
+      substep's initial guess instead of a preconditioner term; (4) a subspace
+      quasi-Newton history; (5) the contact proxy reduction; (6) a tuned
+      block-Jacobi smoother in place of PCG. Item (1) is the prerequisite of all
+      the others, which is why the order is S1/S2 before S4.
+
+      Deleted in this pass (measured ineffective or unstable, per the maintainer's
+      rule): the two-level experiment (`SolverTwoLevel`, the dense per-panel
+      inverse, the `linear_solver_type: 2` wiring, the `apply_preconditioner_extra`
+      / `on_assembly` hooks). Kept because they are independently correct: the
+      basis-index initialisation and the partition-of-unity normalisation in
+      `subspace.cu`, the removal of the dead `solve_subspace` / `SolverSubspace`
+      path, and the new `linear_plain_relative` residual metric.
+- [x] 2.27 The coarse initial guess, taken as far as it goes and then deleted by
+      maintainer decision ("delete it, keep the documentation"). What the two
+      follow-up rounds established:
+
+      Implemented (all of it now removed from the tree): the precomputed subspace
+      from the rest shape, a dense per-panel inverse of the reduced operator
+      built once per substep, and the reduced solve used as the substep's initial
+      guess - i.e. the semantics of the original `subspace.cu` and of the paper's
+      Algorithm 1 ("Run a reduced-order global step w/o contact for an initial
+      guess"). Two new diagnostics came out of it and are kept: the
+      unpreconditioned residual triple `linear_plain_initial/final/relative`
+      (`r . r`, comparable across preconditioners and across initial guesses) and,
+      while it lasted, `coarse_solve_residual` = `|A_c dy - r_c|^2 / |r_c|^2`.
+
+      Defects found on the way, all real and all in this path - the list is the
+      useful part of the exercise for any future attempt:
+
+      | defect | consequence |
+      |---|---|
+      | `build_basis_kernel` never wrote the index of a clipped stencil slot, and `basis_to_new_index_kernel` reads all nine | garbage index into the compaction table |
+      | the clipped stencil also broke the partition of unity (`sum w != 1`) | a constant coarse vector no longer maps to a constant displacement, so the rigid mode is not representable |
+      | the coarse reduction ran over `edges` only, while the fine operator's rows are `valid_pairs` (natural edges + deduped bending pairs) | the coarse operator was too soft, the coarse solution correspondingly too large |
+      | a Gauss-Jordan written as "row-reduce A" returns the identity, not `A^-1` (it needs the augmented identity alongside) | the "inverse" was the identity, so the guess was a prolonged *force*, not a displacement - the numeric signature of the grid-shaped artifacts the path was abandoned for |
+      | the diagonal floor was implemented as "add to every row" instead of "raise only missing rows" | the physically meaningful smooth modes were regularised away and the coarse solve became even softer |
+      | `Geometry::step_h` is garbage before the first substep (-1.7e16 on this machine) | an inverse built at init time is meaningless |
+      | the reduced solve had never been verified | an invalid coarse solve is invisible in the solution norm and only shows up as artifacts |
+
+      Measured verdict (reported scene, 200 substeps, AOGS, notebook parameter
+      block), with the coarse solve verified to 0.6-4.9 % relative residual:
+
+      | configuration | `linear_plain_final` | `newton_relative` | `|x0|/|dx|` | area | strain | display motion |
+      |---|---|---|---|---|---|---|
+      | shipped 5/2, no guess | 1263 | 0.973 | - | 4165 | 0.140 | 0.88 mm |
+      | 5/2 with guess | 63169 | 0.931 | 44 | 5750 | 0.357 | 3.07 mm |
+      | 5/5, no guess | 4.54 | 0.959 | - | 4102 | 0.131 | 0.76 mm |
+      | 5/5 with guess | 3.83 | 0.981 | 147 | 4012 | 0.117 | 1.24 mm |
+
+      So the machinery is correct but the premise is not: block-Jacobi PCG already
+      takes the residual down four orders of magnitude in 5 iterations (1263 ->
+      4.5 relative to an initial ~1e5), so a coarse start has nothing left to buy
+      at 5 iterations, and at the notebook's 2 iterations its overshoot - the
+      coarse solution is 44-147x the truncated fine increment - makes the solve
+      and the drape worse. This matches the frame profile: the cost is the
+      per-iteration assembly (~73 %), not the linear solve (~10 %).
+
+      Closed for now. The preconditioner/subspace direction only becomes
+      meaningful on the paper's own premise - a rest-shape *constant* system
+      operator with a reduced factorisation, a quasi-Newton history on the reduced
+      variables and a tuned Jacobi smoother for the high frequencies - and that
+      premise conflicts with the planned plastic rest-shape flow (task 2.24,
+      `cloth-plasticity`). If it is revived, the table above is the list of traps
+      to avoid, and `coarse_solve_residual` is the check to build first.
 - [ ] 8.2 Update the spec requirement that still needs a maintainer decision
       (defaults on/off) if the decision changes the requirement text.
