@@ -308,8 +308,11 @@ py::dict SimulatorInterface::get_residual_metrics() {
     const char* names[] = {
         "newton_initial", "newton_final", "newton_relative",
         "linear_initial", "linear_final", "linear_relative",
+        // The same triple in the unpreconditioned norm: the only one comparable
+        // between two different preconditioners.
+        "linear_plain_initial", "linear_plain_final", "linear_plain_relative",
     };
-    for ( size_t i = 0; i < 6; ++i ) {
+    for ( size_t i = 0; i < 9; ++i ) {
         d[names[i]] = (i < values.size()) ? values[i] : 0.f;
     }
     return d;

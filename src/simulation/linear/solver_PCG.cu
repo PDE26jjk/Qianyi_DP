@@ -27,7 +27,7 @@ void SolverPCG::init(int diag_size, int edge_size,bool Jx_nondiag_identity_only,
     r.resize(diag_size);
     z.resize(diag_size);
 
-    temp1.resize(6);
+    temp1.resize(8);
     failure_flag.assign(1, 0);
 
 }
@@ -81,7 +81,12 @@ static __global__ void compute_beta_kernel(
 static __global__ void store_residual_metrics_kernel(
     float* __restrict__ out,
     const float* __restrict__ delta_initial,
-    const float* __restrict__ delta_final
+    const float* __restrict__ delta_final,
+    // Plain `r . r`, the residual in the unpreconditioned norm. The ratio above
+    // is the one CG actually drives, but it is not comparable between two
+    // different preconditioners; this one is.
+    const float* __restrict__ r_norm_initial,
+    const float* __restrict__ r_norm_final
 ) {
     if ( blockIdx.x == 0 && threadIdx.x == 0 ) {
         const float d0 = *delta_initial;
@@ -89,6 +94,11 @@ static __global__ void store_residual_metrics_kernel(
         out[0] = d0;
         out[1] = d1;
         out[2] = (d0 > 0.f && d0 == d0) ? d1 / d0 : 0.f;
+        const float n0 = *r_norm_initial;
+        const float n1 = *r_norm_final;
+        out[3] = n0;
+        out[4] = n1;
+        out[5] = (n0 > 0.f && n0 == n0) ? n1 / n0 : 0.f;
     }
 }
 template<bool UsePreprocessingDiag>
@@ -275,6 +285,8 @@ void SolverPCG::solve_impl(float3* dx, const float3* rhs, int max_iters) {
     float* d_delta_new_ptr = temp + 2;
     float* d_delta_old_ptr = temp + 3;
     float* d_dot_Ad_ptr = temp + 4;
+    float* d_r_norm_initial_ptr = temp + 6;
+    float* d_r_norm_final_ptr = temp + 7;
 
     int blocksPerGrid = (n + block - 1) / block;
 
@@ -285,6 +297,7 @@ void SolverPCG::solve_impl(float3* dx, const float3* rhs, int max_iters) {
 
     float delta_new_host;
     vector_field_dot(r, UsePreprocessingDiag ? z : r, d_delta_new_ptr);
+    vector_field_dot(r, r, d_r_norm_initial_ptr);
     // Keep the initial residual for the observability metric below.
     float* d_delta_initial_ptr = temp + 5;
     cudaMemcpyAsync(d_delta_initial_ptr, d_delta_new_ptr, sizeof(float),
@@ -379,8 +392,10 @@ void SolverPCG::solve_impl(float3* dx, const float3* rhs, int max_iters) {
             d_delta_new_ptr, failure_flag.data().get());
     }
     if ( !residual_metrics.empty() ) {
+        vector_field_dot(r, r, d_r_norm_final_ptr);
         store_residual_metrics_kernel<<<1, 1, 0, work_stream()>>>(
-            residual_metrics.data().get(), d_delta_initial_ptr, d_delta_new_ptr);
+            residual_metrics.data().get(), d_delta_initial_ptr, d_delta_new_ptr,
+            d_r_norm_initial_ptr, d_r_norm_final_ptr);
     }
 }
 
