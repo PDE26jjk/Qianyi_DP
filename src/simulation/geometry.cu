@@ -611,7 +611,7 @@ __global__ void forward_step(
     float dt,
     float mask_stiff,
     float3 gravity,
-    bool warm_start,
+    int warm_start, // 0 = off, 1 = VBD predictor, 2 = inertia prediction, 3 = velocity only
     int num_vertices
 ) {
     int i = threadIdx.x + blockIdx.x * blockDim.x;
@@ -637,7 +637,7 @@ __global__ void forward_step(
         float3 pos_v = p + v * dt;
         inertia_out[i] = pos_v + accel_ext * dt2;
         static_diags[i] += 1.f / (im * dt2);
-        if ( warm_start ) { // Warm starting from VBD paper. 
+        if ( warm_start == 1 ) { // Warm starting from VBD paper.
             float3 accel_prev = (v - vel_prev[i]) / dt;
             float a_factor = 0;
             float a_ext_len_sq = len_sq(accel_ext);
@@ -646,6 +646,16 @@ __global__ void forward_step(
                 a_factor = clamp(a_factor, 0.0f, 1.0f);
             }
             pos[i] = pos_v + accel_ext * (a_factor * dt2);
+        }
+        else if ( warm_start == 2 ) {
+            // Inertia prediction: predict the whole gravity step instead of the
+            // part of it the body has already been achieving. This is what lets
+            // a body at rest start falling at the shipping iteration budget.
+            pos[i] = pos_v + accel_ext * dt2;
+        }
+        else if ( warm_start == 3 ) {
+            // Velocity only, no gravity term (Newton / Style3D carry `v*dt`).
+            pos[i] = pos_v;
         }
         pos_pred = pos_v + (accel_ext + elastic_force[i] * im) * dt2;
     }

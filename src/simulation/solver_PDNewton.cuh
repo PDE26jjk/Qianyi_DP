@@ -30,8 +30,10 @@ private:
     // several outer iterations without accumulating the fixed part or the
     // per-iteration damping diagonal on top of it.
     thrust::device_vector<Mat3> Jx_diag_assembled;
+    // The fixed projective diagonal's lattice half: per-vertex row sum
+    // (`Jx_diag_pd`) and the matching off-diagonal rows, which live in
+    // `linear->Jx_nondiag_identity` (see pd_precompute_spring_forces).
     thrust::device_vector<float> Jx_diag_pd;
-    // thrust::device_vector<float> Jx_nondiag_pd;
     // Captured Projective-Dynamics iteration (`pd_cuda_graph`), plus the key
     // that says when the capture still matches the buffers and parameters it
     // was recorded with. See SolverPDNewton::step.

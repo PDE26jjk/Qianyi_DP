@@ -1183,7 +1183,7 @@ void SolverVBD::step(float h) {
         nullptr, f_elastic,
         mask, q, q_pred, q_inertia, nullptr,
         static_diags,
-        h, 1e2, geo->gravity, true, n);
+        h, 1e2, geo->gravity, 1, n);
     contact.collision_detect_broad_phase_stated(q_prev, q_pred,
         vf_states, ee_states, query_radius);
 

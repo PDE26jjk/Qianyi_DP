@@ -842,5 +842,258 @@
       premise conflicts with the planned plastic rest-shape flow (task 2.24,
       `cloth-plasticity`). If it is revived, the table above is the list of traps
       to avoid, and `coarse_solve_residual` is the check to build first.
+- [x] 2.28 Maintainer report: "a flat panel floating in air falls very slowly,
+      like it is weightless; gravity is -9.8. Is it the mass unit change or a
+      damping bug?" It is the mass unit change, but not a unit error - the
+      smaller mass exposed a *pre-existing* operator defect. No damping is
+      involved.
+
+      Reproduced headless with a flat grid panel, `ground = 0`, nothing else in
+      the scene, one substep per frame, and the closed form `z(t) = z0 - a t^2/2`
+      as the reference: measured `a_eff = 0.197 m/s^2` against 9.8, i.e. the
+      panel integrates 2 % of gravity. (A separate diagnostic probe, not part of
+      the test suite: it builds the `input_data` contract directly and reads
+      `check_point_attributes`, which reports the engine's own `pos_prev`,
+      `pos_pred`, `pos_world`, `force`, `force_elastic` and `mass`.)
+
+      | configuration | a_eff (m/s^2) |
+      |---|---|
+      | shipped (mass 0.1 kg/m^2) | 0.197 |
+      | `velocity_damping = 0` | 0.624 |
+      | `velocity_damping = 5` | 0.062 |
+      | mass 0.01 / 0.1 / 1 / 10 / 100 / 1000 kg/m^2 | 0.000 / 0.197 / 1.387 / 5.795 / 8.443 / 8.594 |
+      | `base_spring_stiffness = 10` | 8.412 |
+      | `base_spring_stiffness = 0` | 8.594 |
+      | `pd_static_diag_scale = 0` | 0.652 |
+
+      Readings:
+      1. Not damping. Turning `velocity_damping` off only moves 0.197 -> 0.624,
+         and increasing it scales the fall down roughly linearly, which is what
+         a velocity decay does - it is a second-order effect here.
+      2. Mass, and in the direction the unit change went. The fall is correct
+         (8.44, the damping-limited ballistic value) at 100 kg/m^2 - the
+         pre-`b9d5cde` interpretation of the frontend's `mass = 100` - and it
+         degrades smoothly as the cloth gets lighter, i.e. the engine behaves as
+         if gravity were divided by the stiffness/mass ratio.
+      3. The membrane stiffness is what resists, and it is not a convergence
+         problem: with `pd_iters = 1, linear_iters = 20` (one exactly-solved
+         Newton step; `linear_plain_relative` = 1e-15) the panel still moves
+         0.03 % of the ballistic step, and raising `linear_iters` from 2 to 25
+         changes nothing (0.197 -> 0.202).
+
+      The mechanism, read out of the assembled system with a temporary dump of
+      `Jx_diag`, `Jx_nondiag`, `valid_pairs`, `static_diags` and `f` (removed
+      again; the numbers are for a single triangle, `base_spring_stiffness =
+      4e3`, `h = 0.0045`):
+
+      - `static_diags = 7994` at a vertex whose inertia term is
+        `m/h^2 = 4.2e-5 / 2.025e-5 = 2.06`. `static_diags` is overwritten with
+        `Jx_diag_pd` at the top of every substep (`solver_PDNewton.cu`), and
+        `Jx_diag_pd` is the precomputed PD spring-lattice row sum
+        `D = sum_e k_e` (~8000 for a 2-edge vertex at k = 4e3). `forward_step`
+        only adds `m/h^2` on top of it, so the "fixed projective diagonal" is
+        99.97 % lattice stiffness.
+      - `D` is added **without its off-diagonal half**. The matching rows
+        (`-k_e`, held in `linear->Jx_nondiag_identity` and never assembled; the
+        identity-only branch of `A_mul_x` is disabled) would make it a graph
+        Laplacian, which annihilates rigid translation. A bare diagonal does the
+        opposite: it resists every vertex's own displacement, i.e. it anchors
+        each vertex to where it was. Under gravity the fixed point becomes
+        `dx = m g / D` per substep instead of `g h^2`.
+      - That is exactly the measured signature: the drop is **independent of
+        `h`** (3.0e-7 m at both `h = 1 ms` and `h = 4.5 ms`, where the ballistic
+        answers differ by 20x), proportional to the mass, and mesh-independent
+        (a single triangle and a 2x2 panel both measure 0.128).
+      - It also explains why the engine looked healthy before `b9d5cde`: at
+        `m/h^2 ~ 5e6 N/m` (the old 100 kg/m^2) the anchor is negligible next to
+        the inertia term. At the correct areal density the inertia term is
+        `m/h^2 ~ 2-5 N/m`, four orders below `D`.
+
+      Second, independent limiter: the PD iteration clamps every vertex into a
+      tube of radius `trajectory_margin = query_radius` around the inertia
+      segment (`clamp_to_trajectory_envelope`), so the per-substep displacement
+      saturates at ~`query_radius`. Measured terminal fall speed: 0.2230 m/s at
+      `query_radius = 1e-3` and 2.246 m/s at 1e-2 against `radius/h` = 0.2222
+      and 2.222. This is the mechanism behind the earlier report "`query_radius`
+      small and it moves very slowly, like it is frozen": it is a *speed* cap of
+      `query_radius / h`, not a damping term.
+
+      Two repair routes were prototyped and measured (both behind parameters,
+      both since deleted in favour of the decision below): start the linear
+      solve from `q_inertia - q` (the rigid part of the step, exact for any
+      iteration budget; free fall 0.197 -> 0.461), and assemble the regulariser
+      with its off-diagonal half so it is a Laplacian instead of an anchor
+      (0.586, and 8.594 with both). The second one *unmasked what the anchor had
+      been hiding*: with the anchor gone the same 5/2 budget leaves
+      `linear_plain_relative` = 0.29 and the t1 garment over-stretches (mean
+      strain 0.094 -> 0.340, excursion 12 mm -> 225 mm).
+
+      Maintainer decision: the lattice precompute is a leftover of the disabled
+      `Jx_nondiag_identity_only` solver flavour, so it is simply not called any
+      more - no new mechanism, no new parameter. `pd_precompute_spring_forces`
+      (planar.cuh) and its two output buffers are gone from the PDNewton path,
+      and `forward_step` now *writes* `static_diags` per substep (the inertia
+      term `m/h^2`, or `mask_stiff` for a pinned vertex, 0 for a massless one)
+      instead of accumulating into a buffer that the precompute used to
+      overwrite. That is a smaller change than either prototype and it fixes the
+      model rather than the symptom.
+
+      **Reverted by 2.29.** The removal is not what shipped. It is exact for a
+      small mesh but not at the shipping budget on a big one (its own table
+      below: 0.606 m/s^2 on the 20x20 grid at 5 outer / 2 linear), so the
+      precompute call and the paired off-diagonal are back behind
+      `pd_static_diag_offdiag` (default on), and `static_diags` is again copied
+      from `Jx_diag_pd` at the top of every substep.
+
+      Measured after the removal (same probes; `a_eff` against 9.8, with the
+      `velocity_damping = 0.5` ballistic value at 8.44):
+
+      | free-fall mesh | before | after 5/2 | after, converged |
+      |---|---|---|---|
+      | single triangle (3 v) | 0.128 | **8.594** | - |
+      | 2x2 quad (4 v) | 0.128 | 1.206 | - |
+      | 20x20 grid (400 v) | 0.197 | 0.606 | 5.735 (`linear_iters` 10), 8.151 (25), 8.580 (20/20) |
+
+      So the anchor is gone and gravity is correct wherever the substep problem
+      is small enough for the truncated CG to resolve the rigid mode (the
+      triangle is exact at the shipping 5 outer / 2 linear budget); a big stiff
+      panel still lags until the linear solve converges, which is the same
+      conclusion as 2.16 - at the new mass the diagonal block-Jacobi
+      preconditioner is stiffness-dominated, so the gravity/inertia mode is what
+      the iteration budget buys first. The trajectory tube still caps the
+      per-substep motion at `query_radius` while the solve lags.
+
+      Reported garment scene (t1, 300 substeps, notebook parameter block):
+
+      | configuration | area | strain (mean) | reversal p90 | excursion (median) | substep | `linear_plain_relative` | tail coherence |
+      |---|---|---|---|---|---|---|---|
+      | before (anchor) | 3852 cm^2 | 0.094 | 0.070 | 11.9 mm | 24.7 ms | 0.005 | 0.337 |
+      | after | 3226 cm^2 | -0.0006 | 0.003 | 134.9 mm | **19.7 ms** | 0.102 | 0.994 |
+
+      The garment is no longer held stretched 9 % past its rest length (it now
+      sits at rest length), the direction-reversal chatter at the 90th
+      percentile drops 0.070 -> 0.003, the substep gets ~20 % faster, and the
+      motion becomes coherent (0.337 -> 0.994) instead of the incoherent
+      per-vertex jitter the anchor produced. The larger excursion is the garment
+      actually draping/falling for 1.35 s instead of being frozen. The quick
+      suite still passes (12 passed) and the standard smoke scene is unchanged
+      (mean free displacement 5.5e-10 m, all vertices at the ground clamp): the
+      resting sheet is already at its equilibrium, so it does not separate the
+      two configurations.
+
+      Defect the removal exposed and that had to be fixed with it: `ite_kernel1`
+      computed `alpha = delta_old / d_dot_Ad` and only guarded
+      `d_dot_Ad < 0`, so an already-converged residual
+      (`delta_old == d_dot_Ad == 0`, which small stiff meshes reach inside the
+      outer loop) gave 0/0 = NaN and the frame threw "PCG ended with NaN
+      residual"; `ite_kernel2` had the same 0/0 in `beta = delta_new /
+      delta_old`. Both directions are now guarded with `<= 0 -> 0`, which is the
+      correct zero step for a converged solve.
 - [ ] 8.2 Update the spec requirement that still needs a maintainer decision
       (defaults on/off) if the decision changes the requirement text.
+- [x] 2.29 Where the initial value belongs, and the three position initial
+      values measured.
+
+      At the shipping 5 outer / 2 linear budget the gravity step is the part the
+      truncated PCG delivers last, so the starting point is what the visible
+      motion is made of: with every warm start off, a free-falling panel moves
+      0.001 m/s^2 and a hanging one barely sags at all (2 mm in 1200 substeps
+      against 598 mm when it is on). Two places can carry an initial value, and
+      they are not the same quantity:
+
+      - the position the iteration starts from, set by `forward_step`
+        (`pos[i] = pos_v + accel_ext * a_factor * dt^2`, geometry.cu);
+      - the increment `dx` the linear solve starts from, set in
+        `prepare_linear_step_kernel` and consumed by PCG as its `x0`
+        (`A_mult_x(Ax, x)` then `r = b - A*x`).
+
+      An earlier pass put the inertia displacement into `dx`, which changed the
+      linear solve's own logic (the maintainer: "don't touch my dx - I asked you
+      to change the *pos* initial value"). That path is reverted; `dx` is back to
+      the historic handling. The options now live on `forward_step`'s own
+      `warm_start` argument, at the same level as the VBD predictor, exposed as
+      the `warm_start` parameter: 0 = off, 1 = VBD predictor
+      (`a_factor = clamp(dot(a_prev, g)/|g|^2, 0, 1)`, the shipped behaviour),
+      2 = the inertia prediction `q_inertia = q_prev + v*h + g*h^2`, 3 = velocity
+      only (`q_prev + v*h`, no gravity term).
+
+      The VBD predictor is self-limiting: it follows the acceleration the body
+      *already* has, so a body at rest gets `a_factor = 0` and it cannot
+      bootstrap a fall - it settles where its contribution equals the part of
+      gravity the truncated solve delivers (measured 0.62 m/s^2, with the
+      velocity then sitting on the `query_radius/h` tube cap at 0.23 m/s).
+      Mode 2 forces the full `g*h^2` and therefore does bootstrap it.
+
+      Measured (same build; `a_eff` against the analytic damping-limited 8.44;
+      the hang probe pins one edge of a 1 m panel and reports the final edge
+      strain, whose analytic static value is 0.0245 %):
+
+      | position initial value | free fall (20x20) | hang: strain at the pins | t1 strain | t1 tail motion |
+      |---|---|---|---|---|
+      | 0 = off | 0.001 | 0.0004 % (nothing loads) | - | - |
+      | 1 = VBD `a_factor*g*h^2` | 0.652 | **0.022 %** | 0.074 | 1.09 mm |
+      | 2 = inertia `v*h + g*h^2` | **8.594** (exact) | 6.9 % | 0.338 | 1.15 mm |
+
+      Two readings:
+      1. Only the inertia prediction makes a free fall exact, and it is also the
+         one that over-stretches a constrained region: it moves every free
+         vertex by the whole gravity step while pinned vertices stay put, and a
+         two-iteration correction cannot relax that. 6.9 % against an analytic
+         0.0245 % is the "pinned region pulled long" report. The same tradeoff
+         is the reason the maintainer's scenes oscillate between the two modes.
+      2. Putting the same information in `pos` instead of `dx` is measurably
+         better: identical free fall, and on t1 the tail motion drops from
+         7.53 mm (the reverted `dx` version) to 1.15 mm at the same strain, with
+         the pin strain coming down from 10 % to 6.9 %. The initial value is a
+         statement about where the iteration *starts*, so it belongs on the
+         position.
+
+      A `dx`-level variant of Newton's Style3D initial value (`dx0 = v*h` on the
+      first nonlinear iteration, their `kernels.py init_step_kernel` +
+      `self.dx if _iter == 0 else None`) was also measured while it existed: it
+      was worse than no initial value on both probes (0.232 vs 0.580 free fall,
+      2.3 % vs 0.022 % pin strain) and exploded the maintainer's production
+      scene. That is consistent with their structure - Style3D leans on a
+      rest-shape *constant* matrix and 10 CG iterations, where the initial value
+      barely matters, while our per-iteration assembled tangent with 2
+      iterations turns a non-uniform increment into noise.
+
+      Decision: `warm_start` defaults to 2 (the maintainer's "the pos initial
+      value is what I asked you to change"); 1 keeps the shipped VBD predictor
+      available, and `pd_static_diag_offdiag` keeps its default of 1.
+      Getting "small iteration budget + contact + gravity all correct"
+      at once still needs either a constrained rigid-mode (coarse) initial value
+      - the inertia displacement projected onto the rigid motions the pins
+      allow, which degenerates to mode 1 when everything is pinned and to mode 2
+      when nothing is - or the constant-matrix operator of S1/S2.
+
+      Also kept from this round: the PCG `alpha`/`beta` guards for
+      `delta_old <= 0` / `d_dot_Ad <= 0`. Without them a small stiff mesh whose
+      residual is solved to zero inside the outer loop yields 0/0 = NaN and the
+      frame throws "PCG ended with NaN residual" (reproduced on a single
+      triangle).
+
+      Quick-suite status of this build (`pytest -m quick`, 12 collected): 11
+      passed, 1 failed - `sim/smoke`, on the ground resting tolerance only.
+      Corner-pinned sheet, 60 frames at 24 fps, replayed headless with the same
+      scene (probe_smoke_scene.py):
+
+      | smoke scene configuration | mean free disp (m) | z_free max (mm) | vertices at the clamp | quick suite |
+      |---|---|---|---|---|
+      | `pd_static_diag_offdiag = 1` (default) | 2.3e-9 | 0.2253 | 89.6 % | 11 passed, 1 failed |
+      | `pd_static_diag_offdiag = 0` (anchor) | 2.0e-10 | 0.1000 | 100 % | 12 passed |
+      | `pd_static_diag_offdiag = 1, warm_start = 1` | 1.5e-5 | 0.3574 | 45.8 % | 1 failed |
+      | `pd_static_diag_offdiag = 1, 20 outer / 20 linear` | 4.5e-4 | 3.1643 | 0 % | 1 failed |
+
+      The sheet settles in every configuration (mean free displacement 1e-9 m
+      or less on the two shipping budgets), so the anchor-free operator does
+      not make the standard scene move; it moves its contact equilibrium. With
+      the paired Laplacian 89.6 % of the free vertices still come to rest
+      exactly at the clamp (`z = 0.1000 mm` = the sheet thickness) but the
+      remaining ones settle up to 0.125 mm above it, which is outside the test's
+      `GROUND_REST_TOL_M = 1e-5 m` "in ground contact" tolerance. Raising the
+      budget to 20/20 does not close the gap - it lifts the sheet 2.4 mm off the
+      clamp - so this is where the contact equilibrium sits, not a truncation
+      artifact of the 5/2 budget. Whether to relax that tolerance, raise the
+      contact stiffness, or keep the anchor as the smoke-scene default is the
+      remaining decision (see 8.2).

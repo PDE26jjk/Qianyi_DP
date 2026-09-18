@@ -253,8 +253,12 @@ void SolverPDNewton::init() {
     Jx_diag_assembled.assign(params.nb_all_vertices, Mat3::zero());
     newton_residual.assign(2, 0.f);
 
+    // The fixed projective diagonal's lattice half. Both halves come from the
+    // same precompute: `Jx_diag_pd` is the per-vertex row sum `D = sum_e k_e`
+    // and `Jx_nondiag_identity` is the matching `-k_e` per natural edge. They
+    // are consumed together (see `add_lattice_offdiag_kernel`); using only the
+    // diagonal would make the term an anchor rather than a Laplacian.
     Jx_diag_pd.assign(params.nb_all_vertices, 0.f);
-    // Jx_nondiag_pd.assign(params.nb_all_edges, 0.f);
     linear->Jx_nondiag_identity.assign(params.nb_all_edges, 0.f);
     linear->Jx_bend_cross_identity.assign(params.nb_all_edges, 0.f);
     int block = 256;
@@ -279,6 +283,40 @@ __global__ void preprocessing_nondiag(
     for ( int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
           i += blockDim.x * gridDim.x ) {
         Jx_nondiag[i] = Mat3::identity(Jx_nondiag_pd[i]);
+    }
+}
+
+// The fixed projective diagonal (`static_diags`) is the PD spring-lattice row
+// sum `D = sum_e k_e`, copied in at the top of every substep, plus this
+// substep's inertia term `m/h^2`. Its off-diagonal half `-k_e` is precomputed
+// by the same `pd_precompute_spring_forces` into `Jx_nondiag_identity` but was
+// never assembled, and a diagonal without its off-diagonal is not a Laplacian:
+// it resists every vertex's own displacement, so it anchors the cloth to its
+// previous position. That is invisible while `m/h^2` dominates `D` (the
+// pre-`b9d5cde` interpretation of the frontend's `mass = 100` as kg/m^2 gave
+// `m/h^2 ~ 5e6 N/m`), but at a realistic areal density the inertia term is
+// `m/h^2 ~ 2-5 N/m` against `D ~ 1e4 N/m`, and the anchor then holds the cloth
+// up against gravity: a free-falling panel drops `m g / D` per substep instead
+// of `g h^2`, i.e. 0.2 % of the ballistic step, independent of `h`.
+//
+// This kernel adds the missing half back, so the pair is a graph Laplacian:
+// the deformation modes keep the same diagonal (identical conditioning to the
+// diagonal-only form, which is what the contact penalty scale in collision.cu
+// also reads) while the rigid translation mode stays free and gravity
+// integrates correctly. Must run after the per-iteration memset of `Jx_nondiag`
+// and before the element assembly, or the entries it writes are cleared.
+// Rows are the natural cloth edges, which are `valid_pairs[0 ..
+// nb_all_cloth_edges-1]` (built that way in sewing.cu), so they line up with
+// the rows the spring element writes.
+static __global__ void add_lattice_offdiag_kernel(
+    Mat3* __restrict__ Jx_nondiag,
+    const float* __restrict__ Jx_nondiag_pd,
+    const float scale,
+    const int n // natural edge count
+) {
+    for ( int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+          i += blockDim.x * gridDim.x ) {
+        Jx_nondiag[i] = Jx_nondiag[i] + Mat3::identity(Jx_nondiag_pd[i] * scale);
     }
 }
 
@@ -315,7 +353,6 @@ void SolverPDNewton::step(float h) {
     auto* obj_data = geo->obj_data.data().get();
     int* vertices_obj = geo->vertices_obj.data().get();
     const float* Jx_diag_pd = this->Jx_diag_pd.data().get();
-    // const float* Jx_nondiag_pd = this->Jx_nondiag_pd.data().get();
     Mat3* Jx_diag = linear->Jx_diag.data().get();
     Mat3* Jx_diag_assembled = this->Jx_diag_assembled.data().get();
     const int hessian_every =
@@ -327,6 +364,23 @@ void SolverPDNewton::step(float h) {
     float mask_stiff = max(0.f, get_global_parameter("mask_stiff", 1e2f));
     const float static_diag_scale =
         max(0.f, get_global_parameter("pd_static_diag_scale", 1.f));
+    // 1 = also assemble the diagonal's off-diagonal half, so the fixed
+    // projective diagonal is a graph Laplacian (no anchor, rigid mode free, free
+    // fall correct) instead of the historic bare diagonal (an anchor that holds
+    // the cloth up). See add_lattice_offdiag_kernel.
+    const float lattice_offdiag =
+        get_global_parameter("pd_static_diag_offdiag", 1.f) > 0.5f ? 1.f : 0.f;
+    // Position initial value for the substep, i.e. the point the PD iteration
+    // starts from. Same option list as `forward_step`'s `warm_start`; the linear
+    // system, its right-hand side and the increment `dx` are untouched by it.
+    //   0 = off, 1 = VBD predictor, 2 = inertia prediction, 3 = velocity only.
+    // At the shipping 5 outer / 2 linear budget the gravity step is what the
+    // truncated PCG delivers last, so the starting point is what the visible
+    // motion is made of: mode 2 integrates a free fall exactly (measured
+    // 8.594 m/s^2 against the analytic damping-limited 8.44), mode 1 reaches
+    // 0.65 m/s^2 (its `a_factor` follows the acceleration the body already has,
+    // so it cannot bootstrap a fall) and mode 0 moves 0.001 m/s^2.
+    const int warm_start = max(0, (int)get_global_parameter("warm_start", 2.f));
     const float base_spring_k =
         geo->get_global_parameter("base_spring_stiffness", default_base_spring_stiffness);
     const float stiffen_start =
@@ -354,7 +408,7 @@ void SolverPDNewton::step(float h) {
         nullptr, f_elastic,
         mask, q, q_pred, q_inertia, nullptr,
         static_diags,
-        h, mask_stiff, geo->gravity, true, n);
+        h, mask_stiff, geo->gravity, warm_start, n);
     contact.refit_bvh_with_target(q_prev, q_pred);
     // Tight, non-swept broad phase (the Warp / Style3D arrangement): the tree
     // and the query boxes are inflated only by the contact radius, so the
@@ -456,6 +510,12 @@ void SolverPDNewton::step(float h) {
             // clear the whole table when assembling, not just the edge part.
             cudaMemsetAsync(Jx_nondiag, 0,
                 sizeof(Mat3) * geo->valid_pairs.size(), work_stream);
+            if ( lattice_offdiag > 0.5f && params.nb_all_cloth_edges > 0 ) {
+                const int n_reg = params.nb_all_cloth_edges;
+                add_lattice_offdiag_kernel<<<(n_reg + block - 1) / block, block, 0, work_stream>>>(
+                    Jx_nondiag, linear->Jx_nondiag_identity.data().get(),
+                    static_diag_scale, n_reg);
+            }
         }
         contact.accumulate_contact_force(f, Jx_hess, h, work_stream);
         step_begin_pd<<<(n + block - 1) / block, block, 0, work_stream>>>(f, q_inertia, q, mass, h, n);
@@ -566,6 +626,8 @@ void SolverPDNewton::step(float h) {
         mix_float(query_radius);
         mix_float(trajectory_margin);
         mix_float(static_diag_scale);
+        mix_float(lattice_offdiag);
+        mix((uint64_t)warm_start);
         mix((uint64_t)hessian_every);
         mix_float(projection_snap_dist);
         mix((uint64_t)projection_active);
@@ -615,6 +677,9 @@ void SolverPDNewton::step(float h) {
         mix_buffer(geo->stitch_cluster_locked.data().get(),
             geo->stitch_cluster_locked.size());
         mix_buffer(geo->valid_pairs.data().get(), geo->valid_pairs.size());
+        mix_buffer(this->Jx_diag_pd.data().get(), this->Jx_diag_pd.size());
+        mix_buffer(linear->Jx_nondiag_identity.data().get(),
+            linear->Jx_nondiag_identity.size());
         if ( iter_graph_exec != nullptr && key != iter_graph_key ) {
             cudaGraphExecDestroy(iter_graph_exec);
             iter_graph_exec = nullptr;

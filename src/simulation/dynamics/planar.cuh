@@ -32,6 +32,14 @@ __device__ inline float strain_stiffen_factor(float strain, float start, float r
 
 
 // T. Liu, A. W. Bargteil, J. F. O’Brien, and L. Kavan, "Fast simulation of mass-spring systems," ACM Trans. Graph., vol. 32, no. 6, p. 214:1-214:7, Nov. 2013, doi: 10.1145/2508363.2508406.
+// The fixed projective diagonal's lattice half: per-vertex row sum
+// `D = sum_e k_e` and the matching off-diagonal `-k_e`, in scalar form.
+// SolverPDNewton copies the row sum into `static_diags` (which is also the
+// penalty scale the contact kernels read) and, when
+// `pd_static_diag_offdiag` is on, assembles the off-diagonal rows through
+// `add_lattice_offdiag_kernel`. The two halves belong together: the diagonal
+// alone is an anchor, not a Laplacian. See solver_PDNewton.cu and
+// openspec/changes/solver-damping/tasks.md 2.28/2.29.
 static __global__ void pd_precompute_spring_forces(
     float* __restrict__ Jx_diag_scalar,
     float* __restrict__ Jx_nondiag_scalar,

@@ -303,6 +303,16 @@ __global__ void forward_step(
     float dt,
     float mask_stiff,
     float3 gravity,
-    bool warm_start,
+    // Position initial value for the substep, i.e. where the iteration starts:
+    //   0 = off (keep the position at the substep start),
+    //   1 = VBD / Style3D predictor: follow the acceleration the body already
+    //       has, `a_factor = clamp(dot(a_prev, g)/|g|^2, 0, 1)`;
+    //   2 = inertia prediction: `q_prev + v*dt + g*dt^2`, the full gravity step;
+    //   3 = velocity only: `q_prev + v*dt` (no gravity term).
+    // 1 and 2 differ in kind, not only in strength: 1 cannot bootstrap a rest
+    // body into a fall (`a_factor = 0` at rest), 2 can. Only the predictor moves
+    // `pos`; `inertia_out` (`q_inertia`) and `pos_preds` (`q_pred`) always carry
+    // the physical quantities whatever the mode.
+    int warm_start,
     int num_vertices
 );

@@ -130,7 +130,7 @@ void SolverExplicit::step(float h) {
         nullptr, f_elastic,
         mask, q_inertia, nullptr, q, nullptr,
         static_diags,
-        h, 1e2, geo->gravity, false, n);
+        h, 1e2, geo->gravity, 0, n);
     // n = pp_result_size_h;
     // compute_collision_penalty_force_point_point<<<(n + block - 1) / block, block>>>(
     //     nullptr, nullptr,

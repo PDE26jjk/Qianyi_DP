@@ -115,7 +115,13 @@ static __global__ void ite_kernel1(
     const float* delta_old,
     const float* d_dot_Ad,
     int n) {
-    float a = (*d_dot_Ad < 0.f) ? 0.f : (*delta_old / *d_dot_Ad);
+    // `delta_old == 0` means the previous residual was already zero (an exact
+    // initial guess, or a system solved to machine precision at the end of the
+    // previous outer iteration); `d` is then zero as well, so the quotient would
+    // be 0/0. Taking a zero step leaves `x` unchanged, which is what a converged
+    // solve should do.
+    const float a = (*delta_old <= 0.f || *d_dot_Ad <= 0.f)
+        ? 0.f : (*delta_old / *d_dot_Ad);
     for ( int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
           i += blockDim.x * gridDim.x ) {
         x[i] = x[i] + a * d[i];
@@ -134,7 +140,10 @@ static __global__ void ite_kernel2(
     const float* delta_new,
     const float* delta_old,
     int n) {
-    float b = *delta_new / *delta_old;
+    // Same guard as `ite_kernel1`: a zero `delta_old` is a converged solve, and
+    // the search direction has to stay finite (0/0 would poison `d`, `Ad` and
+    // every later iteration).
+    const float b = (*delta_old <= 0.f) ? 0.f : (*delta_new / *delta_old);
     for ( int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
           i += blockDim.x * gridDim.x ) {
         d[i] = r[i] + b * d[i];
