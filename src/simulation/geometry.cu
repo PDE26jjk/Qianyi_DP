@@ -151,6 +151,11 @@ void Geometry::init(const GeoDataInput& geo) {
 
     m_contact.init();
 
+    // The bend structure belongs to the scene being loaded; `update_seam_state`
+    // must not read the previous scene's arrays while `init_sewing` /
+    // `build_stitch_clusters` run below.
+    bend_structure_built = false;
+
     init_pin();
     init_picker();
     init_sewing();

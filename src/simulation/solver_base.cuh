@@ -103,6 +103,13 @@ public:
     // float3* collision_Wu2021_step(float3* y, bool first, bool& done);
 
     float get_global_parameter(const std::string& key, float default_value) const;
+    // Velocity damping (1/s) for the solvers that decay velocities. The
+    // canonical key is `velocity_damping` (the PDNewton block's name and
+    // semantics: `v *= exp(-h * rate)` per substep); a solver whose historic
+    // key is still present in a scene falls back to it when `velocity_damping`
+    // is not set, so old parameter blocks keep working. A negative value in
+    // the parameter store means "not set".
+    float velocity_damping(const char* legacy_key, float default_value = 0.f) const;
 
 private:
     thrust::device_vector<int> pool;

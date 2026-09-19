@@ -445,6 +445,8 @@ __global__ void solve_elasticity_springs_kernel(
     const float kd,// damping
     float dt,
     const float base_spring_k, // membrane stiffness, N/m
+    const float stiffen_start, // strain where stiffening starts
+    const float stiffen_rate,  // exponential stiffening rate
     int color_groups_size
 ) {
     int block_idx = blockIdx.x;
@@ -473,7 +475,11 @@ __global__ void solve_elasticity_springs_kernel(
         float rest_length = edge_rest_lengths[elem.y];
         float3 f_elastic;
         Mat3 H_elastic;
-        calc_spring_elastic(p0, p1, rest_length, k,
+        // Same strain stiffening term the shared spring element uses, so the
+        // membrane softens identically to PDNewton below `stiffen_start`.
+        float strain = sqrtf(len_sq(p0 - p1)) / rest_length - 1.f;
+        float k_e = k * strain_stiffen_factor(strain, stiffen_start, stiffen_rate);
+        calc_spring_elastic(p0, p1, rest_length, k_e,
             f_elastic, &H_elastic, HessianRegularization::SPD_CLAMP);
 
         f_total += f_elastic;
@@ -540,6 +546,38 @@ __device__ void evaluate_self_contact_force_norm(
     }
 }
 constexpr int kNumThreadsPerPrimitive = 4;
+
+// The spring block solve adds the mass/inertia term itself, because it builds
+// the vertex block from scratch (`H += m/h^2 I`, `b += (q_inertia - q) m/h^2`).
+// The FEM membrane path assembles its elastic blocks with the shared kernel
+// instead, so the same term is added here - without it the block would be the
+// elastic stiffness alone and the step would have no inertia.
+__global__ void add_mass_block_kernel(
+    Mat3* __restrict__ particle_hessians,
+    const float* __restrict__ static_diags,
+    const int n
+) {
+    for ( int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+          i += blockDim.x * gridDim.x ) {
+        particle_hessians[i].add_diag(static_diags[i]);
+    }
+}
+
+// The inertia right-hand side that the spring block solve folds into its own
+// `rhs` (`(q_inertia - q) * m / h^2`), for the FEM membrane path.
+__global__ void add_inertia_rhs_kernel(
+    float3* __restrict__ forces,
+    const float3* __restrict__ inertia,
+    const float3* __restrict__ pos,
+    const float* __restrict__ mass,
+    const float h,
+    const int n
+) {
+    for ( int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+          i += blockDim.x * gridDim.x ) {
+        forces[i] += (inertia[i] - pos[i]) * mass[i] / (h * h);
+    }
+}
 
 __global__ void vbd_self_contact_kernel(
     float3* __restrict__ forces,
@@ -1188,7 +1226,23 @@ void SolverVBD::step(float h) {
         vf_states, ee_states, query_radius);
 
     int iters = max(1, (int)get_global_parameter("vbd_iters", 10));
-    float damping = max(0.f, get_global_parameter("vbd_damping", 0.f));
+    // Velocity damping, shared parameter with VBD's historic key as fallback;
+    // it is the `kd` of the block solve (the damping Hessian `kd/h * H_elastic`
+    // and its matching force).
+    float damping = max(0.f, velocity_damping("vbd_damping", 0.f));
+    const float bending_k = max(0.f, get_global_parameter("bending_k", 0.2f));
+    const float base_spring_k = max(0.f,
+        geo->get_global_parameter("base_spring_stiffness", default_base_spring_stiffness));
+    const float stiffen_start =
+        geo->get_global_parameter("strain_stiffen_start", default_strain_stiffen_start);
+    const float stiffen_rate =
+        geo->get_global_parameter("strain_stiffen_rate", default_strain_stiffen_rate);
+    // Planar FEM operator flags, identical to the PDNewton assembly.
+    const float fem_psd_clamp = get_global_parameter("fem_psd_clamp", 1.f) > 0.5f ? 1.f : 0.f;
+    const float fem_shear_hessian =
+        get_global_parameter("fem_shear_hessian", 1.f) > 0.5f ? 1.f : 0.f;
+    const bool fem_membrane = geo->constitutive_model == ConstitutiveModel::FEM_BW;
+    const int n_bend = params.nb_all_cloth_edges + params.nb_all_stitches;
     float vf_ground_k = max(0.f, geo->get_global_parameter("vf_ground_k", 0.2f));
     float vf_force_k = max(0.f, geo->get_global_parameter("vf_force_k", 0.2f));
     float ee_force_k = max(0.f, geo->get_global_parameter("ee_force_k", 0.2f));
@@ -1213,20 +1267,73 @@ void SolverVBD::step(float h) {
         cudaMemsetAsync(f_elastic, 0, active_vertices_size * sizeof(float3));
         cudaMemsetAsync(Jx_diag, 0, active_vertices_size * sizeof(Mat3));
         // cudaMemsetAsync(dx, 0, active_vertices_size * sizeof(float3));
+        // Membrane (FEM flavour), bending and the stitch constraint are
+        // element-parallel shared kernels: a hinge spans four vertices in four
+        // different color groups and a stitch is an edge of the coloring, so
+        // they cannot run "per color" the way the spring kernel does. They are
+        // evaluated once per iteration at the iteration-start positions, i.e.
+        // they act as Jacobi terms inside the Gauss-Seidel vertex sweep. See
+        // openspec/changes/experimental-solver-parity/design.md (D2).
+        if ( fem_membrane ) {
+            int n_tri = params.nb_all_cloth_triangles;
+            compute_BW_FEM<<<(n_tri + block - 1) / block, block>>>(
+                nullptr, Jx_diag, f_elastic, nullptr,
+                q, tri_edges, edges,
+                geo->Dms.data().get(), geo->areas.data().get(),
+                obj_data, vertices_obj,
+                n_tri, fem_psd_clamp, fem_shear_hessian,
+                base_spring_k, stiffen_start, stiffen_rate);
+            add_inertia_rhs_kernel<<<(active_vertices_size + block - 1) / block, block>>>(
+                f_elastic, q_inertia, q, mass, h, active_vertices_size);
+            add_mass_block_kernel<<<(active_vertices_size + block - 1) / block, block>>>(
+                Jx_diag, static_diags, active_vertices_size);
+        }
+        if ( n_bend > 0 ) {
+            if ( geo->bending_model == BendingModel::IBM_quadratic )
+                compute_quadratic_bending_IBM<<<(n_bend + block - 1) / block, block>>>(
+                    nullptr, Jx_diag, f, nullptr,
+                    geo->IBM_q.data().get(), q,
+                    geo->bend_points.data().get(),
+                    geo->bend_valid.data().get(),
+                    geo->bend_cross_rows.data().get(),
+                    n_bend, bending_k);
+            else if ( geo->bending_model == BendingModel::DiscreteShells_GN )
+                compute_dihedral_bending_GN<<<(n_bend + block - 1) / block, block>>>(
+                    nullptr, Jx_diag, f, q,
+                    geo->bend_points.data().get(),
+                    geo->bend_rest_theta.data().get(),
+                    geo->bend_factor.data().get(),
+                    geo->bend_valid.data().get(),
+                    geo->bend_cross_rows.data().get(),
+                    n_bend, bending_k);
+            else if ( geo->bending_model == BendingModel::DiscreteShells_AOGS )
+                compute_dihedral_bending_AOGS<<<(n_bend + block - 1) / block, block>>>(
+                    nullptr, Jx_diag, f, q,
+                    geo->bend_points.data().get(),
+                    geo->bend_rest_theta.data().get(),
+                    geo->bend_factor.data().get(),
+                    geo->bend_valid.data().get(),
+                    geo->bend_cross_rows.data().get(),
+                    n_bend, bending_k);
+        }
+        // Zero-rest-length stitch springs; torn stitches are skipped by the
+        // kernel through `stitches_status`.
+        geo->accumulate_sewing_force(Jx_diag);
         for ( int c = 0; c < num_colors; c++ ) {
             int color_index = geo->h_colors_index_offsets[c];
             int color_size = geo->h_colors_index_offsets[c + 1] - color_index;
             int* color_group_begin = color_groups + color_index;
 
-            solve_elasticity_springs_kernel<dynamics_block_size><<<color_size, dynamics_block_size>>>
-                (q, f_elastic, Jx_diag, q_prev, mass_inv, static_diags, q_inertia,
-                obj_data, vertices_obj,
-                edges, geo->edge_lengths.data().get(),
-                geo->edge_lookup.data().get(),
-                geo->dir_edges.data().get(),
-                color_group_begin, damping, h,
-                geo->get_global_parameter("base_spring_stiffness", default_base_spring_stiffness),
-                color_size);
+            if ( !fem_membrane )
+                solve_elasticity_springs_kernel<dynamics_block_size><<<color_size, dynamics_block_size>>>
+                    (q, f_elastic, Jx_diag, q_prev, mass_inv, static_diags, q_inertia,
+                    obj_data, vertices_obj,
+                    edges, geo->edge_lengths.data().get(),
+                    geo->edge_lookup.data().get(),
+                    geo->dir_edges.data().get(),
+                    color_group_begin, damping, h,
+                    base_spring_k, stiffen_start, stiffen_rate,
+                    color_size);
 
             vbd_self_contact_kernel<<<(total_threads + block - 1) / block, block>>>(
                 f, Jx_diag,
@@ -1271,5 +1378,11 @@ void SolverVBD::step(float h) {
     step_end_kernel<<<(n + block - 1) / block, block>>>(
         v, q, nullptr,
         q_prev, mask, h, max_vel, n);
+    // Seam projection and its matching velocity pass, the same pair PDNewton
+    // runs: the cluster projection is geometry-side (it welds the stitch
+    // clusters into one point once the assembly gate opens), and without the
+    // velocity pass the next substep would read the snap as momentum.
+    geo->project_stitches();
+    geo->average_stitch_cluster_velocities();
     // contact.check_truncation_traverse_bvh(q_prev, q);
 }

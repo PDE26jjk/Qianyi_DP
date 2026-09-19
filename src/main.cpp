@@ -107,7 +107,20 @@ PYBIND11_MODULE(Qianyi_DP, m) {
         .def_static("print", &SimulatorInterface::print)
         .def_static("get_all_solver", &SimulatorInterface::get_all_solver)
         .def_static("set_solver", &SimulatorInterface::set_solver)
-        .def_static("input_data", &SimulatorInterface::input_data)
+        // `input_data` is the call that builds a whole scene, and a failure
+        // inside it (a bad scene, or an engine error left over from a previous
+        // one) used to reach the process as a bare abort with no message. Print
+        // the exception text before it crosses the binding, then rethrow - the
+        // Python-visible exception type is unchanged.
+        .def_static("input_data", [](py::dict input) {
+            try {
+                SimulatorInterface::input_data(input);
+            } catch ( const std::exception& e ) {
+                printf("[input_data] exception: %s\n", e.what());
+                fflush(stdout);
+                throw;
+            }
+        })
         .def_static("update", &SimulatorInterface::update)
         .def_static("update_world_matrix", &SimulatorInterface::update_world_matrix)
         .def_static("update_local_vertices", &SimulatorInterface::update_local_vertices)

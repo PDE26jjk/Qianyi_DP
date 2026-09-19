@@ -254,8 +254,11 @@ void Geometry::init_stitch_cluster_buffers() {
     cluster_scratch_keys_b.resize(max_members);
     cluster_scratch_counts.assign(2, 0);
 
-    // Sort temp queried once for the worst-case key count; the requirement
-    // is monotonic in n, so smaller rebuilds always fit.
+    // First guess for the sort's scratch space, from the worst-case key count.
+    // It is only a starting size: `build_stitch_clusters` re-queries cub for the
+    // member count it actually sorts and grows the buffer when needed, because
+    // a size cached here is not a guaranteed upper bound (see the comment
+    // there).
     unsigned long long* ka = cluster_scratch_keys_a.data().get();
     unsigned long long* kb = cluster_scratch_keys_b.data().get();
     cub::DeviceRadixSort::SortKeys(nullptr, cluster_sort_temp_bytes,
@@ -323,8 +326,20 @@ void Geometry::build_stitch_clusters() {
     pack_member_keys_kernel<<<(mc + block - 1) / block, block>>>(
         label, stitch_cluster_members.data().get(),
         cluster_scratch_keys_a.data().get(), mc);
+    // Query the sort's temporary storage for the member count this rebuild
+    // actually has. The size cached by `init_stitch_cluster_buffers` is not a
+    // safe upper bound - cub reports a per-call requirement, and a stale (or
+    // too small) value makes the sort kernel write past the buffer, which
+    // surfaces later as an asynchronous `cudaErrorIllegalAddress` at whatever
+    // synchronization point comes next (it aborted `input_data` when a stitched
+    // scene followed another scene in the same process).
+    size_t sort_bytes = 0;
+    cub::DeviceRadixSort::SortKeys(nullptr, sort_bytes,
+        cluster_scratch_keys_a.data().get(), cluster_scratch_keys_b.data().get(), mc);
+    if ( sort_bytes > cluster_scratch_sort_temp.size() )
+        cluster_scratch_sort_temp.resize(sort_bytes);
     cub::DeviceRadixSort::SortKeys(cluster_scratch_sort_temp.data().get(),
-        cluster_sort_temp_bytes,
+        sort_bytes,
         cluster_scratch_keys_a.data().get(), cluster_scratch_keys_b.data().get(), mc);
     unpack_members_kernel<<<(mc + block - 1) / block, block>>>(
         cluster_scratch_keys_b.data().get(), stitch_cluster_members.data().get(), mc);
@@ -703,7 +718,6 @@ void Geometry::init_bend_structure() {
     const int ne = params.nb_all_cloth_edges;
     const int ns = params.nb_all_stitches;
     const int N = ne + ns;
-
     // stitch -> sewing line (static; same construction the old
     // init_sewing used).
     stitch_sewing.resize(ns);
@@ -781,13 +795,13 @@ void Geometry::init_bend_structure() {
         bend_cross_rows.data().get(), ne, ext_count, N);
 
     // Fill both validity arrays and refresh collapsed-triangle areas
-    // (the call inside build_stitch_clusters no-ops while bend_valid
-    // was still empty).
+    // (the call inside build_stitch_clusters no-ops until this flag is set).
     update_seam_state();
+    bend_structure_built = true;
 }
 
 void Geometry::update_seam_state() {
-    if ( bend_valid.empty() ) return; // bend structure not built yet
+    if ( !bend_structure_built ) return; // not built for this scene yet
     const int ntri = params.nb_all_cloth_triangles;
     const int ne = params.nb_all_cloth_edges;
     const int ns = params.nb_all_stitches;

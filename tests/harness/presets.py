@@ -75,12 +75,22 @@ VBD_PARAMETERS: dict[str, float] = {
     "debug_e_id": -7,
     "debug_v_id": -6,
     "constitutive_model_planar": 1,
+    # Velocity damping (1/s), the shared key; the solver reads it in place of
+    # its historic `vbd_damping`.
+    "velocity_damping": 0.0,
+    # Bending: VBD now dispatches IBM / DiscreteShells GN / AOGS. GN is the
+    # default because it is also valid for seam hinges (IBM gets no seam
+    # bending).
+    "bending_model": 1,
+    "bending_k": 0.2,
 }
 
 XPBD_PARAMETERS: dict[str, float] = {
     "smooth_times": 5,
     "step_h": 0.001,
+    "sewing_k": 1e5,
     "sewing_forced_connect_frame": 80,
+    "query_radius": 1e-3,
     "vf_force_k": 1e2,
     "vf_ground_k": 1e6,
     "ee_force_k": 0.1,
@@ -90,13 +100,21 @@ XPBD_PARAMETERS: dict[str, float] = {
     "ee_force_type": 0,
     "max_vel": 100.0,
     "gravity": -9.8,
-    "xpbd_damping": 0.1,
+    # Velocity damping (1/s), the shared key; it decays the end-of-substep
+    # velocity and weights the constraint damping term (it replaces the
+    # hard-coded exp(-h*0.5) and the `xpbd_damping` alias).
+    "velocity_damping": 0.1,
     "xpbd_relaxation": 0.1,
     "xpbd_iters": 20,
     "average_mass_by_cloth": 0,
     "constitutive_model_planar": 1,
     "xpbd_dynamics_iters": 1,
     "xpbd_use_lambdas": 0,
+    # Bending: XPBD now solves IBM (linear Willmore coordinate) and
+    # DiscreteShells GN (dihedral) as compliance constraints; AOGS is not
+    # offered by this solver.
+    "bending_model": 1,
+    "bending_k": 0.2,
 }
 
 EXPLICIT_PARAMETERS: dict[str, float] = {
@@ -104,14 +122,23 @@ EXPLICIT_PARAMETERS: dict[str, float] = {
     "step_h": 0.00025,
     "sewing_k": 1e5,
     "sewing_forced_connect_frame": 80,
+    "query_radius": 1e-3,
     "vf_force_k": 0.02,
     "ee_force_k": 0.002,
     "ef_force_k": 0.001,
     "ground": 1,
     "vf_force_type": 0,
     "ee_force_type": 0,
-    "max_vel": 1.0,
+    # `max_vel` was 1.0 m/s, which capped the fall itself (measured: a free
+    # panel dropped 1.19 m in 1.25 s instead of the ballistic 7.66); it is a
+    # safety clamp, not a speed limit for the scene.
+    "max_vel": 100.0,
     "gravity": -9.8,
+    # Velocity damping (1/s): the explicit step previously decayed velocity by
+    # a hard-coded exp(-h*0.5) no matter what the parameters said.
+    "velocity_damping": 0.0,
+    "bending_model": 0,
+    "bending_k": 0.2,
 }
 
 SOLVER_REGISTRY: dict[str, SolverInfo] = {

@@ -134,6 +134,59 @@ class MeshSpec:
                 raise ValueError(f"vertex index {idx} out of range [0, {num_vertices})")
 
 
+def seamed_panels_input_data(
+    cols: int = 5,
+    rows: int = 3,
+    width_m: float = 0.2,
+    height_m: float = 0.1,
+) -> tuple[dict, np.ndarray, np.ndarray]:
+    """Two panels joined only by ``sewings``, plus the seam index pair arrays.
+
+    Panel A sits directly above panel B and is pinned along its top edge; the
+    two panels share no mesh edge, so the engine's stitch constraint is the
+    only thing that can hold B (this is the arrangement the Blender frontend
+    builds from its sewing lines, and the one that distinguishes a solver that
+    applies the constraint from one that ignores it).
+
+    Returns ``(input_data, upper_indices, lower_indices)`` where the two index
+    arrays are the global vertex ids of each stitch pair, so the closure metric
+    is ``norm(world[upper] - world[lower])``.
+    """
+    upper = _shift_mesh(
+        _grid_spec(cols, rows, width_m, height_m,
+                   fixed=tuple(range(cols * (rows - 1), cols * rows))).to_dict(),
+        dy=height_m,
+    )
+    lower = _grid_spec(cols, rows, width_m, height_m).to_dict()
+    pairs = [(i, cols * (rows - 1) + i) for i in range(cols)]
+    sewings = [{
+        "patterns": [0, 1],
+        "stitches": pairs,
+        "angle": 0.0,
+    }]
+    n_upper = cols * rows
+    upper_ids = np.arange(cols, dtype=np.int64)
+    lower_ids = n_upper + np.asarray([cols * (rows - 1) + i for i in range(cols)],
+                                     dtype=np.int64)
+    return {"mesh_list": [upper, lower], "sewings": sewings}, upper_ids, lower_ids
+
+
+def _grid_spec(cols: int, rows: int, width_m: float, height_m: float,
+               fixed: tuple[int, ...] = ()) -> "MeshSpec":
+    """Grid spec helper (kept separate so the seam scene reads as a scene)."""
+    return MeshSpec(width_m=width_m, height_m=height_m, cols=cols, rows=rows,
+                    fixed_vertex_indices=fixed)
+
+
+def _shift_mesh(mesh: dict, dy: float) -> dict:
+    """Translate a mesh dict's vertices along +Y, in place."""
+    for key in ("vertices", "vertices_sim"):
+        values = np.array(mesh[key], dtype=np.float32).reshape(-1, 3)
+        values[:, 1] += dy
+        mesh[key] = values.reshape(-1)
+    return mesh
+
+
 def validate_mesh_list(mesh_list: list[dict]) -> None:
     """Validate multi-mesh input ordering and per-mesh triangle-edge integrity.
 

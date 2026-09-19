@@ -12,4 +12,7 @@ struct SolverXPBD : SolverBase {
 private:
     thrust::device_vector<float3> delta;
     thrust::device_vector<float> lambdas;
+    // Size of the membrane's range inside `lambdas`; bending hinges and
+    // stitches accumulate into the ranges that follow it.
+    int membrane_lambda_slots = 0;
 };

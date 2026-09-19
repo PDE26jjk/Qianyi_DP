@@ -1097,3 +1097,84 @@
       artifact of the 5/2 budget. Whether to relax that tolerance, raise the
       contact stiffness, or keep the anchor as the smoke-scene default is the
       remaining decision (see 8.2).
+- [x] 2.30 Cross-solver audit: what VBD / XPBD / Explicit are missing, and
+      whether continuing to invest in them is justified. Measurement only, no
+      code change. Requested by the maintainer right after the 2.29 commit.
+
+      Which shared subsystems each solver's `step` actually calls. The
+      subsystems themselves are solver-independent (`sewing.cu`,
+      `dynamics/bending.cuh`, `dynamics/planar.cuh`, `contact/collision.cu`), so
+      this is purely a wiring inventory:
+
+      | subsystem | PDNewton | VBD | XPBD | Explicit |
+      |---|---|---|---|---|
+      | membrane springs | yes | yes | yes | yes |
+      | membrane FEM_BW | yes | **no** - springs only, `constitutive_model_planar` is never read | yes | no (the ARAP/BW calls are commented out) |
+      | bending (IBM / DiscreteShells GN / AOGS) | yes | **no** | **no** | IBM + GN only |
+      | stitch constraint | yes | **no** | **no** (`// accumulate_sewing_force()`) | yes |
+      | seam projection + cluster velocity averaging | yes | no | no | no |
+      | broad-phase refresh | per substep (`refit_bvh_with_target`) | per substep (stated contacts) | **per frame only** (stale over the 42 substeps of a frame at `step_h = 1 ms`) | **per frame only** |
+      | velocity damping | `velocity_damping` / `creep_damping` | `vbd_damping` | hard-coded `exp(-h*0.5)` | hard-coded `exp(-h*0.5)` |
+      | strain stiffening | yes | no | no | yes (springs) |
+      | residual metrics | yes | no | no | no |
+      | test coverage | quick suite | skipped xfail | skipped xfail | skipped xfail |
+
+      `SolverChebyshev` and `SolverPNCG` are dead code: both are commented out in
+      `Simulator::create_solver`, absent from `get_all_solver()` and from the
+      preset registry, so nothing can select them.
+
+      The Blender frontend does expose all four registered names
+      (`Qianyi/model/solver_params.py`: `SOLVERS = ("PDNewton", "XPBD", "VBD",
+      "Explicit")` as an `EnumProperty`), so what follows is user-reachable.
+
+      Measured on one GarmentCodeData element (two skirt panels, 1166 cloth
+      vertices, 2 stitch chains of 9 members, 23 752-vertex body), 20 frames at
+      24 fps, `--no-reference` (probe: `build/probe_solver_gaps.py`):
+
+      | solver | invariant tier | ms/frame | outcome |
+      |---|---|---|---|
+      | PDNewton | passed | 44-50 | drapes, z stays in 824-937 mm |
+      | VBD | passed | 250-390 | drapes, 2.5-7x the PDNewton cost |
+      | XPBD | passed | 430-530 | drapes but stretches 1.4x as far, 9-10x the cost |
+      | Explicit | passed at 20 frames | 990 | moves 2.7 m, collapses onto the ground |
+
+      The invariant tier does not separate them, because the two panels of that
+      element start coincident along the seam and gravity moves both the same
+      way. Two probes that do separate them:
+
+      1. Two-panel seam whose only connection is the engine's stitch constraint
+         (panel A pinned along its top edge, panel B hanging from A, ground
+         off, 30 frames). `seam_gap_max` is the distance between the paired seam
+         vertices in the last frame:
+
+         | solver | seam gap | panel B motion |
+         |---|---|---|
+         | PDNewton | **0.84 mm** | 153 mm (hangs from the stitches) |
+         | PDNewton, `sewing_k = 0` (control) | 5826 mm | 5924 mm (free fall) |
+         | VBD | 67 mm, bit-identical with `sewing_k = 0` | 57 mm |
+         | XPBD | 5816 mm, bit-identical with the control | 5902 mm (free fall) |
+         | Explicit | 218295 mm (blows up; free-falls cleanly with `sewing_k = 0`) | - |
+
+         The control is the reading that matters: removing `sewing_k` from
+         PDNewton opens the seam by five orders of magnitude, so the metric
+         measures the stitch constraint and nothing else. XPBD's result is
+         bit-identical to that control (it never applies the constraint), and
+         VBD's is bit-identical with the constraint on and off (it never reads
+         `sewing_k` either).
+      2. Repeatability of two identical fresh-process runs of the 10-frame
+         skirt drape, `max|dpos|` between the two final frames: PDNewton 2.7 mm
+         (the known determinism xfail), VBD 27.5 mm, XPBD **456 mm**. VBD is no
+         longer a candidate for parameter A/B without a determinism story, and
+         XPBD's 0.4 s drape is not reproducible at all.
+
+      Conclusion and recommendation. VBD is the closest to viable (per-substep
+      stated contacts, colored block solve, cheapest of the three) and its
+      missing pieces are exactly the ones a garment needs: the stitch
+      constraint and bending. XPBD needs those plus a per-substep broad-phase
+      refresh and a stability fix; Explicit is a reference implementation (20x
+      the cost, blows up at the garment areal density) and should not receive
+      more work. If a second solver is wanted, the cheapest useful step is the
+      stitch constraint plus the bending dispatch in VBD, then re-enable its
+      smoke test; XPBD/Explicit stay experimental and user-visible only if the
+      frontend stops listing them. Recorded as an open decision - no code was
+      changed for this audit.

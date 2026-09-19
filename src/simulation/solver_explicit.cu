@@ -12,37 +12,53 @@
 static __global__ void step_end_kernel(
     float3* __restrict__ vertices_world,
     float3* __restrict__ velocities,
-    const float3* __restrict__ pos_ine,
+    const float3* __restrict__ pos_prev,
     const float3* __restrict__ other_forces,
     const float3* __restrict__ elastic_forces,
     const char* __restrict__ vertices_mask,
     const float* __restrict__ mass_inv,
     const ObjectDataInput* __restrict__ obj_data,
     const int* __restrict__ vertices_obj,
+    const float3 gravity,
     const float h,
     const float max_velocity,
     const bool ground,
     const float ground_f,
+    // Velocity decay rate (1/s), see SolverBase::velocity_damping. The previous
+    // fixed `exp(-h * 0.5)` ignored every parameter.
+    const float damping_rate,
     const int n
 ) {
     for ( int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
           i += blockDim.x * gridDim.x ) {
         if ( !vertices_mask[i] ) {
-            auto x_old = vertices_world[i];
-            float mi = mass_inv[i];
-            float3 x = pos_ine[i] + (other_forces[i] + elastic_forces[i]) * mi * h * h;
-            float3 v = (x - x_old) / h;
+            // Symplectic (semi-implicit) Euler: the velocity advances with the
+            // force sampled by this substep's assembly, the position with the
+            // new velocity. The previous form advanced the position by
+            // `f/m * h^2` from the *old* velocity, which is explicit Euler on
+            // the positions and is unconditionally unstable for the elastic
+            // oscillator - and it read that force from `pos_ine`, a buffer the
+            // explicit path never wrote, so the instability was masked by the
+            // force term being effectively dropped (measured: 2.7 m of motion
+            // and a collapse onto the ground on a skirt drape, then NaN once
+            // the term was correctly applied).
+            const float3 x_old = pos_prev[i];
+            const float mi = mass_inv[i];
+            float3 v = velocities[i] + (gravity + (other_forces[i] + elastic_forces[i]) * mi) * h;
+            float3 x = x_old + v * h;
             if ( ground ) {
                 float min_z = obj_data[vertices_obj[i]].thickness;
                 if ( x.z <= min_z ) {
                     x.z = min_z;
-                    v.z = 0.f;
+                    if ( v.z < 0.f ) v.z = 0.f;
                     v = v * expf(-h * ground_f);
                 }
             }
-            if ( norm(v) > max_velocity )
+            if ( norm(v) > max_velocity ) {
                 v = normalized(v) * max_velocity;
-            v = v * expf(-h * 0.5f);
+                x = x_old + v * h;
+            }
+            v = v * expf(-h * damping_rate);
             velocities[i] = v;
             vertices_world[i] = x;
         }
@@ -88,6 +104,7 @@ void SolverExplicit::step(float h) {
     //     masses.data().get(),
     //     vertices_mask.data().get(), n);
     float3* q = geo->pos_world.data().get();
+    const float3* q_prev = geo->pos_step_prev.data().get();
     float3* q_inertia = geo->pos_inertia.data().get();
     float3* v = geo->velocities.data().get();
     float3* f = geo->forces.data().get();
@@ -125,12 +142,27 @@ void SolverExplicit::step(float h) {
     cudaMemsetAsync(f, 0, params.nb_all_cloth_vertices * sizeof(float3));
     cudaMemsetAsync(f_elastic, 0, params.nb_all_cloth_vertices * sizeof(float3));
 
+    // `pos_world` stays at the substep start while the forces are assembled:
+    // the explicit scheme samples the force at the position it integrates
+    // from (`f(x_n)`), which is what keeps it stable. The inertia prediction
+    // goes into `pos_inertia` and is used only as the swept target of the
+    // broad phase below.
     forward_step<<<(n + block - 1) / block, block>>>(
         v, nullptr, mass_inv,
         nullptr, f_elastic,
-        mask, q_inertia, nullptr, q, nullptr,
+        mask, q, nullptr, q_inertia, nullptr,
         static_diags,
         h, 1e2, geo->gravity, 0, n);
+    // Per-substep collision refresh, so the contact penalty in this substep
+    // uses candidate pairs and a swept BVH built from this substep's inertia
+    // prediction instead of the frame start (`Simulator::update` detects
+    // collisions once per frame, before the substep loop).
+    {
+        auto& contact = geo->get_contact();
+        const float query_radius = max(1e-5f, get_global_parameter("query_radius", 1e-3f));
+        contact.refit_bvh_with_target(q_prev, q_inertia);
+        contact.collision_detect_broad_phase(q_prev, q_inertia, query_radius, true);
+    }
     // n = pp_result_size_h;
     // compute_collision_penalty_force_point_point<<<(n + block - 1) / block, block>>>(
     //     nullptr, nullptr,
@@ -158,11 +190,24 @@ void SolverExplicit::step(float h) {
         geo->get_global_parameter("strain_stiffen_start", default_strain_stiffen_start);
     const float stiffen_rate =
         geo->get_global_parameter("strain_stiffen_rate", default_strain_stiffen_rate);
-    accumulate_spring_forces<<<(n + block - 1) / block, block>>>(nullptr, nullptr,
-        f_elastic, nullptr, q, edges,
-        geo->edge_lengths.data().get(),
-        geo->obj_data.data().get(), geo->vertices_obj.data().get(),
-        n, base_spring_k, stiffen_start, stiffen_rate);
+    if ( geo->constitutive_model == ConstitutiveModel::SpringMass )
+        accumulate_spring_forces<<<(n + block - 1) / block, block>>>(nullptr, nullptr,
+            f_elastic, nullptr, q, edges,
+            geo->edge_lengths.data().get(),
+            geo->obj_data.data().get(), geo->vertices_obj.data().get(),
+            n, base_spring_k, stiffen_start, stiffen_rate);
+    else if ( geo->constitutive_model == ConstitutiveModel::FEM_BW ) {
+        // The planar FEM membrane path, previously commented out here: the
+        // explicit solver only ever integrated the spring lattice, so
+        // `constitutive_model_planar` had no effect on it. Forces only (both
+        // Hessian arguments null) - the explicit integrator needs no tangent.
+        n = params.nb_all_cloth_triangles;
+        compute_BW_FEM<<<(n + block - 1) / block, block>>>(nullptr, nullptr,
+            f_elastic, nullptr, q, tri_edges, edges,
+            geo->Dms.data().get(), geo->areas.data().get(),
+            geo->obj_data.data().get(), geo->vertices_obj.data().get(),
+            n, 1.f, 1.f, base_spring_k, stiffen_start, stiffen_rate);
+    }
     n = params.nb_all_cloth_triangles;
     // compute_ARAP_FEM<<<(n + block - 1) / block, block>>>(
     //     nullptr, nullptr,
@@ -186,6 +231,9 @@ void SolverExplicit::step(float h) {
     //     n);
 
     n = params.nb_all_cloth_edges + params.nb_all_stitches;
+    // Bending stiffness: this path passed a literal 0.2f, so `bending_k` had no
+    // effect on the explicit solver.
+    const float bending_k = max(0.f, get_global_parameter("bending_k", 0.2f));
     if ( geo->bending_model == BendingModel::IBM_quadratic )
         compute_quadratic_bending_IBM<<< (n + block - 1) / block, block>>>(
             nullptr, nullptr,
@@ -195,10 +243,8 @@ void SolverExplicit::step(float h) {
             geo->bend_points.data().get(),
             geo->bend_valid.data().get(),
             geo->bend_cross_rows.data().get(),
-            n, 0.2f);
-    else if ( geo->bending_model == BendingModel::DiscreteShells_GN
-        || geo->bending_model == BendingModel::DiscreteShells_AOGS )
-        // The forces are the same
+            n, bending_k);
+    else if ( geo->bending_model == BendingModel::DiscreteShells_GN )
         compute_dihedral_bending_GN<<<(n + block - 1) / block, block>>>(
             nullptr, nullptr,
             f, q,
@@ -207,7 +253,20 @@ void SolverExplicit::step(float h) {
             geo->bend_factor.data().get(),
             geo->bend_valid.data().get(),
             geo->bend_cross_rows.data().get(),
-            n, 0.2f);
+            n, bending_k);
+    else if ( geo->bending_model == BendingModel::DiscreteShells_AOGS )
+        // AOGS was previously folded into the GN branch ("the forces are the
+        // same"), which is not the case: it is a different curvature measure.
+        // Both now take their own kernel, as PDNewton already did.
+        compute_dihedral_bending_AOGS<<<(n + block - 1) / block, block>>>(
+            nullptr, nullptr,
+            f, q,
+            geo->bend_points.data().get(),
+            geo->bend_rest_theta.data().get(),
+            geo->bend_factor.data().get(),
+            geo->bend_valid.data().get(),
+            geo->bend_cross_rows.data().get(),
+            n, bending_k);
     geo->accumulate_sewing_force(nullptr);
     geo->get_contact().accumulate_contact_force(f, nullptr, h);
     // update substep end
@@ -219,8 +278,17 @@ void SolverExplicit::step(float h) {
 
     bool ground = geo->ground;
     float ground_f = max(0.f, (get_global_parameter("ground_f", 1e3)));
+    // Velocity decay, parameter driven (was a fixed exp(-h * 0.5)).
+    const float damping = max(0.f, velocity_damping(nullptr, 0.f));
     step_end_kernel<<<(n + block - 1) / block, block>>>(
-        q, v, q_inertia, f, f_elastic, mask, mass_inv, obj_data, vertices_obj, h, max_vel, ground, ground_f, n);
+        q, v, q_prev, f, f_elastic, mask, mass_inv, obj_data, vertices_obj,
+        geo->gravity, h, max_vel, ground, ground_f, damping, n);
+    // Seam projection and its matching velocity pass (geometry-side, see
+    // SolverPDNewton::step). It has to run *after* `step_end_kernel` here: the
+    // explicit integrator overwrites the position from the velocity, so a
+    // projection before it would be discarded.
+    geo->project_stitches();
+    geo->average_stitch_cluster_velocities();
 
     // if ( substep % LCP_substeps == 0 ) {
     //     collision_LCP_postprocess_unified(vertices_world.data().get());

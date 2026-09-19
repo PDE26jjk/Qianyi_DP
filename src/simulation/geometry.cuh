@@ -164,6 +164,13 @@ public:
                                                       // internal lines later
     thrust::device_vector<char>  bend_valid;          // N
     thrust::device_vector<char>  seam_bend_static_ok; // ns (apexes found etc.)
+    // False until `init_bend_structure` has rebuilt the arrays above for the
+    // *current* scene. `update_seam_state` must not touch them before that: on
+    // a re-init (`input_data` called a second time) they still hold the
+    // previous scene's contents, so "is the vector empty?" is not a usable
+    // readiness test - it read a stale-size `seam_bend_static_ok` and aborted
+    // the process with an illegal memory access.
+    bool bend_structure_built = false;
 
     void init_bend_structure();   // once, after init_triangle_data
     void update_seam_state();     // areas + bend validity, on cluster rebuilds

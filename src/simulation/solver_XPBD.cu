@@ -11,10 +11,143 @@
 // Combined friction coefficient. Geometric mean per convention; fall back to the
 // known side when the other material has no friction field (unset rigid objects
 // default to 0) so cloth-vs-body contacts still grip.
+// Stitch status bit for a torn seam, same encoding as sewing.cu (which keeps
+// these constants file-local).
+constexpr char xpbd_stitch_status_torn = (char)(1 << 3);
+
 static __device__ __forceinline__ float combine_mu(const float mu0, const float mu1) {
     if ( mu0 <= 0.0f ) return mu1;
     if ( mu1 <= 0.0f ) return mu0;
     return sqrtf(mu0 * mu1);
+}
+
+// Bending as XPBD constraints, mirroring the compliance/damping form of
+// `xpbd_solve_springs_kernel` (`alpha = 1/(k h^2)`, `gamma = kd/(k h)`,
+// `dlambda = -(C + alpha*lambda + gamma*grad.v) / ((1+gamma)*sum(w|grad|^2) + alpha)`).
+// Two constraint flavours share the unified bend tables:
+//   model 0 (IBM quadratic): the energy is `0.5 k (q.X)^2`, i.e. the linear
+//     constraint `C = q . X` with gradient `q` per vertex, so restoring C -> 0
+//     flattens the hinge exactly as the force-based model does.
+//   otherwise (DiscreteShells): `C = theta - theta_rest` with the dihedral
+//     gradients `dtheta/dx_i`.
+// AOGS is not offered here: it needs its own seam-aware geometry setup, and the
+// shipped XPBD block selects a model this kernel implements (see the change's
+// design.md, D3).
+static __global__ void xpbd_solve_bending_kernel(
+    float* __restrict__ lambdas,
+    float3* __restrict__ delta,
+    const float3* __restrict__ pos,
+    const float3* __restrict__ velocities,
+    const float* __restrict__ inv_mass,
+    const int4* __restrict__ bend_points,
+    const float4* __restrict__ IBM_q,
+    const float* __restrict__ bend_rest_theta,
+    const float* __restrict__ bend_factor,
+    const char* __restrict__ bend_valid,
+    const int model,
+    const float damping,
+    const float h,
+    const float bending_k,
+    const int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if ( i >= n ) return;
+    if ( !bend_valid[i] ) return;
+    int4 p = bend_points[i];
+    float w0 = inv_mass[p.x], w1 = inv_mass[p.y], w2 = inv_mass[p.z], w3 = inv_mass[p.w];
+    if ( w0 <= 0.f && w1 <= 0.f && w2 <= 0.f && w3 <= 0.f ) return;
+    float ke = bending_k * bend_factor[i];
+    if ( ke <= 0.f ) return;
+
+    float3 g0, g1, g2, g3;
+    float C;
+    float denom;
+    if ( model == 0 ) {
+        // Vector constraint: C = q . X (a 3-vector), gradients q_i per vertex,
+        // so the constraint direction is C/|C| and the denominator is the
+        // scalar sum `sum(w_i q_i^2)`.
+        float4 q = IBM_q[i];
+        float3 Cv = pos[p.x] * q.x + pos[p.y] * q.y + pos[p.z] * q.z + pos[p.w] * q.w;
+        C = norm(Cv);
+        if ( C < 1e-12f ) return;
+        const float len_inv = 1.f / C;
+        g0 = Cv * (q.x * len_inv);
+        g1 = Cv * (q.y * len_inv);
+        g2 = Cv * (q.z * len_inv);
+        g3 = Cv * (q.w * len_inv);
+        denom = w0 * q.x * q.x + w1 * q.y * q.y + w2 * q.z * q.z + w3 * q.w * q.w;
+    }
+    else {
+        float theta;
+        get_theta_dpk(pos[p.x], pos[p.y], pos[p.z], pos[p.w], g0, g1, g2, g3, theta);
+        C = theta - bend_rest_theta[i];
+        denom = w0 * len_sq(g0) + w1 * len_sq(g1) + w2 * len_sq(g2) + w3 * len_sq(g3);
+    }
+
+    if ( denom <= 1e-20f ) return;
+
+    const float alpha = 1.0f / (ke * h * h);
+    const float gamma = damping / (ke * h);
+    const float grad_dot_v = h * (
+        dot(g0, velocities[p.x]) + dot(g1, velocities[p.y])
+        + dot(g2, velocities[p.z]) + dot(g3, velocities[p.w]));
+    float delta_lambda;
+    if ( lambdas ) {
+        delta_lambda = -(C + alpha * lambdas[i] + gamma * grad_dot_v)
+            / ((1.0f + gamma) * denom + alpha);
+        lambdas[i] += delta_lambda;
+    }
+    else {
+        delta_lambda = -(C + gamma * grad_dot_v) / ((1.0f + gamma) * denom + alpha);
+    }
+    atomicAddFloat3(&delta[p.x], g0 * (w0 * delta_lambda));
+    atomicAddFloat3(&delta[p.y], g1 * (w1 * delta_lambda));
+    atomicAddFloat3(&delta[p.z], g2 * (w2 * delta_lambda));
+    atomicAddFloat3(&delta[p.w], g3 * (w3 * delta_lambda));
+}
+
+// Seam stitches as zero-rest-length XPBD distance constraints over the engine's
+// stitch pairs (torn stitches are skipped), the same shape as the spring
+// constraint above with `rest_length = 0`.
+static __global__ void xpbd_solve_stitches_kernel(
+    float* __restrict__ lambdas,
+    float3* __restrict__ delta,
+    const float3* __restrict__ pos,
+    const float3* __restrict__ velocities,
+    const float* __restrict__ inv_mass,
+    const int2* __restrict__ stitches,
+    const char* __restrict__ stitches_status,
+    const float damping,
+    const float h,
+    const float sewing_k,
+    const int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if ( i >= n ) return;
+    if ( stitches_status && stitches_status[i] == xpbd_stitch_status_torn ) return;
+    auto [v0, v1] = stitches[i];
+    if ( v0 < 0 || v1 < 0 || v0 == v1 ) return;
+    float3 e = pos[v0] - pos[v1];
+    float len = norm(e);
+    if ( len < 1e-12f ) return;
+    float3 n_dir = e / len;
+    float w0 = inv_mass[v0], w1 = inv_mass[v1];
+    float denom = w0 + w1;
+    if ( denom <= 0.f || sewing_k <= 0.f ) return;
+    const float alpha = 1.0f / (sewing_k * h * h);
+    const float gamma = damping / (sewing_k * h);
+    const float grad_dot_v = h * dot(n_dir, velocities[v0] - velocities[v1]);
+    float delta_lambda;
+    if ( lambdas ) {
+        delta_lambda = -(len + alpha * lambdas[i] + gamma * grad_dot_v)
+            / ((1.0f + gamma) * denom + alpha);
+        lambdas[i] += delta_lambda;
+    }
+    else {
+        delta_lambda = -(len + gamma * grad_dot_v) / ((1.0f + gamma) * denom + alpha);
+    }
+    atomicAddFloat3(&delta[v0], n_dir * (w0 * delta_lambda));
+    atomicAddFloat3(&delta[v1], -n_dir * (w1 * delta_lambda));
 }
 
 static __global__ void step_end_kernel(
@@ -25,6 +158,9 @@ static __global__ void step_end_kernel(
     const char* __restrict__ vertices_mask,
     const float h,
     const float max_velocity,
+    // Velocity decay rate (1/s), see SolverBase::velocity_damping. The previous
+    // fixed `exp(-h * 0.5)` ignored every parameter.
+    const float damping_rate,
     const int n
 ) {
     for ( int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
@@ -35,7 +171,7 @@ static __global__ void step_end_kernel(
 
             if ( norm(v) > max_velocity )
                 v = normalized(v) * max_velocity;
-            v = v * expf(-h * 0.5f);
+            v = v * expf(-h * damping_rate);
             velocities[i] = v;
             pos_world[i] = x;
             // if ( ground ) {
@@ -59,7 +195,13 @@ void SolverXPBD::init() {
     auto* geo = simulator->get_geo();
 
     delta.resize(params.nb_all_vertices);
-    lambdas.resize(max(params.nb_all_edges, params.nb_all_cloth_triangles * 3));
+    // One multiplier slot per constraint, in three disjoint ranges:
+    // membrane [0, membrane_slots), bending hinges, then stitches. Sharing a
+    // single range would alias the accumulators of two constraint families.
+    membrane_lambda_slots = max(params.nb_all_edges, params.nb_all_cloth_triangles * 3);
+    lambdas.resize(membrane_lambda_slots
+        + params.nb_all_cloth_edges + params.nb_all_stitches
+        + params.nb_all_stitches);
 }
 __global__ void xpbd_forward_step(
     const float3* __restrict__ pos,
@@ -683,11 +825,30 @@ void SolverXPBD::step(float h) {
     float vf_ground_k = max(0.f, geo->get_global_parameter("vf_ground_k", 0.2f));
     float ee_force_k = max(0.f, geo->get_global_parameter("ee_force_k", 0.2f));
     float ef_force_k = max(0.f, geo->get_global_parameter("ef_force_k", 0.2f));
-    float damping = max(0.f, get_global_parameter("xpbd_damping", 0.f));
+    // Velocity damping, shared parameter with the historic `xpbd_damping` as
+    // the fallback; it decays the end-of-substep velocity and weights the
+    // constraint damping term inside the solve.
+    float damping = max(0.f, velocity_damping("xpbd_damping", 0.f));
     float relaxation = max(0.f, geo->get_global_parameter("xpbd_relaxation", 0.9f));
+    const float bending_k = max(0.f, get_global_parameter("bending_k", 0.2f));
+    const float sewing_k = max(0.f, geo->get_global_parameter("sewing_k", 1e5f));
+    const bool bending_ibm = geo->bending_model == BendingModel::IBM_quadratic;
+    const int n_bend = params.nb_all_cloth_edges + params.nb_all_stitches;
+    const int n_stitch = params.nb_all_stitches;
+    // Lambda ranges: membrane first, then bending hinges, then stitches.
+    float* bend_lambdas = lambdas ? lambdas + membrane_lambda_slots : nullptr;
+    float* stitch_lambdas = lambdas ? lambdas + membrane_lambda_slots + n_bend : nullptr;
 
 
     auto& contact = geo->get_contact();
+    // Per-substep collision refresh. `Simulator::update` detects collisions once
+    // per frame, before the substep loop, so without this the candidate pairs
+    // and the swept BVH would describe the frame's start while the substep has
+    // already moved by the inertia prediction (a frame is up to 42 substeps at
+    // the shipped step_h). Same arrangement PDNewton and VBD use.
+    const float query_radius = max(1e-5f, get_global_parameter("query_radius", 1e-3f));
+    contact.refit_bvh_with_target(q_prev, q_inertia);
+    contact.collision_detect_broad_phase(q_prev, q_inertia, query_radius, true);
     for ( int i = 0; i < iters; i++ ) {
         if ( lambdas )
             cudaMemsetAsync(lambdas, 0, this->lambdas.size() * sizeof(float));
@@ -712,8 +873,36 @@ void SolverXPBD::step(float h) {
                     damping, relaxation, h, base_spring_k, n);
             }
         }
+        // Bending and stitching belong to the same projection pass as the
+        // membrane; they were previously absent from this solver entirely (no
+        // `bending_model` dispatch, `accumulate_sewing_force` commented out),
+        // which is what left a garment's seams unheld and its folds limp.
+        if ( n_bend > 0 && bending_k > 0.f ) {
+            xpbd_solve_bending_kernel<<<(n_bend + block - 1) / block, block>>>(
+                bend_lambdas, dx,
+                q, v, mass_inv,
+                geo->bend_points.data().get(),
+                geo->IBM_q.data().get(),
+                geo->bend_rest_theta.data().get(),
+                geo->bend_factor.data().get(),
+                geo->bend_valid.data().get(),
+                bending_ibm ? 0 : 1,
+                damping, h, bending_k, n_bend);
+        }
+        if ( n_stitch > 0 && sewing_k > 0.f ) {
+            xpbd_solve_stitches_kernel<<<(n_stitch + block - 1) / block, block>>>(
+                stitch_lambdas, dx,
+                q, v, mass_inv,
+                geo->stitches.data().get(),
+                geo->stitches_status.data().get(),
+                damping, h, sewing_k, n_stitch);
+        }
         // contact.ccd_truncation_traverse_bvh(q_prev, q);
-        // geo->accumulate_sewing_force();
+        // The membrane / bending / stitch kernels leave `n` at the constraint
+        // count, which is not the vertex count: apply (and clear) the
+        // accumulator over the cloth vertices, or the stale entries beyond the
+        // last constraint index would be applied again as the loop continues.
+        n = params.nb_all_cloth_vertices;
         applay_delta_xpbd<<<(n + block - 1) / block, block>>>(
             q, dx, mask, max_dx, n);
         // contact
@@ -744,6 +933,12 @@ void SolverXPBD::step(float h) {
     // update substep end
 
     step_end_kernel<<<(n + block - 1) / block, block>>>(
-        q, v, q_prev, dx, mask, h, max_vel, n);
+        q, v, q_prev, dx, mask, h, max_vel, damping, n);
+    // Seam projection and its matching velocity pass (geometry-side, see
+    // SolverPDNewton::step): applied to the positions this substep produced, so
+    // a stitch cluster is welded rather than dragged together by the soft
+    // constraint alone.
+    geo->project_stitches();
+    geo->average_stitch_cluster_velocities();
 
 }

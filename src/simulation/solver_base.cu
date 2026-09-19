@@ -66,3 +66,13 @@ AutoGPUmem::~AutoGPUmem() { pool->dealloc_pool(ptr); }
 float SolverBase::get_global_parameter(const std::string& key, float default_value) const {
     return simulator->get_parameter(key, default_value);
 }
+
+float SolverBase::velocity_damping(const char* legacy_key, float default_value) const {
+    const float unified = simulator->get_parameter("velocity_damping", -1.f);
+    if ( unified >= 0.f ) return unified;
+    if ( legacy_key != nullptr ) {
+        const float legacy = simulator->get_parameter(legacy_key, -1.f);
+        if ( legacy >= 0.f ) return legacy;
+    }
+    return default_value;
+}
