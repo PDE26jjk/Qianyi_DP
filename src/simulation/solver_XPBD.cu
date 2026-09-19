@@ -189,6 +189,14 @@ static __global__ void step_end_kernel(
     }
 }
 
+// XPBD stays finite at much larger substeps than the explicit family, but its
+// accuracy does not: on the t1 garment the motion is several times too large at
+// the frontend's shared 4.5 ms default and settles at 1 ms (measured 0.30 m vs
+// 0.09 m of displacement over 40 frames).
+float SolverXPBD::max_stable_step_h() const {
+    return max(0.f, get_global_parameter("xpbd_max_step_h", 1e-3f));
+}
+
 void SolverXPBD::init() {
     SolverBase::init();
     auto& params = *simulator->get_geo_params();

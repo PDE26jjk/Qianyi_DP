@@ -273,6 +273,43 @@
 
 ## 7. Verification and documentation
 
+- [x] 7.6 Reproduce the maintainer's "these solvers still blow up immediately"
+      report against the real scene and fix the cause.
+
+      Reproduced with the *frontend's own parameter block* on the t1 .blend
+      (`build/probe_t1_solvers.py`, 40 frames, scene read-only): the addon sends
+      `scene.qmyi.solver.apply_to_engine()` - one shared block, `step_h`
+      **4.5 ms** - and drives `simulator.update(step_h)` once per frame. With it:
+
+      | solver | 4.5 ms (frontend default) | 1 ms | 0.25 ms |
+      |---|---|---|---|
+      | PDNewton | fine (26 mm) | - | - |
+      | VBD | fine (26 mm) | - | - |
+      | XPBD | finite but 3x too mobile (0.30 m, 176 mm in one frame) | 94 mm | 45 mm |
+      | Explicit | **blows up on frame 0: 4.2 m of motion in a single frame** | 54 mm | 23 mm |
+
+      So the missing piece was not the physics but the substep: the frontend
+      has one `step_h` for every solver, and the explicit family's contact
+      limit (0.25 ms) is 18x below it. This cannot be fixed from the engine by
+      guessing a constant, so the solver now declares its own limit:
+      `SolverBase::max_stable_step_h()` (0 = no opinion), implemented by
+      Explicit (`explicit_max_step_h`, default 2.5e-4) and XPBD
+      (`xpbd_max_step_h`, default 1e-3), and `Simulator::update` clamps the
+      requested substep to it and subdivides the frame - the frame time and the
+      reported trajectory are unchanged, only the cost is.
+
+      Verified: on the standard scene with ground contact and a 10 ms requested
+      substep the explicit solver rests at the clamp (0 mm) with the guard and
+      moves 1.74 km with `explicit_max_step_h = 0`; on t1 with the frontend
+      block unchanged, all four solvers now complete 40 frames finite (Explicit
+      0.51 m of displacement, dominated by the seam projection's merge, worst
+      single frame 0.99 m). A regression test
+      (`test_explicit_substep_cap_prevents_the_contact_blowup`) covers it.
+
+      Note for whoever owns the frontend: giving each solver its own `step_h`
+      default (Explicit <= 0.5 ms, XPBD <= 1 ms, VBD/PDNewton free) would reach
+      the same result without the guard, at the same cost.
+
 - [x] 7.5 Wire the geometry-side seam projection (`project_stitches` +
       `average_stitch_cluster_velocities`) into VBD, XPBD and Explicit, and
       measure the blow-up boundaries the maintainer asked about.

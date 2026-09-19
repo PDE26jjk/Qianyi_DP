@@ -93,6 +93,16 @@ public:
     virtual void init();
     virtual void begin_frame() {}
     virtual void step(float h) = 0;
+    // Largest substep this solver can integrate on the current scene, or 0 for
+    // "no opinion". `Simulator::update` clamps the requested `step_h` to it and
+    // subdivides the frame accordingly.
+    //
+    // The frontend sends one shared `step_h` (4.5 ms by default) whatever solver
+    // is selected, and the conditionally-stable solvers cannot take that: the
+    // explicit family needs `h < 2 sqrt(m/k)`, which on a garment with contact
+    // is ~0.25 ms. Without this hook, choosing one of those solvers in the UI
+    // blows the scene up on the first frame.
+    virtual float max_stable_step_h() const { return 0.f; }
 
 
     // void collision_LCP_postprocess(float3* points_y);

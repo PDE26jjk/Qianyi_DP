@@ -229,3 +229,24 @@ def test_seam_projection_merges_clusters(qydp, solver, capture) -> None:
         f"seam gap {float(gap.max()) * 1e3:.3f} mm after the projection gate: the "
         "solver is not running the seam projection"
     )
+
+
+def test_explicit_substep_cap_prevents_the_contact_blowup(qydp, capture) -> None:
+    """A coarse requested substep must not blow the explicit solver up.
+
+    The frontend sends one shared `step_h` (4.5 ms by default) whatever solver
+    is selected. Measured on this scene with the ground contact active: the
+    explicit solver moves 1.74 km with a 10 ms substep when the guard is off
+    (`explicit_max_step_h = 0`) and rests at the clamp with it on, because the
+    engine subdivides the frame down to the solver's declared limit.
+    """
+    spec = MeshSpec(rows=10, cols=10, fixed_vertex_indices=PINNED_INDICES)
+    free = [i for i in range(spec.num_vertices) if i not in PINNED_INDICES]
+    driver = SimDriver(qydp, solver="Explicit", fps=FPS, frames=SEAM_FRAMES, dt=DT)
+    run = driver.run(spec.to_input_data(), params_overlay={"step_h": 0.01})
+    assert bool(np.isfinite(run.world_frames).all()), "non-finite capped run"
+    disp = np.linalg.norm(run.local_frames[-1] - run.local_frames[0], axis=1)
+    assert float(disp[free].max()) < 0.1, (
+        f"the explicit solver moved {float(disp[free].max()):.3f} m with a 10 ms "
+        "requested substep: the substep cap is not being applied"
+    )

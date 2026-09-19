@@ -83,6 +83,11 @@ VBD_PARAMETERS: dict[str, float] = {
     # bending).
     "bending_model": 1,
     "bending_k": 0.2,
+    # The solver's own stability limit, applied by `Simulator::update` when the
+    # requested substep is coarser (it subdivides the frame). XPBD stays finite
+    # beyond this but its motion is already several times too large on the t1
+    # garment at the frontend's shared 4.5 ms default.
+    "xpbd_max_step_h": 1e-3,
 }
 
 XPBD_PARAMETERS: dict[str, float] = {
@@ -139,6 +144,10 @@ EXPLICIT_PARAMETERS: dict[str, float] = {
     "velocity_damping": 0.0,
     "bending_model": 0,
     "bending_k": 0.2,
+    # Explicit is only conditionally stable (`h < 2 sqrt(m/k)`): with contact on
+    # a garment the measured limit is ~0.25 ms, and the frontend's shared 4.5 ms
+    # default blew the t1 scene up on frame 0 (4.2 m in one frame).
+    "explicit_max_step_h": 2.5e-4,
 }
 
 SOLVER_REGISTRY: dict[str, SolverInfo] = {

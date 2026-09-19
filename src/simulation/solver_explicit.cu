@@ -68,6 +68,14 @@ static __global__ void step_end_kernel(
     }
 }
 
+// Explicit's stability limit on a garment with contact is around 0.25 ms -
+// measured: the t1 scene blows up at frame 0 with the frontend's default
+// 4.5 ms substep (4.2 m of motion in one frame), is clean at 0.25 ms, and a
+// ground-contact sweep diverges from 5 ms upward (9.8 m, then 1.7 km).
+float SolverExplicit::max_stable_step_h() const {
+    return max(0.f, get_global_parameter("explicit_max_step_h", 2.5e-4f));
+}
+
 void SolverExplicit::step(float h) {
     // Explicit Euler
     auto& params = *simulator->get_geo_params();

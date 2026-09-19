@@ -94,6 +94,13 @@ void Simulator::update(float h) {
 
     float dt_rest = h;
     float step_h = max(1e-20f, get_parameter("step_h", 0.001f));
+    // A solver that is only conditionally stable caps its own substep: the
+    // frontend sends one shared `step_h` (4.5 ms by default) whichever solver is
+    // selected, and the explicit family diverges at that size on a garment with
+    // contact. The frame is subdivided, so the frame time and the reported
+    // trajectory stay the same; only the cost changes.
+    const float solver_step_cap = m_solver->max_stable_step_h();
+    if ( solver_step_cap > 0.f && step_h > solver_step_cap ) step_h = solver_step_cap;
     if ( step_h > h || step_h <= 0.0f ) step_h = h;
     int iters = (int)ceilf(h / step_h);
     step_h = h / (float)iters;
