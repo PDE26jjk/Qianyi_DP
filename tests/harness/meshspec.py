@@ -263,8 +263,13 @@ def sample_panel(
     """
     curve_sizes = np.asarray([len(boundary)], dtype=np.int32)
     is_holes = np.asarray([0], dtype=np.int32)
+    # ``sample_points`` takes the requested triangle edge length. The harness
+    # presets were calibrated when the sampler used a cell length of
+    # radius / sqrt(2) (edges ~0.71 x the requested value), so keep the produced
+    # mesh density unchanged by passing the equivalent edge length.
+    sample_radius = float(spacing_m) / np.sqrt(2.0)
     points, triangles = qydp.geometry.sample_points(
-        boundary, segments, curve_sizes, is_holes, float(spacing_m))
+        boundary, segments, curve_sizes, is_holes, sample_radius)
     points = np.asarray(points, dtype=np.float32).reshape(-1, 2)
     triangles = np.asarray(triangles, dtype=np.int32).reshape(-1, 3)
     vertices = np.hstack(

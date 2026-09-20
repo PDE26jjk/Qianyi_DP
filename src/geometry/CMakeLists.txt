@@ -3,6 +3,7 @@ add_library(geometry)
 target_sources(
    geometry PRIVATE
    sample_points.cu
+   gcdt_backend.cu
    sampler.h
    lbvh_2d.h
    lbvh_2d.cu
@@ -14,6 +15,7 @@ target_sources(
 
 )
 target_include_directories(geometry PUBLIC ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(geometry PRIVATE gCDT)
 if(MSVC)
     # A hack to set include path to VS, taught by deepseek. 
    set_target_properties(geometry PROPERTIES VS_GLOBAL_IncludePath "${PROJECT_SOURCE_DIR}/src")

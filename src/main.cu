@@ -5,7 +5,6 @@
 // #include <cuda_runtime.h>
 #include <vector>
 #include "common/device.h"
-#include "graphics/graphics.h"
 
 // inline int cutGetMaxGflopsDeviceId() {
 //     int current_device = 0, sm_per_multiproc = 0;
@@ -158,7 +157,5 @@ void init_device() {
     if ( g_cuda_device_initialized ) return;
     auto device_id = init_cuda_device();
     g_cuda_active_device_id = device_id;
-    graphics::VulkanCudaRasterizer::Init(device_id);
-    graphics::VulkanCudaRasterizer::SetResourceDirectory(g_module_dir);
     g_cuda_device_initialized = true;
 }

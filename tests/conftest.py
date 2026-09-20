@@ -183,29 +183,6 @@ def _plain_import_available() -> bool:
     return result.returncode == 0 and b"OK" in result.stdout
 
 
-def _ensure_shader_assets(module) -> None:
-    """Copy the rasterizer shaders next to the module if missing.
-
-    The CUDA extension resolves its Vulkan shader directory to the module's
-    own directory (``g_module_dir``); without ``assets/vert.spv`` and
-    ``assets/frag.spv`` next to the .pyd, ``sample_points`` fails with
-    "Shader not found". The repo copies live under ``src/graphics/assets``.
-    """
-    module_file = getattr(module, "__file__", None)
-    if not module_file:
-        return
-    module_dir = Path(module_file).resolve().parent
-    assets_dir = module_dir / "assets"
-    if (assets_dir / "vert.spv").exists() and (assets_dir / "frag.spv").exists():
-        return
-    source_assets = REPO_ROOT / "src" / "graphics" / "assets"
-    if not (source_assets / "vert.spv").exists() or not (source_assets / "frag.spv").exists():
-        return
-    assets_dir.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(source_assets / "vert.spv", assets_dir / "vert.spv")
-    shutil.copy2(source_assets / "frag.spv", assets_dir / "frag.spv")
-
-
 def _resolve_qydp():
     """Resolve the module: QYDP_PYD env var -> ABI-tagged build scan -> import."""
     candidates = _candidate_pyd_paths()
@@ -215,7 +192,6 @@ def _resolve_qydp():
             try:
                 module = _load_module(candidate)
                 _check_fingerprint(module)
-                _ensure_shader_assets(module)
                 return module
             except Exception as exc:  # noqa: BLE001 - surface the last failure
                 last_error = exc
@@ -230,7 +206,6 @@ def _resolve_qydp():
     try:
         module = importlib.import_module(MODULE_NAME)
         _check_fingerprint(module)
-        _ensure_shader_assets(module)
         return module
     except Exception:
         return None

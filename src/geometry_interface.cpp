@@ -4,20 +4,17 @@
 #include "geometry/triangulator.h"
 
 void sample_points_impl(std::vector<float>& boundary, std::vector<int>& edge_indices_flat,
-    std::vector<int>& curve_sizes, std::vector<int>& is_holes_int,
-    float radius, std::vector<float>& output_points,
-    std::vector<int>& output_tris);
-std::vector<unsigned char> sample_points_debug(std::vector<float>& boundary,
-    std::vector<int>& edge_indices_flat, std::vector<int>& curve_sizes,
-    std::vector<int>& is_holes_int, float radius);
-std::vector<int> sample_points_debug2(std::vector<float>& boundary, std::vector<float>& points);
-std::vector<int> sample_points_debug3(std::vector<float>& boundary, std::vector<int>& next_pt, float radius);
-
-py::tuple GeometryInterface::sample_points(py::array_t<float> boundary, py::array_t<int> edge_indices,
-    py::array_t<int> curve_sizes, py::array_t<int> is_holes, float radius) {
-    // py::object print = py::module::import("builtins").attr("print");
+      std::vector<int>& curve_sizes, std::vector<int>& is_holes_int,
+      float radius, std::vector<float>& output_points,
+      std::vector<int>& output_tris, int triangulator,
+      float relax_gain1, int relax_iters1, float relax_gain2, int relax_iters2,
+      float boundary_margin_cells);
+  
+  py::tuple GeometryInterface::sample_points(py::array_t<float> boundary, py::array_t<int> edge_indices,
+      py::array_t<int> curve_sizes, py::array_t<int> is_holes, float radius, int triangulator,
+      float relax_gain1, int relax_iters1, float relax_gain2, int relax_iters2,
+      float boundary_margin_cells) {
     auto buf = boundary.request();
-    auto buf2 = edge_indices.request();
     if ( buf.ndim != 2 ) {
         throw std::runtime_error("Points array must be 2-dimensional");
     }
@@ -32,24 +29,14 @@ py::tuple GeometryInterface::sample_points(py::array_t<float> boundary, py::arra
     auto is_holes_ = to_vector(is_holes);
     std::vector<float> points;
     std::vector<int> tris;
-    sample_points_impl(boundary_, edge_indices_, curve_sizes_, is_holes_, radius, points, tris);
+      sample_points_impl(boundary_, edge_indices_, curve_sizes_, is_holes_, radius, points, tris,
+          triangulator, relax_gain1, relax_iters1, relax_gain2, relax_iters2,
+          boundary_margin_cells);
     return py::make_tuple(
         to_py_vector(points, ShapeContainer({ (long long)points.size() / 2, 2 })),
         to_py_vector(tris, ShapeContainer({ (long long)tris.size() / 3, 3 }))
         );
 }
-
-// py::array_t<unsigned char> GeometryInterface::sample_points_dbg(py::array_t<float> boundy, py::array_t<int> next_pt,
-//     float radius) {
-//     auto buf = boundy.request();
-//     auto buf2 = next_pt.request();
-//
-//     auto boundy_ = to_vector(boundy);
-//     auto next_pt_ = to_vector(next_pt);
-//     // auto res = sample_points_debug2(boundy_, points_);
-//     // auto res = sample_points_debug(boundy_, next_pt_, radius);
-//     return to_py_vector(res);
-// }
 
 py::array_t<int> GeometryInterface::delaunay_2d(py::array_t<float> pointVecIn, py::array_t<int> constraintVec) {
     auto pointVecIn_ = to_vector(pointVecIn);

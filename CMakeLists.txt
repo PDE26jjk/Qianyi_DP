@@ -48,6 +48,10 @@ add_subdirectory(extern/pybind11)
 set_source_files_properties(*.cu PROPERTIES LANGUAGE CUDA)
 
 PYBIND11_ADD_MODULE(${PROJECT_NAME} src/main.cu src/main.cpp)
+# gCDT is a CUDA static library compiled with separable compilation (its
+# pipeline launches kernels defined in other translation units), so the module
+# has to participate in the device link step as well.
+set_target_properties(${PROJECT_NAME} PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 target_include_directories(${PROJECT_NAME} PRIVATE
     ${Python_INCLUDE_DIRS}
     ${CMAKE_CURRENT_SOURCE_DIR}/extern/pybind11/include
@@ -62,18 +66,18 @@ target_sources(${PROJECT_NAME} PRIVATE
     src/perf_timing.cpp
  )
 
+add_subdirectory(src/gCDT)
 add_subdirectory(src/geometry)
 add_subdirectory(src/gDel2D)
 add_subdirectory(src/simulation)
-add_subdirectory(src/graphics)
 add_subdirectory(src/test)
 
 target_include_directories(${PROJECT_NAME} PRIVATE src)
 target_link_libraries(${PROJECT_NAME}
     PRIVATE geometry
     PRIVATE gDel2D
+    PRIVATE gCDT
     PRIVATE simulation
-    PRIVATE graphics
     PRIVATE test
 )
 
@@ -91,4 +95,3 @@ add_compile_options(
     $<$<COMPILE_LANGUAGE:CUDA>:--threads;0>
     $<$<COMPILE_LANGUAGE:CXX>:/MP>
 )
-

@@ -1,8 +1,8 @@
 """Geometry correctness tests for ``sample_points``.
 
 The spacing oracle is derived from ``src/geometry/sample_points.cu``: the
-sampler is grid-based with ``one_grid_length = radius / sqrt(2)`` (NOT
-Poisson-disc), boundary points are placed on the grid as obstacles, interior
+sampler is grid-based with one jittered point per cell of length ``radius``
+(NOT Poisson-disc), boundary points are placed on the grid as obstacles, interior
 points are generated one per interior cell and separated by a capped repulsion
 force. The minimum-spacing assertion therefore uses ``radius/sqrt(2)`` minus a
 relative tolerance that accounts for the capped repulsion iterations.

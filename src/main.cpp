@@ -82,9 +82,10 @@ PYBIND11_MODULE(Qianyi_DP, m) {
         .def_static("sample_points", &GeometryInterface::sample_points,
             py::arg("boundary").noconvert(), py::arg("edge_indices").noconvert(),
             py::arg("curve_sizes").noconvert(), py::arg("is_holes").noconvert(),
-            py::arg("radius"))
-        // .def_static("sample_points_dbg", &GeometryInterface::sample_points_dbg,
-        //     py::arg().noconvert(), py::arg().noconvert(), py::arg().noconvert())
+            py::arg("radius"), py::arg("triangulator") = 0,
+            py::arg("relax_gain1") = 0.02f, py::arg("relax_iters1") = 15,
+            py::arg("relax_gain2") = 0.01f, py::arg("relax_iters2") = 35,
+            py::arg("boundary_margin_cells") = 0.8f)
         .def_static("delaunay_2d", &GeometryInterface::delaunay_2d,
             py::arg("pointVecIn").noconvert(), py::arg("constraintVec").noconvert())
         .def_static("find_map_weight", &GeometryInterface::find_map_weight,
