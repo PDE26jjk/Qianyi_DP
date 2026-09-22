@@ -182,8 +182,14 @@ void GpuDel::constructInitialTriangles()
 
 	if ( ori == 0.0 )
 	{
-		std::cout << "Input too degenerate!!!\n" << std::endl; 
-		exit(-1); 
+        // Local modification (see README.txt): the upstream code printed this
+        // and called exit(-1), which kills the host process - the whole Python
+        // interpreter, or Blender. An input with no non-degenerate kernel
+        // triangle (every point on one line) is a caller-visible failure, not a
+        // reason to take the session down.
+		throw std::runtime_error( 
+            "gDel2D: the input is too degenerate to triangulate: every point "
+            "lies on one line, so there is no triangle to build" ); 
 	}
 
 	if ( ortToOrient( ori ) == OrientNeg ) 

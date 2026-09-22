@@ -3,6 +3,9 @@
 #include <thrust/host_vector.h>
 #include <thrust/device_vector.h>
 
+#include <stdexcept>
+#include <string>
+
 ////////////////////////////////////////////////////////////////// DevVector //
 
 template< typename T > 
@@ -132,11 +135,13 @@ public:
         }
         catch( ... )
         {
-            // output an error message and exit
+            // Local modification (see README.txt): report the failed allocation
+            // to the caller instead of exiting the host process.
             const int OneMB = ( 1 << 20 );
-            std::cerr << "cudaMalloc failed to allocate " << ( sizeof( T ) * _capacity ) / OneMB << " MB!" << std::endl;
-            std::cerr << "size = " << _size << " sizeof(T) = " << sizeof( T ) << std::endl;
-            exit( -1 );
+            throw std::runtime_error( "gDel2D: cudaMalloc failed to allocate "
+                + std::to_string( ( sizeof( T ) * _capacity ) / OneMB )
+                + " MB (size = " + std::to_string( _size )
+                + ", sizeof(T) = " + std::to_string( sizeof( T ) ) + ")" );
         }
 
         return;

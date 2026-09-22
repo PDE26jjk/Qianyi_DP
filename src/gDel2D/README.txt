@@ -1,5 +1,18 @@
 This program originated from [gdel3d](https://www.comp.nus.edu.sg/%7Etants/gdel3d.html) and has been adapted for this project. We express our gratitude to the original author for their awesome work and open-source contribution.
 
+Local modifications
+===================
+
+- A failure is reported to the caller instead of ending the host process. The
+  upstream code prints a message and calls exit(-1) in several places - an input
+  with no non-degenerate kernel triangle ("Input too degenerate!!!"), a failed
+  cudaMalloc, a CUDA error check, an uninitialised counter - and this library is
+  called from a Python extension whose caller is Blender, so an exit there takes
+  the whole session with it. Those paths now throw std::runtime_error with the
+  same information, which the pybind11 layer turns into a RuntimeError.
+- The memory pool, the device-memory bookkeeping and the CUDA runtime linkage
+  were adapted for this project; see the surrounding GPU/ sources.
+
 Below is the README of the original program.
 
 ============

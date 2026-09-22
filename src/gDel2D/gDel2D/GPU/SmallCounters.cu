@@ -25,8 +25,9 @@ void SmallCounters::renew()
 {
     if ( _data.size() == 0 ) 
     {
-        printf( "Flag not initialized!\n" ); 
-        exit(-1); 
+        // Local modification (see README.txt): report it instead of exiting the
+        // host process.
+        throw std::runtime_error( "gDel2D: SmallCounters::renew() called before init()" ); 
     }
 
     _offset += _size;  

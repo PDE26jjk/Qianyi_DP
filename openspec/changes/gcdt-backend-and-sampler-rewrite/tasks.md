@@ -70,3 +70,28 @@
 - [x] 5.4 Stress thin strips, deep notches, combs, stars, hole patterns,
   collinear constraints and duplicate vertices; verify no algorithmic crash and
   record the degenerate-input findings
+
+## 6. Degenerate input is refused, not repaired
+
+- [x] 6.1 Refuse coincident boundary points inside `sample_points` with an
+  error naming both indices, and refuse a constraint edge that names the same
+  point twice with an error naming the edge; verify a caller-produced list with
+  thousands of zero-length edges reports the first one instead of spinning the
+  device, and that no point or edge is merged, dropped or reordered
+- [x] 6.2 Refuse a non-finite boundary point and a `curve_sizes` that does not
+  describe the edge list, each with an error naming the offender; verify the
+  NaN/Inf input and the under- and over-counted counts no longer hang or crash
+  the process
+- [x] 6.3 Verify a valid repeated constraint edge and a crossing outline still
+  return in bounded time, then re-run the corner-radius sweep, the two-call
+  repro and `pytest -m quick -q`; verify clean inputs return the same point and
+  triangle counts as before the change and the pre-existing
+  `test_standard_scene_smoke` failure is unchanged
+- [x] 6.4 Replace the print-and-exit paths on the triangulation route with
+  exceptions: gDel2D's non-degenerate-kernel check ("Input too degenerate!!!"),
+  its CUDA error checks, its allocation failures and its counter guard, plus the
+  project's own `CUDA_CHECK` helper; record the local modification in the
+  vendored gDel2D README
+- [x] 6.5 Verify from Blender that an outline collapsed onto one line raises a
+  catchable `RuntimeError` and that the next `sample_points` call in the same
+  session still returns a mesh

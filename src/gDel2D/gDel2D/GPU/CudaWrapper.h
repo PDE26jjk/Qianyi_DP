@@ -4,6 +4,19 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <stdexcept>
+#include <string>
+
+// Local modification (see README.txt): this header used to call exit(-1) on a
+// CUDA failure, which takes the whole host process down - in a Python extension
+// that means the caller's interpreter, and in Blender it means Blender. Every
+// failure is thrown instead, so the caller can report it and carry on.
+inline void __cudaThrow( const char *what, const char *file, const int line,
+    cudaError err )
+{
+    throw std::runtime_error( std::string( what ) + " failed at " + file + ":"
+        + std::to_string( line ) + " : " + cudaGetErrorString( err ) );
+}
 
 // Define this to turn on error checking
 #define CUDA_ERROR_CHECK
@@ -16,9 +29,7 @@ inline void __cudaSafeCall( cudaError err, const char *file, const int line )
 #ifdef CUDA_ERROR_CHECK
     if ( cudaSuccess != err )
     {
-        fprintf( stderr, "cudaSafeCall() failed at %s:%i : %s\n",
-                 file, line, cudaGetErrorString( err ) );
-        exit( -1 );
+        __cudaThrow( "cudaSafeCall()", file, line, err );
     }
 #endif
 
@@ -31,9 +42,7 @@ inline void __cudaCheckError( const char *file, const int line )
     cudaError err = cudaGetLastError();
     if ( cudaSuccess != err )
     {
-        fprintf( stderr, "cudaCheckError() failed at %s:%i : %s\n",
-                 file, line, cudaGetErrorString( err ) );
-        exit( -1 );
+        __cudaThrow( "cudaCheckError()", file, line, err );
     }
 
     // More careful checking. However, this will affect performance.
@@ -41,9 +50,7 @@ inline void __cudaCheckError( const char *file, const int line )
     err = cudaDeviceSynchronize();
     if( cudaSuccess != err )
     {
-        fprintf( stderr, "cudaCheckError() with sync failed at %s:%i : %s\n",
-                 file, line, cudaGetErrorString( err ) );
-        exit( -1 );
+        __cudaThrow( "cudaCheckError() with sync", file, line, err );
     }
 #endif
 

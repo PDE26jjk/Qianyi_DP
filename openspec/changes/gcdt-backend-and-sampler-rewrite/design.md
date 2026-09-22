@@ -80,6 +80,62 @@ optional keyword arguments with the shipped defaults; the five-argument form
 keeps working. An env-gated (`QYDP_SAMPLE_PROFILE=1`) per-phase CUDA-event
 breakdown is available for profiling and is off by default.
 
+### Degenerate input is refused at the entry point, and never repaired
+
+The frontend hands over the outline it sampled and de-duplicated: it merges
+samples closer than `granularity * 0.02` and maps its edge list through that
+merge, so a piece whose samples the merge collapses arrives as a run of edges
+that run from a point to itself. A constrained triangulation is not defined
+for a constraint of zero length, gDel2D's insertion of one never converges, and
+the call then never returns: the device spins at 100% and the host blocks in a
+synchronise. Two exactly coincident points, a non-finite coordinate and a
+`curve_sizes` that does not describe the edge list are the same kind of input -
+one the triangulator cannot be asked to work on. This is not new to the rewrite
+(the pre-rewrite Vulkan-based sampler hung on the same inputs), but the sampler
+entry point is the only place that sees the caller's own indexing, so that is
+where the check belongs.
+
+The sampler validates instead of repairing. It refuses coincident points naming
+both indices, refuses a constraint edge that runs from a point to itself naming
+the edge, refuses a non-finite point, and refuses edge counts that do not add up
+to the list. It deliberately does not merge the points, drop the edges, clamp
+the counts or remap the triangles: the returned point list is index-for-index
+the caller's own list - the frontend maps its panel vertices, sewing ends and
+cached per-vertex data through those indices - so a merge in here would shift
+every index after the merged pair, and a dropped constraint would hand back a
+mesh that quietly does not follow the outline the caller drew. Merging is what
+the frontend's own de-duplication pass does; the engine's job is to say exactly
+what is wrong with the input it was given.
+
+The check costs one pass over the caller's points (a flat open-addressed cell
+table, `coincidence_epsilon` = 1e-6 of the domain, far below one sampling cell
+and far below any caller merge threshold): on a 160k-point stress panel the
+boundary is a few hundred points, so the pass is under a millisecond of a
+~300 ms call. A pairwise comparison of coincident points must cover every
+caller point, not only the ones a constraint edge names: measured with the
+check removed, a duplicated point that no edge touches still spins gDel2D.
+
+### A failure on the triangulation route is thrown, never an exit
+
+Validation covers the inputs the sampler can describe as degenerate, but the
+triangulator has failure paths of its own, and the vendored gDel2D reported
+them the way a command-line program does: print a message and call `exit(-1)`.
+In a Python extension that ends the *interpreter*, and the frontend's
+interpreter is Blender, so a panel whose outline collapsed onto one line (its
+sampled points are all collinear, so gDel2D has no non-degenerate kernel
+triangle) printed "Input too degenerate!!!" and took Blender down with it: no
+exception for the frontend to catch, nothing left to recover. The same pattern
+sat in gDel2D's CUDA error checks, its allocation failures and its counter
+guard, and in the project's own `CUDA_CHECK` helper, so any CUDA failure
+anywhere in the engine was fatal to the session.
+
+All of those now throw `std::runtime_error` carrying the same information (the
+file, the line and `cudaGetErrorString` where there is one), which pybind11
+turns into a Python `RuntimeError`. The paths are marked as local modifications
+in `src/gDel2D/README.txt` and in `src/common/cuda_utils.h`. Verified from
+Blender: a collapsed outline raises a catchable error and the next
+`sample_points` call in the same session returns a mesh.
+
 ## Risks / Trade-offs
 
 - [Sampler memory grows with `(bounding-box extent / radius)^2`] -> Documented
@@ -100,6 +156,23 @@ breakdown is available for profiling and is off by default.
 - [Removing Vulkan deletes the only rasteriser in the tree] -> The parity mask
   is covered by the sampling tests and by the concave/hole scenes; no other
   module used `src/graphics`.
+- [A constraint list that crosses itself is still passed to the triangulator]
+  -> Measured: a bow-tie outline returns a mesh in bounded time on both
+  backends, so the sampler does not duplicate the frontend's own crossing test.
+  The sampler's guarantee is "returns in bounded time for the degenerate lists
+  callers produce", not "produces a meaningful mesh for a meaningless outline".
+- [Callers that hand over a coalesced index list now get an error where they
+  used to hang] -> That is the point: the frontend's corner command already
+  refuses to leave a piece shorter than `max(granularity, 5 mm)`, and a caller
+  that wants shorter pieces has to drop the edges its own merge collapsed
+  (the message names the first one). The alternative - the engine repairing the
+  list - was rejected because it changes the caller's vertex order or silently
+  drops constraints from the outline.
+- [A CUDA error leaves the device in a state the next call cannot use] ->
+  Throwing keeps the process alive and the error text says what failed, but a
+  context lost to an illegal access stays lost; the caller sees the failure on
+  the following call too instead of losing the session. Recovering the device
+  itself is out of scope here.
 
 ## Migration Plan
 

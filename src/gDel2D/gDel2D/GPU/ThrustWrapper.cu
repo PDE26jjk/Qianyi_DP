@@ -84,9 +84,10 @@ public:
             }
             catch( std::runtime_error &e )
             {
-                // output an error message and exit
-                std::cerr << "cudaMalloc failed to allocate " << numBytes << " bytes!" << std::endl;
-                exit( -1 );
+                // Local modification (see README.txt): report the failed
+                // allocation to the caller instead of exiting the host process.
+                throw std::runtime_error( "gDel2D: cudaMalloc failed to allocate "
+                    + std::to_string( numBytes ) + " bytes" );
             }
         }
 

@@ -98,3 +98,56 @@ SHALL fall back to gDel2D and return the fallback mesh.
 - **WHEN** gCDT is selected on an input where its validation fails
 - **THEN** the sampler returns a gDel2D mesh instead of failing or returning
   the invalid result
+
+### Requirement: Degenerate input is refused by name, never repaired
+
+The sampler SHALL refuse an input it cannot triangulate instead of repairing it
+or passing it on, and the error SHALL name the offending points, edges or curve
+counts. The caller's point list and constraint list SHALL NOT be merged, moved,
+reordered or silently reduced: the returned points SHALL be the caller's points
+in the caller's order, so the indices the caller maps its own data through stay
+valid. An input with two points that are the same point, a constraint edge that
+names the same point twice or a point outside the list, a curve count that does
+not describe the edge list, or a non-finite coordinate SHALL raise an error and
+SHALL NOT hang, spin the device or take the process down.
+
+#### Scenario: Coincident boundary points
+
+- **WHEN** two boundary points are the same point, whether or not a constraint
+  edge runs between them
+- **THEN** the call raises an error naming both points, leaving the merge to
+  the caller's own de-duplication pass
+
+#### Scenario: Zero-length constraint edges
+
+- **WHEN** a caller passes the outline its own de-duplicated index map produced,
+  with thousands of edges that run from a point to itself
+- **THEN** the call raises an error naming the first such edge and the point it
+  runs from, instead of never returning
+
+#### Scenario: Non-finite boundary point
+
+- **WHEN** a boundary point is NaN or infinite
+- **THEN** the call raises an error naming that point instead of hanging or
+  taking the process down
+
+#### Scenario: Edge counts that do not describe the edge list
+
+- **WHEN** `curve_sizes` accounts for fewer or more edges than the list holds
+- **THEN** the call raises an error naming the curve and the counts
+
+### Requirement: A triangulation failure is reported, never fatal
+
+Every failure on the triangulation path SHALL reach the caller as a Python
+exception. The sampler and the backends it calls SHALL NOT print and exit, or
+otherwise end the host process: the vendored gDel2D's `exit(-1)` paths (an
+input with no non-degenerate kernel triangle, a failed allocation, a CUDA error
+check, an uninitialised counter) and the project's own `CUDA_CHECK` helper SHALL
+throw instead.
+
+#### Scenario: Outline collapsed onto one line
+
+- **WHEN** an outline's sampled points are all on one line, so no triangle can
+  be built
+- **THEN** the call raises a `RuntimeError` naming the reason instead of ending
+  the process, and the next call in the same process returns a mesh

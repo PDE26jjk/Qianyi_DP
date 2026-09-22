@@ -34,6 +34,7 @@
 #include <cstring>
 #include <iostream>
 #include <string>
+#include <stdexcept>
 #include <vector>
 
 #include <thrust/device_vector.h>
@@ -115,6 +116,118 @@ static __device__ __forceinline__ float2 normalize_safe_f2(const float2& a) {
     float l = sqrtf(dot(a, a));
     if ( l < 1e-12f ) return make_float2(0.0f, 0.0f);
     return a * (1.0f / l);
+}
+
+// ==========================================
+// Input validation
+// ==========================================
+//
+// The input arrives from a caller that samples curves and merges near-identical
+// samples of its own, so it can carry two points that are the same point, a
+// constraint that runs from a point to itself, an edge that names a point
+// outside the list, or a curve count that does not add up to the edge list.
+// None of those can be triangulated: a constraint of zero length is not a
+// constraint at all, and gDel2D's insertion of one never converges, so the
+// device spins and the call never returns. A non-finite coordinate is undefined
+// for every predicate in the pipeline in the same way.
+//
+// The sampler refuses each of them by name instead of repairing it. Its point
+// list is index-for-index the caller's list, so merging two points here would
+// shift every index after them and change the vertex order the caller maps its
+// own data through, and silently dropping a constraint would hand back a mesh
+// that does not follow the outline the caller asked for. Both are the caller's
+// decision - merging is what the frontend's own de-duplication pass is for.
+//
+// The comparison distance is in normalised units: a millionth of the domain,
+// far below one sampling cell (the grid is at most a few thousand cells across)
+// and far below any merge threshold a caller would use, so it only ever fires
+// for points that are the same point.
+static constexpr float coincidence_epsilon = 1e-6f;
+
+static long long coincident_cell_key(int x, int y) {
+    return (static_cast<long long>(x) << 32) ^ static_cast<unsigned int>(y);
+}
+
+// Open-addressed cell table: cell key -> point index. One slot per cell is
+// enough because a cell is `coincidence_epsilon` across, so the only points
+// that share one are points that are the same point.
+class CoincidentPointTable {
+public:
+    explicit CoincidentPointTable(size_t points) {
+        size_t size = 16;
+        // Half-empty, so linear probing stays short.
+        while ( size < points * 2 + 16 ) size <<= 1;
+        keys_.assign(size, 0);
+        filled_.assign(size, 0);
+        points_.assign(size, -1);
+        mask_ = size - 1;
+    }
+
+    int find(long long key) const {
+        size_t slot = hash(key) & mask_;
+        while ( filled_[slot] ) {
+            if ( keys_[slot] == key ) return points_[slot];
+            slot = (slot + 1) & mask_;
+        }
+        return -1;
+    }
+
+    void insert(long long key, int point) {
+        size_t slot = hash(key) & mask_;
+        while ( filled_[slot] ) slot = (slot + 1) & mask_;
+        keys_[slot] = key;
+        filled_[slot] = 1;
+        points_[slot] = point;
+    }
+
+private:
+    static size_t hash(long long key) {
+        unsigned long long x = (unsigned long long)key;
+        x ^= x >> 33;
+        x *= 0xff51afd7ed558ccdULL;
+        x ^= x >> 33;
+        x *= 0xc4ceb9fe1a85ec53ULL;
+        x ^= x >> 33;
+        return (size_t)x;
+    }
+
+    std::vector<long long> keys_;
+    std::vector<unsigned char> filled_;
+    std::vector<int> points_;
+    size_t mask_ = 0;
+};
+
+// Index of an earlier point that is the same point as `point`, or -1. The
+// point's own cell is checked first, because that is where an exact duplicate
+// lands; the neighbouring cells are checked as well, to catch a pair that
+// straddles a cell boundary.
+static int find_coincident_point(const std::vector<float2>& points,
+    const CoincidentPointTable& table, float2 point) {
+    const float inverse = 1.0f / coincidence_epsilon;
+    const int cell_x = (int)floorf(point.x * inverse);
+    const int cell_y = (int)floorf(point.y * inverse);
+
+    const int own = table.find(coincident_cell_key(cell_x, cell_y));
+    if ( own >= 0 ) {
+        const float2 other = points[own];
+        if ( fabsf(other.x - point.x) <= coincidence_epsilon
+            && fabsf(other.y - point.y) <= coincidence_epsilon ) {
+            return own;
+        }
+    }
+    for ( int dx = -1; dx <= 1; ++dx ) {
+        for ( int dy = -1; dy <= 1; ++dy ) {
+            if ( dx == 0 && dy == 0 ) continue;
+            const int candidate = table.find(coincident_cell_key(cell_x + dx, cell_y + dy));
+            if ( candidate < 0 ) continue;
+            const float2 other = points[candidate];
+            if ( fabsf(other.x - point.x) <= coincidence_epsilon
+                && fabsf(other.y - point.y) <= coincidence_epsilon ) {
+                return candidate;
+            }
+        }
+    }
+    return -1;
 }
 
 // ==========================================
@@ -581,6 +694,19 @@ void Sampler::sample(
     // ---------------------------------------------------------
     float x_min = FLT_MAX, y_min = FLT_MAX;
     float x_max = -FLT_MAX, y_max = -FLT_MAX;
+    // Every predicate in the pipeline, on the host and on the device, is
+    // undefined for a non-finite coordinate: the bounding box below turns into
+    // NaN, the grid indices turn into whatever the conversion gives, and the
+    // triangulator's comparisons then never become true. Refusing the input
+    // leaves the caller with an error instead of a hang or a crash.
+    for ( int i = 0; i < num_input_points; ++i ) {
+        if ( !std::isfinite((double)all_points[i].x) || !std::isfinite((double)all_points[i].y) ) {
+            throw std::runtime_error(
+                "sample_points: boundary point " + std::to_string(i)
+                + " is not finite; non-finite points cannot be sampled");
+        }
+    }
+
     for ( const auto& p : all_points ) {
         x_min = fminf(x_min, p.x);
         y_min = fminf(y_min, p.y);
@@ -594,9 +720,26 @@ void Sampler::sample(
     set_radius(radius_scaled);
 
     std::vector<float2> points_normalized(num_input_points);
+    // Two points that are the same point cannot be triangulated: gDel2D's
+    // insertion of the constraint between them never converges. The sampler
+    // reports the pair instead of merging it - the point list it returns is
+    // index-for-index the caller's list, so merging here would shift the vertex
+    // order the caller maps its own data through.
+    CoincidentPointTable seen(num_input_points);
     for ( int i = 0; i < num_input_points; ++i ) {
         points_normalized[i].x = (all_points[i].x - offset.x + raw_radius * 0.5f) * scale;
         points_normalized[i].y = (all_points[i].y - offset.y + raw_radius * 0.5f) * scale;
+
+        const int twin = find_coincident_point(points_normalized, seen, points_normalized[i]);
+        if ( twin >= 0 ) {
+            throw std::runtime_error(
+                "sample_points: boundary points " + std::to_string(twin) + " and "
+                + std::to_string(i) + " are the same point; two coincident points cannot "
+                "be triangulated, so the caller has to merge them first");
+        }
+        seen.insert(coincident_cell_key(
+            (int)floorf(points_normalized[i].x / coincidence_epsilon),
+            (int)floorf(points_normalized[i].y / coincidence_epsilon)), i);
     }
     profiler.mark("setup");
 
@@ -613,8 +756,34 @@ void Sampler::sample(
     for ( int c = 0; c < (int)curve_sizes.size(); ++c ) {
         const unsigned char kind =
             (c == 0) ? 0 : ((c < (int)is_holes.size() && is_holes[c]) ? 1 : 2);
+        // A curve's count has to describe the edge list it came with. Walking
+        // past the end of that list is a crash rather than a result, so the
+        // mismatch is refused by name instead.
+        if ( curve_sizes[c] < 0 || curve_sizes[c] > num_edges - edge_offset ) {
+            throw std::runtime_error(
+                "sample_points: curve " + std::to_string(c) + " claims "
+                + std::to_string(curve_sizes[c]) + " edges and "
+                + std::to_string(num_edges - edge_offset) + " are left of "
+                + std::to_string(num_edges));
+        }
         for ( int e = 0; e < curve_sizes[c]; ++e ) {
-            int2 edge = edge_indices[edge_offset + e];
+            const int flat = edge_offset + e;
+            const int2 edge = edge_indices[flat];
+            if ( edge.x < 0 || edge.x >= num_input_points
+                || edge.y < 0 || edge.y >= num_input_points ) {
+                throw std::runtime_error(
+                    "sample_points: constraint edge " + std::to_string(flat)
+                    + " names points (" + std::to_string(edge.x) + ", "
+                    + std::to_string(edge.y) + ") and the list has "
+                    + std::to_string(num_input_points) + " points");
+            }
+            if ( edge.x == edge.y ) {
+                throw std::runtime_error(
+                    "sample_points: constraint edge " + std::to_string(flat)
+                    + " runs from point " + std::to_string(edge.x)
+                    + " to itself; a constraint has to be a segment, so the caller has to "
+                      "merge the samples it repeated before it asks for a mesh");
+            }
             loop_edges.push_back(points_normalized[edge.x]);
             loop_edges.push_back(points_normalized[edge.y]);
             loop_kind.push_back(kind);
@@ -622,6 +791,12 @@ void Sampler::sample(
         edge_offset += curve_sizes[c];
     }
     int num_loop_edges = (int)loop_kind.size();
+
+    if ( edge_offset < num_edges ) {
+        throw std::runtime_error(
+            "sample_points: curve_sizes accounts for " + std::to_string(edge_offset)
+            + " of " + std::to_string(num_edges) + " constraint edges");
+    }
 
     if ( d_loop_edges ) { cudaFree(d_loop_edges); d_loop_edges = nullptr; }
     if ( d_row_edges ) { cudaFree(d_row_edges); d_row_edges = nullptr; }
@@ -787,10 +962,14 @@ void Sampler::sample(
     for ( int i = nb_boundary_points; i < h_nb_points; ++i ) {
         if ( result_valid[i] > 0 ) output_points.push_back(result_final[i]);
     }
+    profiler.mark("collect");
 
     // ---------------------------------------------------------
     // 10. Triangulate with all edges as constraints
     // ---------------------------------------------------------
+    // The input has been validated by now (section 2), so the triangulator sees
+    // exactly the caller's points and edges: no point is merged, moved or
+    // dropped here, and the triangles index the point list the caller gets.
     std::vector<int2> constraints(num_edges);
     memcpy(constraints.data(), edge_indices.data(), num_edges * sizeof(int2));
 

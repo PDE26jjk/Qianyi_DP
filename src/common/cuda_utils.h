@@ -17,13 +17,17 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#include <stdexcept>
+#include <string>
+
+// Local modification: this helper used to call exit(EXIT_FAILURE), which takes
+// the host process down - the whole Python interpreter, and Blender with it.
+// A CUDA failure is thrown instead, so a Python caller gets an exception it can
+// report, and the session survives to try something else.
 inline void __cudaCheckError(cudaError_t err, const char* file, const int line) {
     if ( err != cudaSuccess ) {
-        fprintf(stderr, "CUDA Error: %s\n", cudaGetErrorString(err)); //
-        fprintf(stderr, "File: %s\n", file);                          //
-        fprintf(stderr, "Line: %d\n", line);                          //
-
-        exit(EXIT_FAILURE);
+        throw std::runtime_error(std::string("CUDA Error: ")
+            + cudaGetErrorString(err) + " at " + file + ":" + std::to_string(line));
     }
 }
 
