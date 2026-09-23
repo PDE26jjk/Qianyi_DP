@@ -132,6 +132,15 @@ void SimulatorInterface::input_data(py::dict input) {
             obj_data[i].grain_dir = 0.0f;
             obj_data[i].kinetic = true; // TODO soft body
         }
+        // External forces (see the `external-forces` capability). Pressure is
+        // inert at 0; a negative aerodynamic coefficient means "use the global
+        // parameter", which is what an object without the key gets.
+        obj_data[i].pressure = mesh.contains("pressure")
+            ? mesh["pressure"].cast<float>() : 0.0f;
+        obj_data[i].wind_drag = mesh.contains("wind_drag")
+            ? mesh["wind_drag"].cast<float>() : -1.0f;
+        obj_data[i].wind_lift = mesh.contains("wind_lift")
+            ? mesh["wind_lift"].cast<float>() : -1.0f;
         obj_data[i].collision_layer = mesh["collision_layer"].cast<int>();
         auto world_matrix = mesh["world_matrix"].cast<py::array_t<float>>();
         Mat4 mat;

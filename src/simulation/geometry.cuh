@@ -91,6 +91,12 @@ public:
 
     thrust::device_vector<float3> forces;
     thrust::device_vector<float3> elastic_forces;
+    // External forces (see the `external-forces` capability): the assembled
+    // per-vertex pressure + wind load, and the per-vertex wind field sampled
+    // once per frame. Both are inert (all zero) when a scene configures no
+    // external force.
+    thrust::device_vector<float3> external_forces;
+    thrust::device_vector<float3> wind_velocity;
     thrust::device_vector<float> edge_lengths;
     thrust::device_vector<float> static_diags;
     thrust::device_vector<float3> velocities;
@@ -182,6 +188,9 @@ public:
 
     float3 gravity;
     bool ground;
+    // True when at least one object carries a non-zero pressure value, i.e.
+    // when the pressure pass has work to do. Set from the scene input.
+    bool external_forces_configured = false;
 
     // subspace
     thrust::device_vector<float> basis_weights; // save by 9*vertex
@@ -199,6 +208,12 @@ public:
     void update_for_frame();
     void update_for_step(float h, float time_factor);
     void end_for_frame();
+    // External forces (see the `external-forces` capability). The wind field is
+    // sampled once per frame (it varies slowly); the assembled load is rebuilt
+    // every substep from the current positions and velocities.
+    void update_wind_field();
+    void accumulate_external_forces();
+    bool has_wind() const;
     void collision_detect() { m_contact.collision_detect_prepare(); }
 
     void upload_world_matrix(int obj_index, const std::vector<float>& matrix);

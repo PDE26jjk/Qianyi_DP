@@ -27,6 +27,14 @@ struct ObjectDataInput {
     // float3 shear;
     float3 bending;
     float mass_densitys; // mass density per object, kg/m^2
+    // External forces (see the `external-forces` capability). `pressure` is a
+    // constant load along the surface normal in Pa: positive pushes along the
+    // stored normal, negative pulls inward, and 0 is inert. The aerodynamic
+    // coefficients override the global parameters per object; a negative value
+    // means "use the global parameter".
+    float pressure;
+    float wind_drag;
+    float wind_lift;
     bool kinetic; // The solver does not update its position, todo set mass for it
     bool vertices_updated;
     bool matrix_updated;

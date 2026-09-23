@@ -22,6 +22,7 @@ target_sources(
     collision.cu
     geometry.cuh
     geometry.cu
+    external_forces.cu
     subspace.cu
     solver_base.cuh
     solver_base.cu

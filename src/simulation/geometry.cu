@@ -101,6 +101,15 @@ void Geometry::init(const GeoDataInput& geo) {
     vel_prev.assign(params.nb_all_vertices, make_float3(0.0f, 0.0f, 0.0f));
     forces.assign(params.nb_all_vertices, make_float3(0.0f, 0.0f, 0.0f));
     elastic_forces.assign(params.nb_all_vertices, make_float3(0.0f, 0.0f, 0.0f));
+    external_forces.assign(params.nb_all_vertices, make_float3(0.0f, 0.0f, 0.0f));
+    wind_velocity.assign(params.nb_all_vertices, make_float3(0.0f, 0.0f, 0.0f));
+    external_forces_configured = false;
+    for ( const auto& object : geo.obj_data_input ) {
+        if ( object.pressure != 0.f ) {
+            external_forces_configured = true;
+            break;
+        }
+    }
     vertices_mask.assign(params.nb_all_vertices, static_cast<char>(0));
     mass_inv.resize(params.nb_all_vertices);
 
@@ -917,6 +926,10 @@ void Geometry::update_for_step(float h, float time_factor) {
         gravity_z = get_global_parameter("gravity", -9.8f);
     gravity = make_float3(0.0f, 0.0f, gravity_z);
     ground = bool(get_global_parameter("ground", 1));
+    // The wind field is a slowly varying velocity field: sample it once per
+    // frame. The per-substep part (relative velocity against the cloth) is
+    // evaluated in `accumulate_external_forces`.
+    update_wind_field();
 }
 static __global__ void update_local_pos_kernel(
     float3* __restrict__ vertices,

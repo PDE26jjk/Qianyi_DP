@@ -403,9 +403,14 @@ void SolverPDNewton::step(float h) {
     // without improving the Newton residual (0.970 -> 0.981 per substep), and
     // the |dx| form was worse (1.41 mm). Neither is the residual bottleneck.
     const float trajectory_margin = query_radius;
+    // External forces (constant normal pressure and wind) are rebuilt for this
+    // substep from the current positions and velocities. They enter the inertia
+    // prediction below as a right-hand-side term only: no Hessian block and no
+    // diagonal entry is contributed (see the `external-forces` capability).
+    geo->accumulate_external_forces();
     forward_step<<<(n + block - 1) / block, block>>>(
         v, v_prev, mass_inv,
-        nullptr, f_elastic,
+        geo->external_forces.data().get(), f_elastic,
         mask, q, q_pred, q_inertia, nullptr,
         static_diags,
         h, mask_stiff, geo->gravity, warm_start, n);
