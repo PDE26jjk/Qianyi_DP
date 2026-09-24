@@ -166,10 +166,31 @@ public:
     // (tear events); the static parts are built once.
     thrust::device_vector<int4>  bend_points;         // (x0, x1, x2, x3)
     thrust::device_vector<float> bend_factor;         // dihedral factor
-    thrust::device_vector<float> bend_rest_theta;     // 0 / SewingData.angle /
-                                                      // internal lines later
+    // Rest angle per entry: the scene's `angles` input on the entry's own edge
+    // (mesh edge) or on the hinge edge (seam hinge); 0 = flat. It is live state
+    // once plasticity is enabled and `bend_rest_theta_elastic` keeps the input
+    // value for reset.
+    thrust::device_vector<float> bend_rest_theta;
     thrust::device_vector<char>  bend_valid;          // N
     thrust::device_vector<char>  seam_bend_static_ok; // ns (apexes found etc.)
+    // Rest-shape input and plastic state (see the `cloth-plasticity`
+    // capability). `edge_rest_angle` / `edge_compress` are the scene's
+    // per-edge values (size nb_all_edges, 0 = no change); they are consumed at
+    // init and never change while the simulation runs. The rest below is the
+    // per-bend-entry state the update kernel advances, the bending kernels read
+    // and freeze / reset rewrite.
+    thrust::device_vector<float> edge_rest_angle;
+    thrust::device_vector<float> edge_compress;
+    thrust::device_vector<float> bend_rest_theta_elastic; // reset reference
+    thrust::device_vector<float> bend_anchor_theta;       // friction anchor
+    thrust::device_vector<float> bend_stick_t;            // dwell timer
+    thrust::device_vector<float> bend_plastic_t;          // hardening timer
+    thrust::device_vector<float> bend_plastic_hp;         // hardening strain
+    thrust::device_vector<float> bend_yield_theta;        // live yield angle
+    thrust::device_vector<char>  bend_plastic_enabled;    // per-entry mask
+    // True when at least one panel opted in. The per-substep update is skipped
+    // entirely otherwise, so a scene without the flag costs nothing.
+    bool plasticity_enabled = false;
     // False until `init_bend_structure` has rebuilt the arrays above for the
     // *current* scene. `update_seam_state` must not touch them before that: on
     // a re-init (`input_data` called a second time) they still hold the
@@ -180,6 +201,13 @@ public:
 
     void init_bend_structure();   // once, after init_triangle_data
     void update_seam_state();     // areas + bend validity, on cluster rebuilds
+    // Rest-shape input and plasticity (see the `cloth-plasticity` capability).
+    void apply_rest_shape_input();      // compress -> rest lengths / FEM metric
+    void init_plastic_state();          // after the bend table is built
+    void accumulate_bend_plasticity(float h); // once per substep, PDNewton only
+    void freeze_bend_rest_shape();
+    void reset_bend_plasticity();
+    void copy_plasticity_state(float* out) const;
     
     bool need_record_interpolation_this_frame;
     bool need_update_interpolation_vertices_this_frame;

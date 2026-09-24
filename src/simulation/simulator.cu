@@ -87,10 +87,21 @@ void Simulator::init(const GeoDataInput& geo
 void Simulator::update(float h) {
     dt = h;
     frame += 1;
+    // Frame-stage timing (see the `frame-stage-timing` capability). The stages
+    // are the boundaries of this function; everything is recorded on the stream
+    // each stage runs on, and the stages are only bracketed while the caller
+    // asked for timings.
+    m_timing.set_enabled(get_parameter("profile_timing", 0.f) > 0.5f);
+    m_timing.start_frame(frame);
+    m_timing.begin(FrameTiming::FrameUpdate);
     m_geo->update_for_frame();
+    m_timing.end(FrameTiming::FrameUpdate);
+    m_timing.begin(FrameTiming::Collision);
     m_geo->collision_detect();
+    m_timing.end(FrameTiming::Collision);
 
     m_solver->begin_frame();
+    m_timing.begin(FrameTiming::Substeps);
 
     float dt_rest = h;
     float step_h = max(1e-20f, get_parameter("step_h", 0.001f));
@@ -113,7 +124,15 @@ void Simulator::update(float h) {
         m_geo->update_for_step(step_h, factor);
         m_solver->step(step_h);
     }
+    m_timing.end(FrameTiming::Substeps);
+    m_timing.begin(FrameTiming::EndFrame);
     m_geo->end_for_frame();
+    m_timing.end(FrameTiming::EndFrame);
+    m_timing.finish_frame();
+}
+
+FrameTiming::Snapshot Simulator::get_timing() {
+    return m_timing.resolve();
 }
 
 const SimulatorParams* Simulator::get_geo_params() const {
@@ -125,6 +144,18 @@ Geometry* Simulator::get_geo() const {
 
 void Simulator::copy_vertices(float* ptr, bool world_space) {
     return m_geo->copy_vertices(ptr, world_space);
+}
+void Simulator::freeze_rest_shape() {
+    m_geo->freeze_bend_rest_shape();
+}
+void Simulator::reset_plasticity() {
+    m_geo->reset_bend_plasticity();
+}
+int Simulator::plasticity_state_size() const {
+    return (int)m_geo->bend_rest_theta.size();
+}
+void Simulator::copy_plasticity_state(float* out) const {
+    m_geo->copy_plasticity_state(out);
 }
 void Simulator::copy_debug_colors(float* ptr) {
     return m_geo->copy_debug_colors(ptr);

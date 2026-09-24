@@ -1302,19 +1302,23 @@ void SolverVBD::step(float h) {
                     nullptr, Jx_diag, f, q,
                     geo->bend_points.data().get(),
                     geo->bend_rest_theta.data().get(),
+                    // Plastic bending is a PDNewton capability; a null mask
+                    // keeps this solver on the elastic path.
+                    nullptr, nullptr,
                     geo->bend_factor.data().get(),
                     geo->bend_valid.data().get(),
                     geo->bend_cross_rows.data().get(),
-                    n_bend, bending_k);
+                    n_bend, bending_k, 0.f);
             else if ( geo->bending_model == BendingModel::DiscreteShells_AOGS )
                 compute_dihedral_bending_AOGS<<<(n_bend + block - 1) / block, block>>>(
                     nullptr, Jx_diag, f, q,
                     geo->bend_points.data().get(),
                     geo->bend_rest_theta.data().get(),
+                    nullptr, nullptr,
                     geo->bend_factor.data().get(),
                     geo->bend_valid.data().get(),
                     geo->bend_cross_rows.data().get(),
-                    n_bend, bending_k);
+                    n_bend, bending_k, 0.f);
         }
         // Zero-rest-length stitch springs; torn stitches are skipped by the
         // kernel through `stitches_status`.

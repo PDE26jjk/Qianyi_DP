@@ -166,8 +166,10 @@ current known issues:
   (reproduced in fresh subprocesses). Fix direction: C++ side - fully reset
   per-vertex device buffers in `Geometry::init` and rule out kernel-level
   nondeterminism.
-- `sim/experimental/*`: VBD/XPBD/Explicit smoke tests are deferred (skipped)
-  by maintainer decision; re-enable after the solvers are re-validated.
+
+The VBD / XPBD / Explicit test cases were removed by maintainer decision: those
+solvers are not maintained, so the harness only exercises PDNewton. Do not add
+new cases for them.
 
 ## Portability
 

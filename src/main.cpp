@@ -138,6 +138,18 @@ PYBIND11_MODULE(Qianyi_DP, m) {
             py::arg("key"), py::arg("value"))
         .def_static("set_parameters", &SimulatorInterface::set_parameters,
             py::arg("params"))
+        .def_static("get_timing", &SimulatorInterface::get_timing,
+            "Frame-stage timings of the last completed frame: a flat dict of "
+            "milliseconds (total_ms plus one key per stage), enabled by the "
+            "profile_timing parameter")
+        .def_static("freeze_rest_shape", &SimulatorInterface::freeze_rest_shape,
+            "Adopt the current configuration as the rest shape of every panel "
+            "that opted into the plastic model")
+        .def_static("reset_plasticity", &SimulatorInterface::reset_plasticity,
+            "Restore the input rest shape and clear the plastic and friction state")
+        .def_static("get_plasticity_state", &SimulatorInterface::get_plasticity_state,
+            "Per bend entry: rest angle, anchor angle, yield angle, stick timer, "
+            "plastic timer")
         .def_static("on_exit", &SimulatorInterface::on_exit)
         .def_static("check_point_attributes", &SimulatorInterface::check_point_attributes,
             py::arg("index"))

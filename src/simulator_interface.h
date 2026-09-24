@@ -29,6 +29,19 @@ public:
     
     static void set_parameter(const std::string& key, float value);
     static void set_parameters(const std::unordered_map<std::string, float>& params);
+
+    // Frame-stage timings of the last completed frame (see the
+    // `frame-stage-timing` capability): a flat dict of milliseconds, one frame,
+    // no averaging. `profile_timing` turns it on.
+    static py::dict get_timing();
+
+    // Cloth plasticity (see the `cloth-plasticity` capability): adopt the
+    // current configuration as the rest shape, drop the accumulated plastic and
+    // friction state, and read the state back. The readback is one row per bend
+    // entry: rest angle, anchor angle, yield angle, stick timer, plastic timer.
+    static void freeze_rest_shape();
+    static void reset_plasticity();
+    static py::array_t<float> get_plasticity_state();
     
     static py::dict check_point_attributes(int index);
     // Observability: solver convergence metrics of the last substep.

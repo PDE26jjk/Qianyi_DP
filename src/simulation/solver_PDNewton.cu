@@ -408,12 +408,21 @@ void SolverPDNewton::step(float h) {
     // prediction below as a right-hand-side term only: no Hessian block and no
     // diagonal entry is contributed (see the `external-forces` capability).
     geo->accumulate_external_forces();
+    // Cloth plasticity: advance the rest-angle and friction-anchor state once
+    // per substep, from the configuration the substep starts at, before the
+    // iteration that consumes it. Skipped entirely when no panel opted in.
+    geo->accumulate_bend_plasticity(h);
     forward_step<<<(n + block - 1) / block, block>>>(
         v, v_prev, mass_inv,
         geo->external_forces.data().get(), f_elastic,
         mask, q, q_pred, q_inertia, nullptr,
         static_diags,
         h, mask_stiff, geo->gravity, warm_start, n);
+    // The per-substep contact work (BVH refit plus broad phase) is measured as
+    // the frame's `collision` stage: it repeats inside the substep loop, so the
+    // timer accumulates the intervals and the reported stages stay a partition
+    // of the frame. See the `frame-stage-timing` capability.
+    simulator->timing().begin_accum(FrameTiming::Collision);
     contact.refit_bvh_with_target(q_prev, q_pred);
     // Tight, non-swept broad phase (the Warp / Style3D arrangement): the tree
     // and the query boxes are inflated only by the contact radius, so the
@@ -434,10 +443,15 @@ void SolverPDNewton::step(float h) {
         contact.refit_bvh_with_target(q_prev, q_pred);
         contact.collision_detect_broad_phase(q_prev, q_pred, query_radius, true);
     }
+    simulator->timing().end_accum(FrameTiming::Collision);
     int iters = max(1, (int)get_global_parameter("pd_iters", 10));
     int linear_iters = max(1, (int)get_global_parameter("linear_iters", 10));
     // Subspace acceleration disabled (see SolverPDNewton::init).
     float bending_k = max(0.f, get_global_parameter("bending_k", 0.2f));
+    // Internal-friction stiffness of the plastic bending model, relative to the
+    // edge's elastic stiffness (see the `cloth-plasticity` capability).
+    const float friction_ratio =
+        max(0.f, get_global_parameter("plastic_bend_friction", 2.f));
     // Planar FEM operator fixes (see compute_BW_FEM): clamping the lateral
     // eigenvalue of the stretch Hessian keeps the assembled matrix positive
     // definite when a fold compresses the membrane, and the shear Hessian is
@@ -480,20 +494,24 @@ void SolverPDNewton::step(float h) {
                 f, q,
                 geo->bend_points.data().get(),
                 geo->bend_rest_theta.data().get(),
+                geo->bend_anchor_theta.data().get(),
+                geo->bend_plastic_enabled.data().get(),
                 geo->bend_factor.data().get(),
                 geo->bend_valid.data().get(),
                 geo->bend_cross_rows.data().get(),
-                n_bend, bending_k);
+                n_bend, bending_k, friction_ratio);
         else if ( geo->bending_model == BendingModel::DiscreteShells_AOGS )
             compute_dihedral_bending_AOGS<<<(n_bend + block - 1) / block, block, 0, work_stream>>>(
                 Jx, Jx_diag,
                 f, q,
                 geo->bend_points.data().get(),
                 geo->bend_rest_theta.data().get(),
+                geo->bend_anchor_theta.data().get(),
+                geo->bend_plastic_enabled.data().get(),
                 geo->bend_factor.data().get(),
                 geo->bend_valid.data().get(),
                 geo->bend_cross_rows.data().get(),
-                n_bend, bending_k);
+                n_bend, bending_k, friction_ratio);
     };
 
     // Chord / modified-Newton: when `assemble` is false the element and contact
@@ -628,6 +646,7 @@ void SolverPDNewton::step(float h) {
         mix_float(h);
         mix_float(mask_stiff);
         mix_float(bending_k);
+        mix_float(friction_ratio);
         mix_float(query_radius);
         mix_float(trajectory_margin);
         mix_float(static_diag_scale);
@@ -646,6 +665,9 @@ void SolverPDNewton::step(float h) {
         };
         mix_buffer(geo->bend_points.data().get(), geo->bend_points.size());
         mix_buffer(geo->bend_rest_theta.data().get(), geo->bend_rest_theta.size());
+        mix_buffer(geo->bend_anchor_theta.data().get(), geo->bend_anchor_theta.size());
+        mix_buffer(geo->bend_plastic_enabled.data().get(),
+            geo->bend_plastic_enabled.size());
         mix_buffer(geo->bend_factor.data().get(), geo->bend_factor.size());
         mix_buffer(geo->bend_valid.data().get(), geo->bend_valid.size());
         mix_buffer(geo->bend_cross_rows.data().get(), geo->bend_cross_rows.size());

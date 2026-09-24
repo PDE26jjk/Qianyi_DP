@@ -23,6 +23,9 @@ target_sources(
     geometry.cuh
     geometry.cu
     external_forces.cu
+    frame_timing.cuh
+    frame_timing.cu
+    plasticity.cu
     subspace.cu
     solver_base.cuh
     solver_base.cu

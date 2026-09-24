@@ -74,6 +74,10 @@ void Geometry::init(const GeoDataInput& geo) {
     copy_to_device(geo.world_matrices, world_matrices);
     copy_to_device(geo.sewings, sewing_lines);
     copy_to_device(geo.stitches, stitches);
+    // Rest-shape input, per edge over the whole scene (see the
+    // `cloth-plasticity` capability). Absent values stay 0 = no change.
+    copy_to_device(geo.edge_rest_angle, edge_rest_angle);
+    copy_to_device(geo.edge_compress, edge_compress);
     copy_to_device(geo.vertex_index_offsets, vertex_index_offsets);
     copy_to_device(geo.edge_index_offsets, edge_index_offsets);
     copy_to_device(geo.triangle_index_offsets, triangle_index_offsets);
@@ -171,6 +175,10 @@ void Geometry::init(const GeoDataInput& geo) {
     init_bending();
     build_stitch_clusters();
     init_bend_structure();
+    // Rest-shape input first (it scales the rest lengths the in-plane force
+    // reads), then the plastic state built on the resulting rest angles.
+    apply_rest_shape_input();
+    init_plastic_state();
     CUDA_CHECK(cudaDeviceSynchronize());
 }
 

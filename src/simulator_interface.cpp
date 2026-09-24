@@ -38,6 +38,19 @@ void copy_and_add(std::vector<T>& dst, size_t offset, const std::vector<T>& src,
         ptr[i] = src_ptr[j] + to_add;
     }
 }
+// `copy_and_add` without the offset value, but bounded by the destination range
+// the caller expects: a per-edge array sent with the wrong length (sized like
+// the flat `edges` key, for example) must not write past the destination.
+template<typename T>
+void copy_bounded(std::vector<T>& dst, size_t offset, const py::array_t<T>& src,
+    size_t expected) {
+    auto buf = src.request();
+    auto src_ptr = static_cast<T*>(buf.ptr);
+    const size_t n = std::min<size_t>(expected, (size_t)buf.size);
+    for ( size_t i = 0; i < n; i++ ) {
+        dst[offset + i] = src_ptr[i];
+    }
+}
 static float3 to_float3(py::array_t<float> src) {
     float3 v;
     memcpy(&v, src.data(), sizeof(float3));
@@ -61,6 +74,10 @@ void SimulatorInterface::input_data(py::dict input) {
     std::vector<int> object_types(nb_all_o);
     std::vector<float> pin_fixed(nb_all_v);
     std::vector<float> pin_attached(nb_all_v);
+    // Rest-shape input (see the `cloth-plasticity` capability): per edge over
+    // the whole scene, 0 where an object does not provide a value.
+    std::vector<float> edge_rest_angle(nb_all_e, 0.f);
+    std::vector<float> edge_compress(nb_all_e, 0.f);
     // std::vector<float> mass_densitys(nb_all_o);
     std::vector<ObjectDataInput> obj_data(nb_all_o);
     std::vector<Mat4> world_matrixs(nb_all_o);
@@ -104,6 +121,17 @@ void SimulatorInterface::input_data(py::dict input) {
         }
         auto _edges = mesh["edges"].cast<py::array_t<int>>();
         copy_and_add(edges, nb_all_e, _edges, vertex_index_offsets[i]);
+        // Both arrays are indexed by this mesh's edges; a missing key leaves
+        // the scene-wide 0 (no change) in place. `nb_all_e` counts ints, so the
+        // edge offset is half of it.
+        if ( mesh.contains("angles") ) {
+            copy_bounded(edge_rest_angle, nb_all_e / 2,
+                mesh["angles"].cast<py::array_t<float>>(), (size_t)_edges.size() / 2);
+        }
+        if ( mesh.contains("compress") ) {
+            copy_bounded(edge_compress, nb_all_e / 2,
+                mesh["compress"].cast<py::array_t<float>>(), (size_t)_edges.size() / 2);
+        }
         auto _triangles = mesh["triangles"].cast<py::array_t<int>>();
         copy_and_add(triangles, nb_all_f, _triangles, vertex_index_offsets[i]);
         nb_all_v += (int)_vertices.size();
@@ -141,6 +169,10 @@ void SimulatorInterface::input_data(py::dict input) {
             ? mesh["wind_drag"].cast<float>() : -1.0f;
         obj_data[i].wind_lift = mesh.contains("wind_lift")
             ? mesh["wind_lift"].cast<float>() : -1.0f;
+        // Plasticity opt-in: off unless the object asks for it, in which case
+        // its bend entries take the plastic rest-angle and friction offsets.
+        obj_data[i].plastic = mesh.contains("plastic")
+            ? mesh["plastic"].cast<bool>() : false;
         obj_data[i].collision_layer = mesh["collision_layer"].cast<int>();
         auto world_matrix = mesh["world_matrix"].cast<py::array_t<float>>();
         Mat4 mat;
@@ -171,8 +203,9 @@ void SimulatorInterface::input_data(py::dict input) {
     for ( auto sewing : sewings_dict ) {
         auto stitches_dict = sewing["stitches"].cast<py::dict>();
         sewings[i].start_idx = nb_all_s;
-        sewings[i].angle = sewing.contains("angle") ? sewing["angle"].cast<float>() : 0.f;
-        sewings[i].compress = sewing.contains("compress") ? sewing["compress"].cast<float>() : 1.f;
+        // The sewing input carries no rest angle or compress any more: both are
+        // authored per edge in the mesh data (see the `cloth-plasticity`
+        // capability).
         auto key = sewing["patterns"].cast<py::list>();
         int p1 = key[0].cast<int>();
         int p2 = key[1].cast<int>();
@@ -198,6 +231,8 @@ void SimulatorInterface::input_data(py::dict input) {
         .pin_attached = std::move(pin_attached),
         .sewings = std::move(sewings),
         .stitches = std::move(stitches),
+        .edge_rest_angle = std::move(edge_rest_angle),
+        .edge_compress = std::move(edge_compress),
         .nb_all_cloth_v = nb_all_cloth_v,
         .nb_all_cloth_e = nb_all_cloth_e,
         .nb_all_cloth_f = nb_all_cloth_f,
@@ -272,6 +307,36 @@ void SimulatorInterface::set_parameters(const std::unordered_map<std::string, fl
     for ( const auto& [fst, snd] : params ) {
         Simulator::instance().set_parameter(fst, snd);
     }
+}
+
+void SimulatorInterface::freeze_rest_shape() {
+    Simulator::instance().freeze_rest_shape();
+}
+py::dict SimulatorInterface::get_timing() {
+    const FrameTiming::Snapshot timing = Simulator::instance().get_timing();
+    py::dict out;
+    out["frame"] = timing.frame;
+    out["enabled"] = timing.enabled;
+    out["stale"] = timing.stale;
+    out["total"] = timing.total_ms;
+    for ( int stage = 0; stage < FrameTiming::StageCount; ++stage ) {
+        out[FrameTiming::stage_key(stage)] = timing.stage_ms[stage];
+    }
+    return out;
+}
+void SimulatorInterface::reset_plasticity() {
+    Simulator::instance().reset_plasticity();
+}
+py::array_t<float> SimulatorInterface::get_plasticity_state() {
+    auto& simulator = Simulator::instance();
+    const int n = simulator.plasticity_state_size();
+    auto result = py::array_t<float>({ (py::ssize_t)n, (py::ssize_t)5 });
+    if ( n <= 0 ) {
+        return result;
+    }
+    py::buffer_info buf = result.request();
+    simulator.copy_plasticity_state(static_cast<float*>(buf.ptr));
+    return result;
 }
 
 template<typename V3>

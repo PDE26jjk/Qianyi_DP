@@ -5,6 +5,7 @@
 
 #include "common/device.h"
 #include "common/vec_math.h"
+#include "frame_timing.cuh"
 
 struct SimulatorParams;
 struct SolverBase;
@@ -35,6 +36,10 @@ struct ObjectDataInput {
     float pressure;
     float wind_drag;
     float wind_lift;
+    // Plasticity opt-in (see the `cloth-plasticity` capability). A panel that
+    // does not set it keeps its input rest angle: no plastic rest-angle offset
+    // and no internal-friction anchor offset are applied to its bend entries.
+    bool plastic;
     bool kinetic; // The solver does not update its position, todo set mass for it
     bool vertices_updated;
     bool matrix_updated;
@@ -45,8 +50,6 @@ struct ObjectDataInput {
 struct SewingData {
     int start_idx; // Start index of stitches
     int count; // Count of stitches
-    float angle; // Dihedral angel of sewing line
-    float compress; // Compress lenght of sewing line
 };
 
 struct GeoDataInput {
@@ -65,6 +68,12 @@ struct GeoDataInput {
     std::vector<float> pin_attached;
     std::vector<SewingData> sewings;
     std::vector<int2> stitches;
+    // Rest-shape input, per edge over the whole scene (0 where an object does
+    // not provide a value). `edge_rest_angle` is the rest dihedral angle of the
+    // edge's bend entry (0 = flat); `edge_compress` is the relative change of
+    // the edge's rest length (0 = keep the pattern length).
+    std::vector<float> edge_rest_angle;
+    std::vector<float> edge_compress;
     int nb_all_cloth_v; int nb_all_cloth_e; int nb_all_cloth_f;
     int nb_all_cloth_o;
 };
@@ -118,6 +127,13 @@ public:
     }
     void init(const GeoDataInput& geo);
     void update(float h);
+    // Frame-stage timings of the most recent completed frame (see the
+    // `frame-stage-timing` capability). Enabled by the `profile_timing`
+    // parameter; returns a disabled, empty sample when it is off.
+    FrameTiming::Snapshot get_timing();
+    // The frame timer itself, for a solver that wants to bracket a piece of its
+    // own loop (see `FrameTiming::begin_accum`).
+    FrameTiming& timing() { return m_timing; }
     void copy_vertices(float*, bool world_space = false);
     void copy_debug_colors(float*);
     const SimulatorParams* get_geo_params() const;
@@ -144,6 +160,15 @@ public:
     uint64_t parameter_version() const { return m_parameter_version; }
     void update_world_matrix(int obj_index, const std::vector<float>& matrix);
     std::vector<std::string> get_all_solver();
+    // Cloth plasticity (see the `cloth-plasticity` capability): adopt the
+    // current configuration as the rest shape, drop the accumulated plastic and
+    // friction state, and read the state back per bend entry.
+    void freeze_rest_shape();
+    void reset_plasticity();
+    // Number of bend entries the plasticity state covers (0 before a scene is
+    // loaded).
+    int plasticity_state_size() const;
+    void copy_plasticity_state(float* out) const;
     // Observability: the solver's convergence metrics (see
     // SimulatorInterface::get_residual_metrics for the named layout).
     std::vector<float> get_residual_metrics();
@@ -163,6 +188,7 @@ private:
     uint64_t m_parameter_version = 0;
     std::string m_last_solver_name;
     std::string m_solver_name = "PDNewton";
+    FrameTiming m_timing;
     void create_solver();
     
 };

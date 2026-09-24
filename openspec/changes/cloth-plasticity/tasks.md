@@ -1,105 +1,140 @@
-## 1. Plastic state and parameters
+## 0. Prerequisite: the bend table's validity at scene init
 
-- [ ] 1.1 Add the plastic state to `Geometry` per design D1: immutable
-  `bend_rest_theta_elastic` / `edge_lengths_elastic` plus live
-  `bend_rest_theta` / `edge_lengths`, and the `plastic_bend_time` /
-  `plastic_stretch_time` timers; verify with the existing quick group that a
-  scene with plasticity off produces the same frame data as before the change
-- [ ] 1.2 Initialize the live arrays from the elastic ones inside the geometry
-  init path and rebuild them on `input_data`; verify that loading the same scene
-  twice with plasticity enabled starts from the elastic reference both times
-- [ ] 1.3 Add the parameter keys (`plastic_enabled`, `plastic_bend_yield`,
-  `plastic_bend_rate`, `plastic_bend_max`, `plastic_hardening`, `plastic_tau`,
-  `plastic_stretch_enabled`, `plastic_stretch_yield`, `plastic_stretch_rate`)
-  with conservative defaults and read them in the update path; verify that an
-  unset-thus-defaulted run and an explicitly-disabled run behave identically
-- [ ] 1.4 Add `src/simulation/plasticity.cu` with its `geometry.cuh`
-  declarations and the `src/simulation/CMakeLists.txt` entry; verify the module
-  builds and imports
-- [ ] 1.5 Add the public simulator calls (`freeze_rest_shape`,
-  `reset_plasticity`, `get_plasticity_state`) to the pybind interface layer
-  with their engine-side entry points declared, starting as stubs where the
-  kernels do not exist yet; verify the module imports and each call is
-  invocable on a loaded scene
+- [x] 0.1 Set `bend_structure_built` before the `update_seam_state()` call at
+  the end of `init_bend_structure()` (design D15); verified with a local probe
+  that `bending_k` 0 vs 1e6 moves a hanging panel by ~135 mm again - it moved
+  0.4 mm (run-to-run noise) while the flag was set afterwards
+- [x] 0.2 Confirm the restored bending does not break the feature-off path
+  structurally: the local verification script's feature-off scenario stays
+  finite and the plastic state stays empty (see task 7.5 for the repository
+  test groups, which move for the bending-sensitive expectations)
 
-## 2. Rest-shape refresh path
+## 1. Input surface and parameters
 
-- [ ] 2.1 Implement `refresh_rest_dependent_state()` per design D7 (areas and
-  bend validity through the existing `update_seam_state()`, then `bend_factor`,
-  then the PD diagonal) and call it from scene init; verify the quick group is
-  unchanged
-- [ ] 2.2 Make the PDNewton precomputed diagonal refreshable outside `init()`
-  (the `Jx_diag_pd` / `static_diags` path) and cover the explicit solver's use
-  of the same rest quantities; verify the smoke scene still runs and steps
-- [ ] 2.3 Verify the refresh is actually complete: change a rest value on
-  purpose, refresh, and confirm no stale-force transient appears in the next
-  frames (frame-by-frame inspection of `traces.json` / `frames.npz`)
+- [x] 1.1 Add the per-object `plastic` flag to `ObjectDataInput` and parse it in
+  the mesh-entry loop of `simulator_interface.cpp`, defaulting to off when the
+  key is absent; verified with a scene that does not send the key (no plastic
+  state, feature-off frames unchanged by the flag itself)
+- [x] 1.2 Add the parameter keys of design D7 (`plasticity_time_scale`,
+  `plastic_bend_friction`, `plastic_bend_thres0`, `plastic_bend_thres_inf`,
+  `plastic_bend_dwell_tau`, `plastic_bend_yield`, `plastic_bend_hardening`,
+  `plastic_bend_hardening_g`, `plastic_bend_hardening_tau`) and read them in the
+  update path; verified that the defaults are inert and that each key moves the
+  state or the held shape as designed
 
-## 3. Freeze (bake the current shape)
+## 2. Rest-shape input
 
-- [ ] 3.1 Implement the freeze kernel (`theta_rest <- theta` for valid bend
-  entries, `L_rest <- L` for edges) and the host-side commit that calls the
-  refresh path; verify vertex positions are unchanged on the freeze frame
-- [ ] 3.2 Wire `freeze_rest_shape()` to the commit-and-refresh path and
-  `reset_plasticity()` to the elastic-restore path (restore elastic arrays,
-  zero timers, refresh); verify a second freeze with no step in between is a
-  no-op and that reset restores elastic behavior
-- [ ] 3.3 Report unsupported combinations per design D4: plastic bending with
-  the quadratic IBM bending model and plastic stretch with the FEM constitutive
-  model; verify the warning text appears once per run and the run continues
-  elastically
-- [ ] 3.4 Implement the `get_plasticity_state()` readback (bend entries always,
-  edges when stretch plasticity is enabled); verify the returned state starts
-  empty on load, matches the amount transferred by a known deformation, and is
-  cleared by `reset_plasticity()`
+- [x] 2.1 Parse the per-mesh `angles` and `compress` arrays into the global
+  per-edge arrays, treating a missing key or element as 0, and write `angles`
+  into the bend table (a mesh edge from its own value, a seam slot from its
+  hinge edge); verified that a scene without the arrays reports the input rest
+  angles and runs as before
+- [x] 2.2 Remove `angle` and `compress` from the sewing input contract; verified
+  that a sewing entry's rest angle now comes from the hinge edge's `angles`
+  value and that a leftover key is ignored
+- [x] 2.3 Apply `compress` to the rest lengths at init
+  (`edge_lengths[i] = pattern_length(i) * (1 + compress[i])`) after the
+  pattern-derived weights exist; verified mean edge lengths 0.0247 m base,
+  0.0181 m shrunk and 0.0331 m grown, with the vertex mass unchanged
+  (2.362949e-05 kg in both runs)
+- [x] 2.4 Verify the FEM planar model scales its per-triangle rest metric from
+  the same input (design D14); verified the FEM in-plane response shrinks by the
+  same ratio and that the planar x bending matrix stays finite in all four
+  combinations
 
-## 4. Continuous plastic flow
+## 3. Plastic state and scene init
 
-- [ ] 4.1 Implement `update_bend_plasticity` with yield, bounded per-step flow,
-  rest-angle clamping and the time-dependent hardening term (design D2); verify
-  a deformation below the yield threshold releases back to the elastic result
-- [ ] 4.2 Implement `update_stretch_plasticity` for the spring-mass model,
-  enabled by its own flag (design D3); verify a stretched edge keeps a longer
-  rest length after release and that the flag off changes nothing
-- [ ] 4.3 Wire both updates at the documented single site (once per frame,
-  before the substep loop) with the frame time as `h`, and accumulate/reset the
-  plastic timers; verify the timer accumulates while the deformation is held and
-  returns to zero after release
-- [ ] 4.4 Call the refresh path after every plastic update; verify a plastic or
-  frozen cloth suspended in mid-air holds its shape without jitter, drift or a
-  pull back toward the flat pattern
+- [x] 3.1 Add the per-entry state of design D1 to `Geometry` and initialize it
+  in `init_bend_structure()`'s caller path; verified the arrays are sized
+  `nb_all_cloth_edges + nb_all_stitches` and that a scene reload re-initializes
+  them (state readback empty again)
+- [x] 3.2 Derive the per-entry enable mask from the owning panel's flag and
+  `bend_valid`; verified a scene with an unflagged panel reports an unchanged
+  rest angle and no timers
+- [x] 3.3 Verify the seam slots carry the hinge edge's angle as their rest angle
+  and that the anchor starts there (readback at frame 0)
 
-## 5. Verification scenarios
+## 4. Update kernel
 
-- [ ] 5.1 Obtain explicit approval for the new test cases before writing them
-  (repository policy: tests are never added speculatively), then add them under
-  `tests/sim/`
-- [ ] 5.2 Residual deformation: compress (or wring) a grid cloth past the yield
-  threshold, release with the support removed, and assert the remaining wrinkle
-  is above a measured threshold and far larger than the elastic-only residual
-- [ ] 5.3 Holding-time ordering: hold the same deformation for a short and a
-  long duration, then assert the longer hold leaves the larger residual
-- [ ] 5.4 Rigid-motion invariance: translate and rotate the whole cloth with no
-  internal deformation and assert the plastic state (observed through the
-  residual shape after returning to rest) is unchanged
-- [ ] 5.5 Frozen suspension: freeze a wrinkled configuration, remove the
-  support, and assert the vertices stay within the configured tolerance of the
-  frozen configuration over a full run
-- [ ] 5.6 Regression: run `python -m pytest -m quick` with the feature off and
-  confirm the result matches the pre-change baseline
+- [x] 4.1 Implement `update_bend_plasticity` in a new
+  `src/simulation/plasticity.cu`, launched once per substep from
+  `SolverPDNewton::step` before the captured loop, reading `pos_step_prev`;
+  verified the timers advance with simulated time (30 s accumulated over 60
+  frames at time scale 60) and that the state does not depend on `pd_iters`
+- [x] 4.2 Verify `plasticity_time_scale = 0` leaves both timers at zero and
+  evaluates the model with the initial threshold and hardening stiffness
+  (readback: timers exactly 0)
+- [x] 4.3 Fold the aggregate first and second derivative into the GN and AOGS
+  bending kernels (design D3); verified the friction term changes the held shape
+  by 15.4 mm at `k_f = 2 k_e` and that the state kernel costs nothing
+  measurable on a 100x100 grid (11.31 vs 11.35 ms/frame)
+- [x] 4.4 Verify the rest angle never moves past the current angle and stays
+  inside the dihedral range over a long run (no NaN anywhere in the matrix of
+  planar x bending combinations)
 
-## 6. Documentation and calibration
+## 5. Actions and readback
 
-- [ ] 6.1 Add one `AGENTS.md` paragraph describing the feature, the parameter
-  keys and the freeze entry point; verify the committed text contains no
-  machine-specific paths
-- [ ] 6.2 Manual pass in the debug window: load a GarmentCodeData scene, create
-  wrinkles against the body, freeze, then suspend the garment and confirm the
-  wrinkles persist; keep screenshots in the gitignored artifact tree and record
-  the outcome in the change notes
-- [ ] 6.3 Calibrate the default parameter values against a drape scene
-  (denim-like target) and record the chosen values in the parameter block
-  comments; verify the calibrated values keep the smoke scene finite over a full
-  run
-- [ ] 6.4 Run the full `quick` and `sim` groups with the feature on where
-  applicable and summarize the outcome in the change notes
+- [x] 5.1 Implement `freeze_rest_shape()`; verified vertex positions are
+  unchanged on the freeze frame and that a frozen shape drifts 0.0000 m over
+  0.5 s with gravity off
+- [x] 5.2 Implement `reset_plasticity()`; verified the rest angles return to the
+  input values exactly
+- [x] 5.3 Implement `get_plasticity_state()`; verified the layout
+  `(entries, 5)` = rest, anchor, yield, stick timer, plastic timer and that it
+  is empty at load, populated after a hold, and cleared by reset
+- [x] 5.4 Verify neither action reallocates a buffer covered by the CUDA-graph
+  capture key (they only rewrite contents), and that the new state buffers are
+  part of the key; verified by running freeze and reset inside a graph-captured
+  run without a capture rebuild
+
+## 6. Verification scenarios
+
+- [x] 6.1 Approval: the maintainer authorized a small number of cases and asked
+  for the non-PDNewton solver cases to be dropped (they were removed, and
+  `AGENTS.md` records that those solvers are unmaintained)
+- [x] 6.2 Rest-shape input (`tests/sim/test_cloth_plasticity.py`): a shrunk
+  panel's mean edge length is below 95 % of the plain run under both planar
+  models, the vertex mass is unchanged, the frames are finite, and a panel that
+  did not opt in reports an empty plastic state
+- [x] 6.3 Plastic flow and the timers (same file): a flagged pinned curtain
+  develops a rest-angle change above 0.01 rad with the clock running, the stick
+  timer accumulates simulated time, and reset returns the rest angles to the
+  input
+- [x] 6.4 Freeze contract (same file): freeze commits the current bend angle
+  into the rest state on an isometric arc, moves no vertex, and a second freeze
+  with no step in between is a no-op
+- [ ] 6.5 Frozen suspension as a *visual* assertion: not asserted in the
+  repository tests. On a procedural sheet the recovery after the load is removed
+  is membrane-dominated while the freeze only changes the bending rest angle, so
+  a hard threshold would measure the membrane. Covered as information by the
+  local script and by the manual debug-window pass (task 7.4); a hard test needs
+  stretch plasticity or a bend-dominated specimen
+- [ ] 6.6 Residual deformation and hold-time ordering as *visual* assertions:
+  covered as information locally (the hold-time effect is small in a
+  self-limiting drape, larger for the hardening time constant); the state-level
+  checks in 6.2-6.4 are the committed ones
+- [ ] 6.7 Regression: `python -m pytest -m quick` reports 13 passed and one
+  pre-existing failure (`sim/smoke`, the sheet hovering ~0.23 mm against a
+  0.1 mm + 0.01 mm ground tolerance; it failed before this change too, at
+  11.25 mm). Relaxing that tolerance is a maintainer decision, not part of this
+  change
+
+The wider scenario set (rigid-motion invariance, hold time, hardening time
+constant, the planar x bending matrix, performance) is covered locally by the
+gitignored `build/verify_plasticity.py` (19 checks, all passing).
+
+## 7. Documentation and calibration
+
+- [x] 7.1 Add the `plastic` field, the per-edge `angles` / `compress` arrays,
+  the parameter table and the PDNewton / IBM limitations to
+  `docs/engine_input_spec.md`; no machine-specific paths
+- [x] 7.2 Add the README section (panel flag, authored rest shape, time scale,
+  freeze call)
+- [ ] 7.3 Calibrate the defaults against a drape scene, starting from the
+  paper's denim column, and record the chosen values
+- [ ] 7.4 Manual pass in the debug window: flag a garment, author a rest shape,
+  fold or press it, freeze it and suspend it
+- [x] 7.5 Run the `quick` group: 13 passed, 1 pre-existing `sim/smoke` failure
+  (see 6.7), no failures from this change's cases; the local script covers the
+  feature-on scenarios over longer runs
+- [ ] 7.6 Run the `sim` group and the data-driven groups before archiving

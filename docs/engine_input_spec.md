@@ -170,6 +170,9 @@ they must not collide with a documented key.
 | `pressure` | cloth | `0` | Constant pressure load along the surface normal, in Pa, applied by PDNewton. Positive inflates, negative pulls inward, `0` is inert. Requires no watertight shell and no volume state. |
 | `wind_drag` | cloth | `-1` | Per-object drag coefficient `C_D` override. A negative value means "use the global `wind_drag_coefficient`". |
 | `wind_lift` | cloth | `-1` | Per-object lift coefficient `C_L` override. A negative value means "use the global `wind_lift_coefficient`". |
+| `angles` | cloth | `0` | Rest-shape input, one float per edge of this mesh: the rest dihedral angle of that edge's bend entry, in radians, `0` = flat. A seam hinge takes the value on its hinge edge. |
+| `compress` | cloth | `0` | Rest-shape input, one float per edge: relative change of the edge's rest length, `0` = keep the pattern length, negative shrinks, positive grows. |
+| `plastic` | cloth | `0` (off) | Opt-in for the plastic bending model of the `cloth-plasticity` capability. When off, the panel keeps its input rest angle and no plastic or friction offset is applied. |
 
 ## 7. Sewing entry
 
@@ -177,7 +180,7 @@ they must not collide with a documented key.
 | --- | --- | --- |
 | `patterns` | list[int], length 2 | The two object indices joined by this seam. |
 | `stitches` | int32, `(S, 2)` flattened | Stitch pairs as panel-local vertex indices; entry `k` pairs `stitches[2k]` of the first pattern with `stitches[2k + 1]` of the second. |
-| `angle` | optional float32 | Rest dihedral angle of the seam. Default `0`. |
+| `angle` | removed | A seam's rest angle is no longer part of this entry: it is the `angles` value on the seam's hinge edge in the mesh data (see section 6). A caller that still sends `angle` (or `compress`) is ignored. |
 | `compress` | optional float32 | Compression length of the seam. Default `1`. |
 
 A seam is a permanent zero-rest-length constraint. Panels that are sewn
@@ -289,6 +292,83 @@ define the engine's surface" below).
 | `fem_psd_clamp`, `fem_shear_hessian` | `1` | FEM Hessian regularization switches. |
 | `gamma_r`, `gamma_min` | `0.9`, `1e-9` | Line-search parameters. |
 | `parallel_eps` | `1e-6` | Parallel-edge epsilon. |
+
+### Cloth plasticity (PDNewton only)
+
+The `cloth-plasticity` capability gives a panel that set `plastic` a
+time-dependent wrinkle model: internal friction (an anchor angle with stick-slip
+and a dwell-dependent threshold) plus an elasto-plastic rest angle (yield and
+time-dependent hardening). The bending kernels consume the two angles as one
+aggregate first derivative, so the model costs two multiply-adds per bend entry;
+the per-substep state update is skipped entirely when no panel opts in.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `plasticity_time_scale` | `0` | Multiplier on the substep before it is added to the dwell and hardening timers. `0` evaluates the model at t = 0 (initial slip threshold, initial hardening stiffness); `1` is the paper's timing; `> 1` compresses a long hold into a short one. |
+| `plastic_bend_friction` | `2.0` | Internal-friction stiffness `K_friction` as a multiple of the edge's elastic bending stiffness. `0` disables the friction term. |
+| `plastic_bend_thres0` | `0.1` | Initial stick-slip threshold, in radians. |
+| `plastic_bend_thres_inf` | `1.2` | Ceiling the threshold grows toward while an entry keeps sticking, in radians. |
+| `plastic_bend_dwell_tau` | `30` | Time constant of that growth, in seconds. |
+| `plastic_bend_yield` | `1.8` | Yield angle of the plastic flow, in radians. |
+| `plastic_bend_hardening` | `1.0` | Initial hardening stiffness `K_h0` as a multiple of the elastic stiffness. |
+| `plastic_bend_hardening_g` | `0.99` | Lower bound of the hardening stiffness: `K_h` decays from `K_h0` toward `K_h0 (1 - g)`. |
+| `plastic_bend_hardening_tau` | `30` | Time constant of that decay, in seconds. |
+
+The thresholds are dihedral angles, matching the paper's own simplification and
+the engine's angle-space bending parameters. The defaults come from the paper's
+cotton/denim columns and are a starting point for calibration, not a tuned
+value.
+
+Actions (not parameters) are separate simulator calls:
+
+| Call | Meaning |
+| --- | --- |
+| `freeze_rest_shape()` | Adopt the current configuration as the rest shape of every panel that opted in, and reset the two timers. Vertex positions do not move. |
+| `reset_plasticity()` | Restore the input rest shape and clear the anchors, timers and accumulated hardening. |
+| `get_plasticity_state()` | `(N, 5)` float array, one row per bend entry: rest angle, anchor angle, yield angle, stick timer, plastic timer. |
+
+Limitations: only PDNewton advances the state (VBD, XPBD and Explicit keep the
+elastic path), and the quadratic IBM bending model has no rest angle, so
+plasticity has no effect there.
+
+### Frame timing (diagnostic, all solvers)
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `profile_timing` | `0` | `1` records CUDA events around the four stages of every `update` call. Off, the frame path only pays one branch per stage. |
+
+`qydp.simulator.get_timing()` returns the last completed frame as a flat dict of
+milliseconds (the keys carry no unit suffix):
+
+```text
+{"frame": int,            # the frame the sample belongs to (-1 when disabled)
+ "enabled": bool,         # whether profile_timing was on for that frame
+ "stale": bool,           # true when the sample predates the newest frame
+ "total": float,
+ "frame_update": float,   # normals, pick, pin, sewing bookkeeping
+ "collision": float,      # contact work: frame preparation + per-substep refit/broad phase
+ "substeps": float,       # the substep loop without the contact work
+ "end_frame": float}
+```
+
+The four stages partition one `update` call, so they add up to `total` exactly.
+`collision` covers the contact work that repeats inside the substep loop - the
+BVH refit and the broad phase of every substep, which PDNewton runs itself -
+plus the frame-level preparation that runs before the loop (the periodic BVH
+rebuild). `substeps` is the loop without that contact work: the external forces,
+the plastic state, the contact forces, the Newton iterations and the seam
+projection, which for PDNewton are one captured CUDA graph. A solver that does
+not bracket its own contact work simply reports `collision = 0` and everything
+lands in `substeps`.
+
+The per-substep contact intervals are accumulated (up to 64 per frame; a frame
+with more substeps than that reports the first 64).
+
+The readback never synchronizes: it resolves the events only when called, and
+returns the previous sample with `stale = True` when the newest one is not
+complete yet. The engine keeps one frame and no history; averaging belongs to
+the caller. Measured cost of the enabled path is about 1.5 % of the frame on a
+40x40 sheet (0.27 ms of 18.6 ms); the disabled path costs nothing measurable.
 
 ### Sewing
 

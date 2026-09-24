@@ -1,325 +1,439 @@
 ## Context
 
-See `proposal.md` for motivation. Current state that shapes the design:
+See `proposal.md` for motivation. The current state that shapes this design:
 
-- Every rest quantity is derived once from the input pattern and never changes:
-  `edge_lengths` (rest edge length from the 2D pattern), `Dms` / `areas` (per
-  triangle rest shape), `bend_rest_theta` (unified bend entries: `0` for mesh
-  edges, the sewing angle for seam hinges), `bend_factor` (dihedral factor) and
-  the precomputed `IBM_q` used by the quadratic bending model.
-- The dihedral convention in `dynamics/bending.cuh` is "flat = 0"; the discrete
-  shell energy is `0.5 * k * (theta - theta_rest)^2`, so a rest angle of `0`
-  makes any wrinkle an elastic deviation that always relaxes back to flat.
-- Bending kernels read `bend_points` / `bend_rest_theta` / `bend_factor` /
-  `bend_valid` / `bend_cross_rows` on every Newton iteration; the spring and
-  FEM kernels read `edge_lengths` / `Dms` on every iteration. Changing a rest
-  value therefore takes effect on the next iteration without touching the
-  solver's assembly code.
-- Some derived state is computed once per scene: `Jx_diag_pd` (the PD diagonal
-  copied into `static_diags` every step) in `SolverPDNewton::init`, and `IBM_q`
-  in the geometry bending setup.
-- There is already a refresh precedent for rest-dependent state:
-  `update_seam_state()` recomputes triangle areas and bend validity after a
-  stitch-cluster rebuild, and `build_stitch_clusters()` is written to be
-  allocation-free so it can run again during a simulation.
-- The harness and the Blender frontend both drive `input_data` -> `set_solver`
-  / `set_parameter` -> per-frame `update(dt)` with internal substeps of
-  `step_h` (<= 0.003 s).
+- `bend_rest_theta` is built once per scene in `Geometry::init_bend_structure()`:
+  `0` for every mesh edge, `sewing_lines[..].angle` for every seam hinge slot
+  (seam slots start at `nb_all_cloth_edges` in the unified table). The dihedral
+  convention is "flat = 0" and the energy is `0.5 * k * (theta - rest)^2`, so a
+  rest angle of 0 makes every wrinkle an elastic deviation that relaxes back.
+- `edge_lengths` is the rest length of every edge: the 2D pattern length
+  `|p2D(i) - p2D(j)|` for cloth edges, the input 3D length for the remaining
+  (non-simulated) edges. It feeds the spring-mass force, the bending factor
+  precompute (`geometric_scale = 3 l^2 / A`), the mean-edge-length the rest of
+  the pipeline reads, and the collision broad phase.
+- The FEM planar model's rest state is per *triangle*: `Dms[i]` is the 2x2 rest
+  metric (its columns are the triangle's two edge vectors in the object's grain
+  frame) and `areas[i] = 0.5 |det Dms|` is both the StVK energy weight and, at
+  init, the source of the vertex masses. There is no per-edge rest length in
+  that model. The default planar model is spring-mass (`constitutive_model_planar`
+  defaults to 0 and the frontend does not send the key).
+- The sewing input carries `angle` and `compress` per sewing line. `angle` is
+  the seam hinge's rest angle; `compress` is parsed but consumed nowhere.
+- The bending kernels (`dynamics/bending.cuh`) read `bend_rest_theta`,
+  `bend_factor`, `bend_valid` and `bend_points` from the live arrays on every
+  Newton iteration. Nothing derived from the rest angle is cached: the PD
+  diagonal (`static_diags` / `Jx_diag_pd`) is built by
+  `pd_precompute_spring_forces` from the spring lattice and the per-object
+  stretch stiffness only, while `bend_factor` / `areas` / `IBM_q` come from the
+  2D pattern and the assembled element diagonal is rebuilt per iteration.
+  Changing a rest angle therefore needs no cache refresh at all.
+- `SolverPDNewton::step(h)` runs `forward_step` first, which overwrites `q` with
+  the warm-start prediction (`warm_start` defaults to 2), and then runs the
+  Newton loop inside a captured CUDA graph. The substep-start positions survive
+  in `pos_step_prev` (`Geometry::update_for_step` copies them at the top of every
+  substep). External forces are already built once per substep just before the
+  graph capture - the same slot this feature needs.
+- The default bending model is AOGS (`bending_model` defaults to 2 and the
+  frontend does not send the key). AOGS takes the first and second derivative of
+  the bending energy at the current state (`g` and `p`) and derives an
+  orthotropic geometric stiffness from them, so an extra quadratic energy term
+  needs no new machinery.
+- The reference implementation of the paper updates its friction and plastic
+  state once per time step, at the current dihedral angle, before assembling the
+  bending force and Jacobian, and it does so on every mesh edge. It also
+  confirms the parameter units used below: the thresholds are dihedral angles in
+  radians, not the curvature-scaled strain.
 
 ## References
 
-The approach follows the published cloth-plasticity work; the first entry is
-the closest match to the requirement (plasticity combined with internal
-friction and time dependence) and the rest are the mechanisms this change
-borrows or deliberately defers.
-
 - D. Gong, Y. Yang, T. Shao, H. Wang. "Cloth Animation with Time-dependent
   Persistent Wrinkles." Eurographics 2025.
-  [arXiv:2502.13491](https://arxiv.org/abs/2502.13491) - elasto-plastic bending
-  with a yield strain, time-dependent hardening, and the internal-friction
-  model that this change defers. Reference implementation:
+  [arXiv:2502.13491](https://arxiv.org/abs/2502.13491) - the model this change
+  implements: forces and Jacobians in SM Appendix E (Eq. 30-37), algorithms in
+  Appendix F, parameter tables in Appendix C. Reference implementation:
   [github.com/realcrane/Cloth-Animation-with-Time-dependent-Persistent-Wrinkles](https://github.com/realcrane/Cloth-Animation-with-Time-dependent-Persistent-Wrinkles)
-  (C++/CUDA).
-- R. Narain, T. Pfaff, J. F. O'Brien. "Folding and Crumpling Adaptive Sheets."
-  ACM Transactions on Graphics 32(4), SIGGRAPH 2013.
-  [doi:10.1145/2461912.2461964](https://doi.org/10.1145/2461912.2461964) -
-  plastic deformation of thin sheets through an evolving rest shape.
-- T. H. Wong, G. Leach, F. Zambetta. "Modelling Bending Behaviour in Cloth
-  Simulation Using Hysteresis." Computer Graphics Forum 32(6), 2013.
-  [doi:10.1111/cgf.12137](https://doi.org/10.1111/cgf.12137) - bending
-  hysteresis, i.e. the recoverable internal-friction half of the problem.
-- E. Miguel et al. "Modeling and Estimation of Internal Friction in Cloth."
-  ACM Transactions on Graphics 32(6), SIGGRAPH Asia 2013 - Dahl-style internal
-  friction and its measurement; basis of the deferred friction model.
-- B.-C. Kim, S. Oh, K. Wohn. "Persistent Wrinkles and Folds of Clothes."
-  International Journal of Virtual Reality, 2011 - permanent wrinkles by
-  changing the rest shape and material stiffness.
+  (`scr/Cloth.cpp`: `cal_bend`, `dwell_friction`, `hardening_plastic`).
 - Z. Wang, Y. Yang, H. Wang. "Stable Discrete Bending by Analytic Eigensystem
-  and Adaptive Orthotropic Geometric Stiffness." ACM Transactions on Graphics
-  42(6), Article 183, 2023 - the discrete bending model and the `theta`
-  convention already used by this engine (`dynamics/bending.cuh`).
-- Houdini Vellum, "Plasticity" (SideFX documentation):
-  [sidefx.com/docs/houdini/vellum/plasticity.html](https://www.sidefx.com/docs/houdini/vellum/plasticity.html)
-  - industry parameterization of the same idea (stretch/bend plastic flow
-  gated by a threshold), used here as a naming reference for the API.
-- Marvelous Designer, "Freeze/Unfreeze" (support article):
-  [support.marvelousdesigner.com](https://support.marvelousdesigner.com/hc/en-us/articles/47358315135897-Freeze-Unfreeze)
-  - the user-facing "bake the current garment shape" behavior this change
-  reproduces with the freeze call.
-- Style3D Studio help, "褶皱" (wrinkle tooling):
-  [help.style3d.com](https://help.style3d.com/studio/zh/1113/c7491/ff6a6/5c9ba/4e55d)
-  - shows the geometry-side alternative (pleats and gather tools that change
-  the flat pattern); useful context for why the engine-side rest shape also
-  has to change.
+  and Adaptive Orthotropic Geometric Stiffness", ACM TOG 42(6), 2023 - the AOGS
+  model whose `p` / `g` inputs this change aggregates.
+- E. Grinspun, A. Hirani, M. Desbrun, P. Schroeder. "Discrete Shells", SCA 2003 -
+  the energy the engine's dihedral bending already implements, and the reason
+  the paper's `K_b` maps onto the existing `bending_k * bend_factor` without
+  rescaling the geometry factor.
+- Houdini Vellum "Plasticity" and Marvelous Designer "Freeze/Unfreeze" -
+  industry naming references for the parameter surface and the freeze call.
 
 ## Goals / Non-Goals
 
 **Goals:**
 
-- Persist wrinkles through rest-shape change, with a freeze/bake operation and a
-  strain-driven plastic evolution behind one enable flag.
-- Zero behavioral change when the feature is off, including for the existing
-  baseline tests.
-- Keep the per-frame cost O(edges + triangles), allocation-free, and confined to
-  one update site so the Newton assembly path is untouched.
-- Deterministic and resettable: loading a scene or resetting plasticity returns
-  the exact elastic reference.
+- Implement the paper's friction and plastic model faithfully in angle space,
+  including its time-dependent parts, on the unified bend-entry table.
+- Zero behavior change and zero added cost when no panel opts in, including the
+  CUDA-graph capture and the bending kernels' existing path.
+- State that is per entry, deterministic (no atomics), resettable and readable
+  through the public API.
+- Keep AOGS - the default and best-quality bending model - by folding the new
+  terms into its existing `p` / `g` inputs instead of adding a second code path.
 
 **Non-Goals:**
 
-- Recoverable wrinkles (internal friction, bending hysteresis, Dahl-style
-  friction, stick-slip anchors, dwell effects).
-- Anisotropic plastic yield (warp/weft-direction dependence) and fabric
-  calibration data.
-- Changing the linear solver, the projector, collision handling or the seam
-  cluster subsystem.
-- Plasticity for the VBD / XPBD experimental solvers.
+- Stretch plasticity, rest edge lengths, and the tensile half of the paper.
+- The quadratic IBM bending model, which has no rest angle.
+- VBD / XPBD / Explicit solvers.
+- Exact Hessians: the anchor is treated as constant inside a step, so the
+  tangent is the paper's Gauss-Newton form, not the true second derivative.
+- A pattern-level interface for internal lines (their rest angle stays 0).
 
 ## Decisions
 
-### D1. Plastic state lives next to the rest arrays it modifies
+### D1. The plastic state lives next to the bend table it modifies
 
-`Geometry` keeps two versions of each plastic-capable rest quantity:
+`Geometry` keeps, per bend entry (`nb_all_cloth_edges + nb_all_stitches` slots):
 
-- `bend_rest_theta_elastic` (immutable, built with the unified bend structure)
-  and `bend_rest_theta` (live value consumed by the bending kernels);
-- `edge_lengths_elastic` (immutable) and `edge_lengths` (live value consumed by
-  the spring kernel);
-- per-entry/per-edge plastic timers (`plastic_bend_time`,
-  `plastic_stretch_time`) for time-dependent hardening.
+| Array | Meaning |
+| --- | --- |
+| `bend_rest_theta` | live rest angle (the plastic state, written by the update) |
+| `bend_rest_theta_elastic` | immutable copy for reset |
+| `bend_anchor_theta` | internal-friction anchor angle |
+| `bend_stick_t` | stick timer for the dwell effect |
+| `bend_plastic_t` | plastic timer for the hardening effect |
+| `bend_plastic_hp` | accumulated hardening plastic strain |
+| `bend_yield_theta` | live yield angle |
+| `bend_plastic_enabled` | per-entry mask: owning panel flagged AND entry valid |
 
-Reset is then a device-to-device copy of the elastic arrays plus a timer
-memset; no recomputation from the pattern is needed.
+They are allocated and initialized in `Geometry::init_bend_structure()` right
+after the bend table is built, so every scene load starts from the input:
+rest = input angle, anchor = rest, timers = 0, hardening strain = 0,
+yield = `plastic_bend_yield`. Sizing them with the bend table keeps them valid
+across scene rebuilds, and only their contents change afterwards, so the
+CUDA-graph capture key (which mixes buffer identity and size) stays valid.
 
-*Alternative:* mutate `pos_2D` instead of adding live copies. Rejected - `pos_2D`
-is the pattern-space reference used by the bending factor, `IBM_q` and the
-pick/2D mapping; overwriting it would destroy the elastic reference and break
-reset.
+*Alternative:* keep the state in the solver. Rejected - the bending kernels
+consume the rest angle, and the state has to outlive a solver instance.
 
-### D2. Elasto-plastic bending with a yield threshold and bounded flow
+### D2. The model, in angle space, advanced once per substep
 
-Using the existing dihedral computation (`theta` with the flat convention):
+Per bend entry, with the entry's own stiffness `k_e = bending_k *
+bend_factor[i]` and `k_f = plastic_bend_friction * k_e`:
 
+```text
+h_eff = plasticity_time_scale * h
+theta = current dihedral angle of the entry (as computed today)
+
+# internal friction: anchor + stick-slip + dwell   (paper Eq. 7-8)
+thres = thres_inf - (thres_inf - thres_0) * exp(-t_stick / tau_f)
+delta = theta - theta_anchor
+if |delta| > thres:
+    theta_anchor += sign(delta) * (|delta| - thres)
+    t_stick = 0
+else:
+    t_stick += h_eff
+
+# elasto-plastic rest angle: yield + time-dependent hardening (paper Eq. 9-14)
+eps_e = theta - theta_rest
+if |eps_e| > yield:
+    t_plastic = (sign(eps_e) == sign(eps_p)) ? t_plastic + h_eff : 0
+    K_h  = K_h0 * (1 - g * (1 - exp(-t_plastic / tau_p)))
+    beta = k_e / (k_e + K_h)
+    eps_hp      += beta * (|eps_e| - yield)
+    theta_rest  += sign(eps_e) * beta * (|eps_e| - yield)
+    yield        = yield_0 + eps_hp * (K_h / k_e)
 ```
-eps_b   = theta - theta_rest                    # total bending strain
-eps_e   = eps_b                                 # elastic (visible) part
-eps_p   = plastic state, currently folded into theta_rest
-d eps_p = sign(eps_e) * min(rate * h, max(|eps_e| - yield, 0))
-theta_rest <- theta_rest + d eps_p
+
+Two properties matter for safety: `beta <= 1` and `|eps_e| - yield < |eps_e|`,
+so the rest angle only ever moves toward the current angle, never past it - the
+update cannot overshoot, cannot invert an entry, and needs no extra clamp.
+
+*Alternative:* the paper's `eps_b = 3 (theta - rest) / H` variant with curvature
+units. Rejected because the paper's own implementation and SM text use the
+dihedral angle for both thresholds, because the engine's other bending
+parameters are already in angle space, and because a curvature threshold would
+require a second per-edge geometric quantity (`H` is not recoverable from
+`bend_factor`, which folds in the per-object anisotropy).
+
+### D3. One aggregate first/second derivative, so AOGS is unchanged
+
+The friction and plastic terms only change *which* constant the bending energy
+is quadratic around:
+
+```text
+force   = -(k_e * (theta - theta_rest) + k_f * (theta - theta_anchor)) * grad(theta)
+p_total = k_e + k_f                                   # second derivative
+g_total = k_e * (theta - theta_rest) + k_f * (theta - theta_anchor)   # first derivative
 ```
 
-`theta_rest` moving toward `theta` is exactly a plastic rest-state update: the
-energy minimum follows the deformation, so the wrinkle survives unloading.
-Safety clamps: the per-step transfer is limited by `rate * h`, and `theta_rest`
-is clamped to `+/- plastic_bend_max` so a wildly bent element cannot flip its
-rest angle through `+/-pi` and lock in an inverted state.
+Both are exactly what the existing kernels already take as inputs: the GN kernel
+uses the outer product with the second derivative, and AOGS is parameterized by
+`(p, g)` at the current state. So the AOGS kernel keeps its single
+`aogs_fp_diag` call and its rank decomposition, with `p = 1 +
+plastic_bend_friction` and `g = (theta - theta_rest) + plastic_bend_friction *
+(theta - theta_anchor)` (relative to `k_e`, which is applied afterwards as
+today). The added cost is two multiply-adds per entry when the panel is flagged,
+and a single branch when it is not.
 
-Time-dependent hardening follows the published model: the effective yield
-grows with how long the deformation has been held,
+*Alternative:* special-case the friction term with a separate geometric
+stiffness. Rejected - the aggregate form is the same approximation the paper
+uses for its own Jacobian and keeps one code path.
 
-```
-Kh      = Kh0 * (1 - g * (1 - exp(-t_p / tau)))      # g in (0,1)
-t_p    += h   while plasticity is active, reset to 0 otherwise
-yield_eff = yield / max(Kh, eps)
-```
+### D4. The update runs once per substep, outside the graph capture
 
-so a short press leaves a shallow crease and a long press a sharp one. `g = 0`
-recovers the simple (time-independent) perfect-plastic model, which keeps the
-feature tunable from "immediate permanent crease" to "only after a long hold".
+`update_bend_plasticity` is launched from `SolverPDNewton::step(h)`, in the slot
+where `accumulate_external_forces()` already runs: after `forward_step`, before
+`run_pd_loop` and therefore outside the captured region. It reads
+`pos_step_prev` (the substep-start configuration, i.e. the state the deformation
+is measured on) and not `q`, which `forward_step` has already replaced with the
+warm-start prediction.
 
-*Alternative:* ideal plasticity (`eps_p = eps_e - yield`, instantaneous).
-Rejected as the only mode - it produces an instant permanent set and cannot
-express the "held for a while" behavior the proposal is after; it remains
-available through `g = 0` plus a high rate.
+*Alternatives:* inside the bending kernel (rejected: it would advance the state
+once per Newton iteration, multiplying the plastic flow by the iteration count
+and making the result depend on `pd_iters`), or once per frame in
+`Geometry::update_for_frame` (rejected: `h` is the integration step, the
+frontend's frame length varies, and the reference implementation also advances
+per step).
 
-### D3. Stretch plasticity is a separate, independently selectable mechanism
+### D5. The whole bend table takes part, gated only by validity
 
-For the spring-mass model the same rule applies to the relative edge strain
-`(L - L_rest) / L_rest`, updating `edge_lengths`. It is off by default because a
-wrongly tuned stretch yield makes garments grow over time and it is not needed
-for the primary crease use case.
+The update covers every entry of the unified table - mesh edges and seam hinges -
+with no seam filter, matching the reference implementation's per-edge loop. The
+only gate is `bend_valid` (dead, collapsed, torn or degenerately built slots
+must be skipped: their `bend_points` are placeholders and the existing bending
+kernels skip them too) plus the per-panel flag described in D7.
 
-For the FEM (BW) model the equivalent update means changing the per-triangle
-rest metric `Dms` while keeping the material frame rotation-free. That metric
-update is deliberately deferred: this change reports plastic stretch as
-unsupported for that constitutive model (per the spec requirement) and only
-implements the edge-length form. Plastic bending is unaffected by this and
-works for both constitutive models.
+*Trade-off:* a seam hinge's rest angle interacts with the per-iteration seam
+projection, and a plastic hinge angle can drift across frames. This is visible
+in the verification scenarios (frozen suspension, seam closure) and the panel
+flag is the escape hatch - a panel that should not drift simply does not set it.
 
-### D4. Plastic bending requires a rest-angle bending model
+### D6. `plasticity_time_scale` is the only clock
 
-`DiscreteShells_GN` and `DiscreteShells_AOGS` consume `bend_rest_theta` and get
-plastic bending for free. The quadratic `IBM` model has no rest angle - its rest
-state is the precomputed `IBM_q` derived from the pattern - so plastic bending
-is reported as unsupported and the run continues elastically, as required by
-the spec.
+The dwell and hardening timers advance by `plasticity_time_scale * h`:
 
-*Alternative:* recompute `IBM_q` from the deformed configuration (a different
-plastic formulation for that model). Rejected for this change: it has different
-energy semantics and would double the work of validating the feature.
+- `0` (default): the timers stay at 0, so the model is the t = 0 evaluation -
+  a fixed slip threshold `thres_0` and a fixed hardening stiffness `K_h0`. This
+  is the stateless drape case: hysteresis and yield are active, but nothing
+  hardens over time.
+- `1`: the paper's timing.
+- `> 1`: the animation-mode compression the paper itself uses when it advances
+  the timers by 10 s per step to reach a 500 s hold in 50 steps.
 
-### D5. One update site, once per frame
+No additional mode flag is introduced; the animation mode is "time scale on",
+the free-drape mode is "time scale 0".
 
-The plastic update runs in `Geometry::update_for_frame()`, before the substep
-loop, with `h` equal to the frame's simulated time. Rationale: the frame is the
-unit at which the frontends drive the engine, plastic time scales are seconds to
-minutes, and keeping the update out of the substep loop leaves the Newton
-assembly path unchanged. `rate * h` remains bounded because the same clamping
-applies at frame scale.
+### D7. The opt-in is per panel, the numbers are global
 
-*Alternative:* update per substep (as the reference implementation does).
-Rejected for the first cut on cost and perturbation grounds; if the apply phase
-measures instability (large per-frame strain on thin, heavily self-contacting
-panels), moving the call into `update_for_step` is a one-line change and is
-recorded as an open question.
+Each cloth object's mesh input carries `plastic` (integer/bool, default off).
+The per-entry mask is derived at init from the owning object of the hinge edge
+(`vertices_obj[bend_points[i].x]`, the same convention the bending factor
+precompute uses) and from `bend_valid`.
 
-### D6. Actions and state get real simulator calls, not parameter triggers
+The flag selects whether that panel's bending takes the plastic rest-angle
+offset and the friction anchor offset at all. An unflagged panel keeps its
+input rest angle, carries no anchor offset, and is otherwise untouched - same
+force and same tangent as today, bit for bit. It is not a hardening mode: a
+participating panel that should not harden is a parameter value
+(`plastic_bend_hardening = 0`), not a second code path.
 
-This capability is not a numeric knob: it adds verbs (freeze, reset) and state
-(how much of the rest shape is currently plastic). Folding those into the
-existing parameter map would mean expressing one-shot actions as sticky floats
-that the engine has to consume and clear, and it does not scale to the surface
-this feature needs. The change therefore adds a small set of simulator calls,
-wired through `simulator_interface.*` in the same style as the existing
-`input_data` / `update` / `pick_triangle*` bindings:
+The numeric constants stay in the global parameter map, which is where every
+other material constant lives and where the frontend already applies a
+per-scene block:
+
+| Key | Meaning | Default | Provenance |
+| --- | --- | --- | --- |
+| `plasticity_time_scale` | timer multiplier (D6) | `0` | this change |
+| `plastic_bend_friction` | `K_friction / K_b` | `2.0` | cotton specimen column |
+| `plastic_bend_thres0` | `thres_0`, slip threshold | `0.1` rad | cotton / denim |
+| `plastic_bend_thres_inf` | `thres_inf`, dwell ceiling | `1.2` rad | cotton trousers |
+| `plastic_bend_dwell_tau` | `tau_f` | `30` s | all materials |
+| `plastic_bend_yield` | `yield_0` | `1.8` rad | cotton specimen |
+| `plastic_bend_hardening` | `K_h0 / K_b` | `1.0` | "similar to the elastic parameters" |
+| `plastic_bend_hardening_g` | `g`, hardening lower bound | `0.99` | all materials |
+| `plastic_bend_hardening_tau` | `tau_p` | `30` s | all materials |
+
+Default ratios come from the paper's tables so the first run is in the intended
+order of magnitude; absolute stiffnesses stay relative to the scene's
+`bending_k`, because the engine's `bending_k` is a scene-tuned value rather than
+the paper's physical `K_b` (the engine's geometry factor is `3 l^2 / A`, whose
+constant differs from the reference implementation's `l^2 / A`, so the
+parameters are only meaningful as ratios of `bending_k`).
+
+### D8. Rest angles keep their existing sources; freezing is the way to move them
+
+The rest angle of an entry is established at init from the source that exists
+today: `0` for a mesh edge, the sewing line's angle for a seam hinge, and (once
+an input field exists) an internal line's angle. Nothing is measured from the
+loaded 3D configuration, so a scene's initial drape behavior is exactly what it
+is today. If a caller wants a non-flat loaded configuration to be stress-free,
+that is `freeze_rest_shape()` after frame 0, not a different init rule.
+
+### D9. The verbs and the readback
 
 | Call | Semantics |
 | --- | --- |
-| `freeze_rest_shape()` | Adopt the current simulated configuration as the rest shape (one-shot action, vertex positions untouched). |
-| `reset_plasticity()` | Drop the accumulated plastic state and return to the elastic reference of the current input. |
-| `get_plasticity_state()` | Read the plastic state back (per bend entry, and per edge when stretch plasticity is enabled) for diagnostics, UI display and test verification. |
+| `freeze_rest_shape()` | rest = current angle, anchor = current angle, timers cleared; vertex positions untouched on that frame |
+| `reset_plasticity()` | restore the elastic rest angles, anchor = rest, timers and hardening strain cleared, yield = `plastic_bend_yield` |
+| `get_plasticity_state()` | per bend entry: rest, anchor, yield, both timers (diagnostics, UI, tests) |
 
-Numeric material constants (`plastic_enabled`, `plastic_bend_yield`,
-`plastic_bend_rate`, `plastic_bend_max`, `plastic_hardening`, `plastic_tau`,
-`plastic_stretch_enabled`, `plastic_stretch_yield`, `plastic_stretch_rate`)
-stay in the existing parameter map, because that is where every other numeric
-material or solver constant in this engine lives (`bending_k`, `sewing_k`,
-`mask_stiff`, ...) and because the frontend already applies a parameter block
-per scene. The split is: parameters carry numbers, calls carry actions and
-state.
+Freeze is the limit case of the plastic update (transfer the whole elastic part
+into the rest shape) and shares the same state layout, so it needs no separate
+model. Both calls only rewrite contents of already allocated buffers, so neither
+invalidates the CUDA-graph capture.
 
-Freeze itself is the limit case of the plastic update: it transfers the entire
-elastic deformation into the rest state in one pass (`theta_rest <- theta` for
-valid bend entries, `L_rest <- L` for edges) and shares the cache-refresh path
-with the continuous update, so there is still exactly one place where "the rest
-shape changed" is handled.
+### D10. No cache refresh, and no new kernels for the bending models
 
-The surface is expected to grow (per-region freeze, plastic presets, material
-export/import for the frontend); new entries follow the existing `snake_case`
-simulator-method convention, and the deferred phases (internal friction,
-anisotropy) add their own calls and parameters rather than overloading these.
+Because nothing derived from the rest angle is cached (Context), a plastic or
+frozen update needs no rebuild of `areas`, `bend_valid`, `bend_factor`,
+`IBM_q`, `static_diags` or the assembled diagonal. The previous revision of this
+design specified a `refresh_rest_dependent_state()` path; it is dropped as
+unnecessary for bending plasticity and would only come back with rest edge
+lengths (stretch plasticity), which is out of scope.
 
-*Alternative:* edge-triggered parameter entries (`freeze_rest_shape = 1`), so no
-interface changes are needed at all. Rejected - it hides an action behind a
-float, makes it invisible to static analysis and to the frontend's parameter
-UI, and it does not extend to the state readback and reset this feature needs.
+### D11. Code placement
 
-### D7. A single refresh path for everything derived from the rest shape
+A new `src/simulation/plasticity.cu` holds the state initialization, the
+per-substep update kernel, and the freeze/reset entry points, with declarations
+in `geometry.cuh` and an entry in the CMake source list. The two dihedral bending
+kernels in `dynamics/bending.cuh` are extended in place with the aggregate
+`p` / `g` (D3). The per-object field is parsed in `simulator_interface.cpp`
+beside `bending` / `stretch`, and the three public calls are wired in the pybind
+layer, so the engine side stays free of Python types.
 
-`refresh_rest_dependent_state()` is the only entry point that runs after a rest
-change, and it refreshes, in order:
+### D15. Prerequisite: the bend table's validity had to be filled at init
 
-1. `areas` (collapsed triangles stay zero) and `bend_valid` via the existing
-   `update_seam_state()`;
-2. `bend_factor`, which depends on rest areas and rest edge lengths;
-3. `IBM_q` - skipped, since IBM is not a plastic-capable bending model (D4);
-4. the PD diagonal (`Jx_diag_pd` / `static_diags`) used by the PDNewton
-   iteration, which is otherwise computed once per scene.
+`Geometry::init_bend_structure()` called `update_seam_state()` *before* setting
+`bend_structure_built`, and `update_seam_state()` returns immediately while that
+flag is false - so the call (and the one inside `build_stitch_clusters()`)
+no-oped for every scene, `bend_valid` stayed zeroed, and every bending kernel
+returned before doing any work. Measured on the pre-change build: raising
+`bending_k` from 0 to 1e6 changed a hanging panel by 0.4 mm (run-to-run noise is
+~0.1-0.4 mm), while a build from before that guard was introduced (2026-09-12)
+changed it by 135 mm. Bending was silently disabled engine-wide; the plastic
+model cannot do anything while the entries it modifies are invalid, so setting
+the flag before the call is a prerequisite of this change.
 
-Adding a new rest-derived quantity later means extending this one function,
-which is the mitigation for the "forgot a cache" failure mode.
+Consequence: scenes get their bending back, so existing frame data changes
+(the bending-sensitive expectations in the experimental-solver group move).
+This is a behavior *restoration*, and it is called out separately in the
+implementation report because it is the one part of this change that is not
+opt-in.
 
-### D8. Cold state, resets and scene lifetime
+### D12. The rest shape is authored by two per-edge arrays in the mesh input
 
-The plastic state is part of the scene state: `Geometry::init` builds the
-immutable elastic arrays and initializes the live arrays from them, so loading
-input data always starts elastic. The `reset_plasticity()` call restores the
-elastic arrays, zeroes the timers and refreshes derived state without reloading
-the scene. Timers are ordinary floats on the device, so reset is a memset - no
-host-side bookkeeping to keep in sync.
+Each cloth mesh entry may carry `angles` and `compress`, both indexed by that
+mesh's own edges and both defaulting to 0 when the key is absent (copied into
+global per-edge arrays through the same offset-add path `edges` / `triangles`
+use):
 
-### D9. Code placement
+- `angles[i]` is the rest dihedral angle of the edge in the engine's convention
+  (0 = flat, sign from the entry's fixed vertex order). It is written into the
+  bend table at init: a mesh edge takes its own value and a seam hinge takes the
+  value on its hinge edge. This replaces `SewingData.angle`, which is removed
+  from the sewing input together with the unused `SewingData.compress`.
+- `compress[i]` is the relative change of the rest length,
+  `edge_lengths[i] = pattern_length(i) * (1 + compress[i])`: 0 keeps the pattern
+  length and a negative value shrinks the edge.
 
-A new `src/simulation/plasticity.cu` holds the device kernels
-(`update_bend_plasticity`, `update_stretch_plasticity`, `commit_rest_shape`)
-and the host-side `Geometry` methods; declarations go into `geometry.cuh` and
-the file is added to `src/simulation/CMakeLists.txt`. The three public calls
-are wired in the pybind interface layer next to the existing simulator
-bindings, so the engine side stays free of Python types. Plasticity is
-deliberately not folded into `sewing.cu` (which owns the unified bend table) or
-`geometry.cu` (which already owns initialization), so the feature can be read
-and removed in one place.
+Both are inputs, not state - they do not change while a simulation runs - and
+they are what the frontend's seam and internal-line angle editing and painted
+expansion/shrinkage convert into. Afterwards, only `freeze_rest_shape()` and the
+plastic flow move a rest angle.
 
-### D10. Verification is effect-based, like the rest of the project
+### D13. What the two arrays drive, and what they deliberately leave alone
 
-Acceptance is measured the way this project verifies everything else - from
-per-frame vertex data - with `get_plasticity_state()` available for assertions
-that are about the state itself rather than the visible shape (for example
-"rigid motion leaves the plastic state bit-identical"). Planned checks: a
-residual deformation test (wring/compress, release, compare against the flat
-pattern), a holding-time ordering test (same deformation held for different
-durations), a rigid-motion invariance test (rotate/translate the whole cloth,
-plastic state unchanged), a frozen-suspension test (freeze a wrinkled shape,
-remove support, assert it holds), and a regression assertion that the
-feature-off path is unchanged.
+`angles` feeds the bend table, so everything derived from the rest angle (the
+bending force, the plastic state, the freeze path) follows it.
+
+`compress` feeds `edge_lengths`, which is where the spring-mass model reads its
+rest length directly - that is the in-plane path the shrinkage shows up on. The
+geometry weights stay on the 2D pattern: `bend_factor`, `areas`, `Dms`, the
+vertex masses and `cloth_edge_mean_length` are built from `pos_2D` and are not
+rescaled. Rationale: those weights describe the discretization and the material,
+while shrink/expand is in-plane rest-length authoring; scaling them per edge
+would silently change the bending stiffness and the mass of an authored panel,
+and a per-edge value cannot determine a per-triangle area scale without the
+conversion of D14.
+
+*Alternative:* scale `areas` and the bending weight by the compressed rest
+lengths. Rejected for this change - it changes the bending stiffness and the
+mass of every authored panel and needs the same conversion FEM needs.
+
+### D14. The FEM planar model reads a per-triangle metric, so compress scales it
+
+The FEM (BW / StVK) rest state is the per-triangle metric `Dms` plus the rest
+area `areas[i]`, and its energy is `W = A_s * psi(E)` with `E` built from
+`F = D_s * Dm^-1`. Shrink/expand is representable in that model - it is exactly
+`Dm -> s * Dm` isotropically - but a per-edge scalar cannot drive it directly,
+because one number per edge over-determines a triangle's rest shape unless the
+three values are consistent.
+
+Decision: an edge's `compress` therefore enters the FEM rest state as the mean
+relative change of the three edges of each triangle,
+`Dms[i] *= 1 + (c1 + c2 + c3) / 3`, clamped to a sane range so a degenerate
+input cannot collapse the metric (`Dm^-1` would blow up). The metric carries the
+authored rest shape; `areas` (the StVK energy weight *and* the init-time source
+of the vertex masses) and the bending weight stay those of the pattern, so a
+painted shrinkage changes the rest shape without silently changing the material
+amount - consistent with D13. The frontend drives the FEM planar model, so this
+path is not optional.
+
+*Alternative:* rebuild each triangle's metric exactly from its three compressed
+rest lengths (SSS in the same grain frame). Recorded as a refinement: it needs
+the triangle-inequality guard and a separate rest area, and it behaves badly for
+wildly non-uniform per-edge input, which is exactly what a painted field
+produces at triangle scale.
 
 ## Risks / Trade-offs
 
-- [Plastic creep: a slow, unintended growth of the garment over long runs] ->
-  yield thresholds are absolute and flow is rate-limited; below the yield
-  nothing changes, and the hardening term saturates the effective yield.
-- [Stale derived state silently producing wrong forces] -> D7's single refresh
-  path plus a test that a frozen cloth stays at rest without residual jitter.
-- [The plastic update perturbs the Newton solve] -> the update only runs between
-  frames (D5), so no iteration sees the rest state change mid-solve.
-- [Model coverage gaps read as bugs] -> unsupported combinations (IBM bending,
-  FEM stretch) report explicitly instead of silently doing nothing.
-- [Determinism] -> the project already has a known non-bitwise determinism
-  issue; this change adds state but no new ordering nondeterminism (the kernels
-  are per-entry and index-stable), and reset is a plain memset/copy.
-- [Visual quality depends on tuning] -> defaults stay conservative and the
-  feature is off by default; denim-like presets are calibrated during apply
-  rather than guessed here.
-- [Seam hinges carry a non-zero rest angle] -> plastic flow for seam entries is
-  clamped per entry and uses the same `bend_valid` gate as the elastic path, so
-  torn or collapsed entries never receive plastic updates.
+- [Friction can destabilize the integration at large steps - the paper's own
+  stability appendix reports an abrupt reaction-torque change at a 10 ms step
+  that disappears at 1 ms] -> the substep stays the integration step (the
+  frontend already subdivides, and the solver can cap its own substep); the
+  frame-time and blow-up checks in the verification scenarios are the evidence.
+- [The anchor starts at the rest angle, so a scene whose loaded configuration is
+  already far from rest gets a one-time friction force proportional to that
+  deviation] -> bounded by the slip threshold after a single substep, and the
+  flagged-panel default keeps existing scenes out of the path; freeze at frame 0
+  is the explicit way to adopt a loaded shape.
+- [Thresholds are angles, so a plastic onset is mesh-density dependent] -> the
+  paper makes the same choice for the same reason (its own text notes the
+  curvature form is the mesh-independent one); the engine's bending stiffness
+  already carries the same density dependence through `bend_factor`.
+- [Seam hinges take part (D5), so a plastic seam angle can fight the seam
+  projection] -> covered by the frozen-suspension and seam scenarios; the panel
+  flag is the escape hatch.
+- [Guidance parameters (nine keys) are a wide surface for a first cut] -> they
+  are ordinary numeric material constants in the existing parameter map, all
+  defaulted, and the only new *input field* is the per-panel flag.
+- [Behavioral change when enabled: a flagged panel will not return to the
+  pattern] -> that is the feature; the default keeps every existing scene and
+  test on the elastic path.
+- [`compress` is an authoring input applied once at init, so a large negative
+  value makes a panel gather hard and can invert triangles at load] -> the
+  degenerate-triangle handling the planar kernels already have skips zero-area
+  faces, and the verification scenes read the frame data at load.
+- [The sewing input loses two keys, so a caller still sending them is silently
+  ignored] -> `compress` was unused, the seam angle moves to the hinge edge's
+  `angles` entry, and the backend contract doc is updated in the same change.
+- [The FEM planar model reads a per-triangle metric while the input is per edge
+  (D14)] -> the metric is scaled by the triangle's mean relative change, which
+  is exact for uniform input and smooth for painted fields; the exact per-edge
+  rebuild stays recorded as the refinement.
 
 ## Migration Plan
 
-Purely additive. The feature defaults to off, so no scene, test or frontend
-configured today changes behavior. Rollback is either disabling the parameter
-or reverting the change; no persisted data or saved state is involved. At
-archive time the capability spec is copied into `openspec/specs/cloth-plasticity/`
-and one paragraph is added to `AGENTS.md` describing the parameters and the
-freeze entry point.
+Purely additive. With no panel flagged the parameter path is inert, so no scene,
+test or frontend configured today changes behavior, and rollback is either
+clearing the flag or reverting the change - no persisted data is involved.
+Archive copies the capability spec into `openspec/specs/cloth-plasticity/` and
+the input contract goes into `docs/engine_input_spec.md`.
 
 ## Open Questions
 
-- Default parameter values for a denim-like look (yield, rate, hardening, tau)
-  - to be calibrated against a drape scene during apply, not fixed here.
-- Whether per-substep plastic updates are needed for stability on thin panels
-  with heavy self-contact; the call site (D5) is isolated so this can be
-  revisited after measurement.
-- Whether the FEM stretch metric update (D3) is worth a follow-up change
-  (covering pressed/flattened cloth under tension) or whether spring-only
-  stretch plasticity is enough for garment work.
+- Default numeric values for a denim-like look (friction ratio, yield, dwell
+  ceiling) are to be calibrated in the apply phase against a drape scene, using
+  the paper's denim column as the starting point.
+- Whether the exact per-edge FEM metric rebuild (D14's alternative) is worth
+  replacing the mean-scale form once a fabric-calibration pass exists.
+- Whether stretch plasticity (rest edge lengths, and with it the cache refresh
+  path) is worth a follow-up change.

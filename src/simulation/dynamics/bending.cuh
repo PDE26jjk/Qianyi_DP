@@ -85,10 +85,12 @@ static __global__ void compute_dihedral_bending_GN(
     const float3* __restrict__ vertices,
     const int4* __restrict__ bend_points,
     const float* __restrict__ bend_rest_theta,
+    const float* __restrict__ bend_anchor_theta,
+    const char* __restrict__ bend_plastic_enabled,
     const float* __restrict__ bend_factor,
     const char* __restrict__ bend_valid,
     const int* __restrict__ bend_cross_rows,
-    int n, float kb
+    int n, float kb, float friction_ratio
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if ( i >= n ) return;
@@ -102,7 +104,18 @@ static __global__ void compute_dihedral_bending_GN(
     get_theta_dpk(vertices[x0_idx], vertices[x1_idx], vertices[x2_idx], vertices[x3_idx],
         theta_dp0, theta_dp1, theta_dp2, theta_dp3, theta);
 
-    float coef = kb * bend_factor[i];
+    // Aggregate bending model (see the `cloth-plasticity` capability): the
+    // elastic term always, plus the internal-friction term for an entry whose
+    // panel opted in. Both are quadratic in the dihedral angle with a constant
+    // stiffness, so the tangent coefficient is their sum and the force uses
+    // their aggregate first derivative - exactly the Gauss-Newton form of the
+    // paper's force and Jacobian.
+    const float k_elastic = kb * bend_factor[i];
+    // A null mask means the caller does not run the plastic model at all (the
+    // non-PDNewton solvers), which keeps them on the elastic path.
+    const float k_friction = (bend_plastic_enabled != nullptr && bend_plastic_enabled[i])
+        ? friction_ratio * k_elastic : 0.f;
+    float coef = k_elastic + k_friction;
     if ( Jx_diag != nullptr ) {
         atomicAddMat3(&Jx_diag[x0_idx], Mat3::outer_product(theta_dp0, theta_dp0 * coef));
         atomicAddMat3(&Jx_diag[x1_idx], Mat3::outer_product(theta_dp1, theta_dp1 * coef));
@@ -126,7 +139,8 @@ static __global__ void compute_dihedral_bending_GN(
             atomicAddMat3(&Jx[rows[5]], x2_idx < x3_idx ? f2d3 : f2d3.transpose());
         }
     }
-    coef *= -(theta - bend_rest_theta[i]);
+    coef = -(k_elastic * (theta - bend_rest_theta[i]) +
+        (k_friction != 0.f ? k_friction * (theta - bend_anchor_theta[i]) : 0.f));
     if ( forces != nullptr ) {
         atomicAddFloat3(&forces[x0_idx], theta_dp0 * coef);
         atomicAddFloat3(&forces[x1_idx], theta_dp1 * coef);
@@ -311,10 +325,12 @@ static __global__ void compute_dihedral_bending_AOGS(
     const float3* __restrict__ vertices,
     const int4* __restrict__ bend_points,
     const float* __restrict__ bend_rest_theta,
+    const float* __restrict__ bend_anchor_theta,
+    const char* __restrict__ bend_plastic_enabled,
     const float* __restrict__ bend_factor,
     const char* __restrict__ bend_valid,
     const int* __restrict__ bend_cross_rows,
-    int n, float kb
+    int n, float kb, float friction_ratio
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if ( i >= n ) return;
@@ -332,11 +348,19 @@ static __global__ void compute_dihedral_bending_AOGS(
         th_dp0, th_dp1, th_dp2, th_dp3, theta, geo);
 
     // ---- forces: unchanged from the GN kernel ----
-    // g = d psi / d theta = theta - rest_theta
-    float g = theta - bend_rest_theta[i];
-    float bending_k = kb * bend_factor[i];
+    // Aggregate bending model (see the `cloth-plasticity` capability): the
+    // AOGS machinery is parameterized by the first and second derivative of the
+    // bending energy at the current angle, so the friction term folds in by
+    // adding its stiffness to `p` and its own rest angle to `g`. The kernel
+    // works in unit-stiffness units and scales by `k_elastic` at the end.
+    const float k_elastic = kb * bend_factor[i];
+    const float k_friction = (bend_plastic_enabled != nullptr && bend_plastic_enabled[i])
+        ? friction_ratio * k_elastic : 0.f;
+    const bool has_friction = k_friction != 0.f;
+    const float g = (theta - bend_rest_theta[i]) +
+        (has_friction ? friction_ratio * (theta - bend_anchor_theta[i]) : 0.f);
     if ( forces != nullptr ) {
-        float coef = -bending_k * g;
+        float coef = -k_elastic * g;
         atomicAddFloat3(&forces[x0_idx], th_dp0 * coef);
         atomicAddFloat3(&forces[x1_idx], th_dp1 * coef);
         atomicAddFloat3(&forces[x2_idx], th_dp2 * coef);
@@ -347,7 +371,9 @@ static __global__ void compute_dihedral_bending_AOGS(
     if ( geo.h1 < 1e-6f || geo.h2 < 1e-6f || geo.l < 1e-6f ) return; // degenerate
 
     // ---- adaptive parameters from the F' diagonal (paper Eq.15) ----
-    const float p = 1.0f; // Discrete Shells: p = d2psi/dtheta2 = 1
+    // Discrete Shells: p = d2psi/dtheta2 = 1 per unit stiffness, plus the
+    // friction stiffness for a participating entry.
+    const float p = 1.0f + (has_friction ? friction_ratio : 0.f);
     float Fp[8];
     aogs_fp_diag(p, g, geo.st, geo.ct, Fp);
     float a0 = fmaxf(0.0f, fmaxf(Fp[0], Fp[1]) - p);
@@ -380,7 +406,7 @@ static __global__ void compute_dihedral_bending_AOGS(
         float w_n2n1 = p * T21;
         float w_ee = a2 * (T11 + T22);
         return (N11 * w_n1n1 + N22 * w_n2n2 + M11 * w_m1m1 + M22 * w_m2m2 +
-            N12 * w_n1n2 + N21 * w_n2n1 + EE * w_ee) * bending_k;
+            N12 * w_n1n2 + N21 * w_n2n1 + EE * w_ee) * k_elastic;
     };
 
     atomicAddMat3(&Jx_diag[x0_idx], calc_B(0, 0));

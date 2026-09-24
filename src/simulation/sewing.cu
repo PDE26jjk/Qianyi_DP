@@ -501,7 +501,7 @@ static __global__ void build_seam_bend_entries_kernel(
     char* __restrict__ static_ok,
     const int2* __restrict__ stitches,
     const int* __restrict__ stitch_sewing,
-    const SewingData* __restrict__ sewing_lines,
+    const float* __restrict__ edge_rest_angle,
     const int2* __restrict__ edges,
     const int2* __restrict__ e2t,
     const int2* __restrict__ edge_opposite_points,
@@ -537,7 +537,10 @@ static __global__ void build_seam_bend_entries_kernel(
     if ( x2 == x3 || x2 == he.x || x2 == he.y || x3 == he.x || x3 == he.y ) return;
 
     bend_points[i] = make_int4(he.x, he.y, x2, x3);
-    bend_rest_theta[i] = sewing_lines[stitch_sewing[i]].angle;
+    // The seam hinge's rest angle is the value the scene put on the hinge edge
+    // (see the `cloth-plasticity` capability): seams and internal lines are
+    // authored as per-edge data, not as a field of the sewing input.
+    bend_rest_theta[i] = edge_rest_angle[hinge];
 
     // Dihedral factor: same formula as precompute_dihedral_bending_factor,
     // from the two adjacent triangles of the seam sides.
@@ -701,6 +704,8 @@ static __global__ void unpack_pairs_kernel(
 static __global__ void fill_mesh_bend_entries_kernel(
     int4* __restrict__ bend_points,
     float* __restrict__ bend_factor,
+    float* __restrict__ bend_rest_theta,
+    const float* __restrict__ edge_rest_angle,
     const int2* __restrict__ edges,
     const int2* __restrict__ edge_opposite_points,
     const float* __restrict__ bending_factor,
@@ -712,6 +717,9 @@ static __global__ void fill_mesh_bend_entries_kernel(
     int2 op = edge_opposite_points[i];
     bend_points[i] = make_int4(e.x, e.y, op.x, op.y);
     bend_factor[i] = bending_factor[i];
+    // Rest dihedral angle of the mesh edge (0 = flat unless the scene authored
+    // a non-flat rest shape).
+    bend_rest_theta[i] = edge_rest_angle[i];
 }
 
 void Geometry::init_bend_structure() {
@@ -740,6 +748,7 @@ void Geometry::init_bend_structure() {
     int block = 256;
     fill_mesh_bend_entries_kernel<<<(ne + block - 1) / block, block>>>(
         bend_points.data().get(), bend_factor.data().get(),
+        bend_rest_theta.data().get(), edge_rest_angle.data().get(),
         edges.data().get(), edge_opposite_points.data().get(),
         bending_factor.data().get(), ne);
     build_seam_bend_entries_kernel<<<(ns + block - 1) / block, block>>>(
@@ -748,7 +757,7 @@ void Geometry::init_bend_structure() {
         bend_rest_theta.data().get() + ne,
         seam_bend_static_ok.data().get(),
         stitches.data().get(), stitch_sewing.data().get(),
-        sewing_lines.data().get(),
+        edge_rest_angle.data().get(),
         edges.data().get(), e2t.data().get(),
         edge_opposite_points.data().get(),
         edge_lookup.data().get(), dir_edges.data().get(),
@@ -794,10 +803,14 @@ void Geometry::init_bend_structure() {
         edge_lookup.data().get(), dir_edges.data().get(),
         bend_cross_rows.data().get(), ne, ext_count, N);
 
-    // Fill both validity arrays and refresh collapsed-triangle areas
-    // (the call inside build_stitch_clusters no-ops until this flag is set).
-    update_seam_state();
+    // Fill both validity arrays and refresh collapsed-triangle areas. The flag
+    // has to be set *before* the call: `update_seam_state` returns early while
+    // it is false (that guard exists so the call inside `build_stitch_clusters`,
+    // which runs earlier in `Geometry::init`, cannot read the previous scene's
+    // arrays). Setting it afterwards left `bend_valid` zeroed for the whole
+    // scene, which silently disabled every bending model.
     bend_structure_built = true;
+    update_seam_state();
 }
 
 void Geometry::update_seam_state() {

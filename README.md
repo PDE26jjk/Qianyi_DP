@@ -112,6 +112,44 @@ Global parameters (through `set_parameter` / `set_parameters`):
 
 Wind is inert while `wind_x = wind_y = wind_z = 0` and `wind_turbulence = 0`.
 
+## Cloth plasticity (PDNewton only)
+
+A cloth object can opt into the time-dependent wrinkle model (internal friction
+plus elasto-plastic bending) with `plastic` in its mesh entry. The rest shape is
+authored per edge instead of being hardcoded flat: `angles` sets the rest
+dihedral angle of an edge (a seam hinge takes its hinge edge's value, so seams
+and internal lines are authored the same way) and `compress` scales an edge's
+rest length (negative shrinks, positive grows - what a painted
+expansion/shrinkage tool converts into). Both default to 0, meaning no change.
+
+- With no panel flagged the simulation is unchanged and the model costs nothing.
+- `plasticity_time_scale` (default 0) drives the dwell and hardening clocks: 0
+  evaluates the model at t = 0 (a fixed slip threshold and hardening stiffness),
+  1 is the published timing, and larger values compress a long hold into a short
+  one - that is how an animation mode can make wrinkles "harden" in seconds.
+- `freeze_rest_shape()` bakes the current shape into the rest shape,
+  `reset_plasticity()` returns to the input rest shape, and
+  `get_plasticity_state()` reports the per-entry rest angle, anchor angle, yield
+  angle and both timers.
+
+See `docs/engine_input_spec.md` for the parameter table and
+`openspec/changes/cloth-plasticity/` for the model and its verification.
+
+## Frame timing (diagnostic)
+
+Set `profile_timing` to 1 and `qydp.simulator.get_timing()` returns the last
+completed frame as a flat dict of milliseconds - one value for the total and one
+per stage (`frame_update`, `collision`, `substeps`, `end_frame`), plus the frame
+index, whether the timer is on, and whether the sample is stale. The stages
+partition one `update` call, so they add up to the total: `collision` carries
+the contact work (the per-substep BVH refit and broad phase that PDNewton runs,
+plus the periodic BVH rebuild), and `substeps` carries the rest of the loop -
+the external forces, the plastic state, the contact forces, the Newton
+iterations and the seam projection. The engine keeps exactly one frame and no
+history - average in the caller. Off by default, and the readback never
+synchronizes: it reports the previous sample while the newest events have not
+completed.
+
 ## Portability
 
 Machine-specific paths, local build outputs, and local environment details

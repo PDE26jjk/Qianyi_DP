@@ -258,10 +258,13 @@ void SolverExplicit::step(float h) {
             f, q,
             geo->bend_points.data().get(),
             geo->bend_rest_theta.data().get(),
+            // Plastic bending is a PDNewton capability; a null mask keeps this
+            // solver on the elastic path.
+            nullptr, nullptr,
             geo->bend_factor.data().get(),
             geo->bend_valid.data().get(),
             geo->bend_cross_rows.data().get(),
-            n, bending_k);
+            n, bending_k, 0.f);
     else if ( geo->bending_model == BendingModel::DiscreteShells_AOGS )
         // AOGS was previously folded into the GN branch ("the forces are the
         // same"), which is not the case: it is a different curvature measure.
@@ -271,10 +274,11 @@ void SolverExplicit::step(float h) {
             f, q,
             geo->bend_points.data().get(),
             geo->bend_rest_theta.data().get(),
+            nullptr, nullptr,
             geo->bend_factor.data().get(),
             geo->bend_valid.data().get(),
             geo->bend_cross_rows.data().get(),
-            n, bending_k);
+            n, bending_k, 0.f);
     geo->accumulate_sewing_force(nullptr);
     geo->get_contact().accumulate_contact_force(f, nullptr, h);
     // update substep end
